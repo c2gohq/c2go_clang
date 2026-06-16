@@ -311,6 +311,10 @@ set(utility_files
   mm_malloc.h
 )
 
+set(c2go_files
+  c2go.h
+)
+
 set(files
   ${core_files}
   ${arm_common_files}
@@ -333,6 +337,7 @@ set(files
   ${webassembly_files}
   ${windows_only_files}
   ${utility_files}
+  ${c2go_files}
   )
 
 set(cuda_wrapper_files
