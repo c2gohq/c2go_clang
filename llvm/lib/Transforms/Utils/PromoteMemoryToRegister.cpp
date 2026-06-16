@@ -46,6 +46,7 @@
 #include "llvm/IR/Type.h"
 #include "llvm/IR/User.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
 #include <algorithm>
@@ -64,6 +65,21 @@ STATISTIC(NumDeadAlloca,    "Number of dead alloca's removed");
 STATISTIC(NumPHIInsert,     "Number of PHI nodes inserted");
 
 bool llvm::isAllocaPromotable(const AllocaInst *AI) {
+  // c2go (#208 / Phase 3) — managed-pointer allocas must survive
+  // mem2reg so the Plan 9 .s GC bitmap can reference their fixed
+  // frame offsets via Direct(SP, off) stackmap entries. If the
+  // alloca were promoted to a virtual register, the runtime would
+  // have no scannable home for the pointer at safepoints; once the
+  // register got spilled the slot would carry no `c2go.ptr.managed`
+  // tag and the bitmap-driven scan would miss it.
+  //
+  // Future Phase 3.5 will plumb the metadata through ISel → MMO →
+  // RegAlloc spill so register-resident managed pointers can be
+  // tracked as Indirect(SP, spill_off). Until then, refuse to
+  // promote — the runtime correctness contract is upstream of any
+  // codegen efficiency.
+  if (AI->getMetadata(llvm::c2go::kPtrManagedMD))
+    return false;
   // Only allow direct and non-volatile loads and stores...
   for (const User *U : AI->users()) {
     if (const LoadInst *LI = dyn_cast<LoadInst>(U)) {

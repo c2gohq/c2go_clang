@@ -18,6 +18,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 
 using namespace llvm;
 
@@ -206,6 +207,30 @@ static void convertToRelLookupTable(LookupTableInfo &Info,
 // Convert lookup tables to relative lookup tables in the module.
 static bool convertToRelativeLookupTables(
     Module &M, function_ref<TargetTransformInfo &(Function &)> GetTTI) {
+  // c2go #298 Wave AI (Track AI.2): the relative-lookup-table optimisation
+  // rewrites `[N x ptr]` initialisers (e.g. `static const char* const t[]`)
+  // into `[N x i32]` PC-relative-offset tables. AsmPrinter then emits each
+  // element as a 4-byte symbol-difference value, which the Plan-9 streamer
+  // serialises as `DATA <sym>+<off>(SB)/4, $<other-sym>(SB)`. The Go
+  // assembler rejects that form unconditionally
+  // (gosrc/src/cmd/asm/internal/asm/asm.go `asmData`: `TYPE_ADDR` requires
+  // `sz == p.arch.PtrSize` == 8 on every 64-bit target) with
+  // `bad addr size for DATA argument: 4`. AArch64 is already exempt via
+  // the BasicTTI Darwin guard in `shouldBuildRelLookupTables`, so this
+  // never triggered on the aarch64 c2go path; X86-64 Darwin is allowed,
+  // so SQLite WF1 -O2 hits it on the string-constant lookup arrays
+  // (`sqlite3VdbeDisplayP4_encnames`, `sqlite3VdbeExec_azType`, ...).
+  //
+  // Disable the optimisation under the c2go pipeline. The fallback path is
+  // the unconverted `[N x ptr]` table, which `emitDataSymDirective` emits
+  // as `DATA <sym>+<off>(SB)/8, $<other-sym>(SB)` — accepted by the Go
+  // assembler. Cross-arch invariant: aarch64 modules never reached this
+  // pass to begin with on Darwin (Darwin guard), so this gate keeps the
+  // X86 c2go path matching the aarch64 c2go path without touching the
+  // aarch64 backend. Non-c2go modules are unaffected.
+  if (M.getModuleFlag(llvm::c2go::kGoabiModuleFlag))
+    return false;
+
   for (Function &F : M) {
     if (F.isDeclaration())
       continue;

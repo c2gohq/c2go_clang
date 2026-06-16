@@ -81,6 +81,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
@@ -6089,6 +6090,19 @@ bool SROA::deleteDeadInstructions(
 /// the PromotableAllocas list. If that list is empty, there is nothing to do.
 /// This function returns whether any promotion occurred.
 bool SROA::promoteAllocas() {
+  if (PromotableAllocas.empty())
+    return false;
+
+  // c2go (Phase 3) — SROA's internal split/rewrite can route managed
+  // allocas (those bearing `!c2go.ptr.managed` metadata) into the
+  // promote queue even though isAllocaPromotable rejects them, which
+  // trips the assert at the top of PromoteMemToReg::run. Filter them
+  // out here. Managed allocas must keep their fixed frame offset so
+  // the c2go-safepoint pass and Plan 9 .s GC bitmap can reference
+  // them via Direct(SP, off) stackmap entries.
+  PromotableAllocas.remove_if([](AllocaInst *AI) {
+    return AI->getMetadata(llvm::c2go::kPtrManagedMD) != nullptr;
+  });
   if (PromotableAllocas.empty())
     return false;
 

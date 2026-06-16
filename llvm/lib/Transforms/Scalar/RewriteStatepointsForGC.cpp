@@ -494,6 +494,32 @@ static Value *findBaseDefiningValue(Value *I, DefiningValueMapTy &Cache,
   }
 
   if (CastInst *CI = dyn_cast<CastInst>(I)) {
+    // c2go (#386): an addrspacecast whose result is live across a statepoint
+    // is its own base, analogous to the alloca carve-out at #326 below. The
+    // c2go-gc strategy tracks BOTH AS0 and AS1 (see BuiltinGCs.cpp C2GoGC),
+    // and both ends of an AS1<->AS0 cast are first-class GC pointers. Two
+    // shapes hit this:
+    //   (a) frontend managed->unmanaged-typed store: the AS0 cast result is
+    //       stored into a Go-managed field and must be relocated;
+    //   (b) C2GoMemcpyTyping adaptArgAS at libc.Memmove call sites: the AS0
+    //       cast result is a call argument live across the (non-leaf)
+    //       memmove statepoint.
+    // Soundness: Go heap is non-moving for object identity (only the
+    // goroutine stack moves via copystack), so gc.relocate on the AS1 source
+    // is the identity at the IR level; the AS0 cast result is independently
+    // tracked through the backend FUNCDATA stack bitmap. RS4GC's verifier
+    // (~line 1554) derives the relocate AS from the live-var type, so an
+    // AS0 cast -> gc.relocate.p0 consistently. If a future c2go change
+    // makes the Go heap movable, AS1-source and AS0-cast independent
+    // relocates would need atomic-relocate semantics — out of scope here.
+    if (auto *ASC = dyn_cast<AddrSpaceCastInst>(I)) {
+      const Function *F = ASC->getFunction();
+      if (F && F->hasGC() && F->getGC() == "c2go-gc") {
+        Cache[I] = I;
+        setKnownBase(I, /* IsKnownBase */ true, KnownBases);
+        return I;
+      }
+    }
     Value *Def = CI->stripPointerCasts();
     // If stripping pointer casts changes the address space there is an
     // addrspacecast in between.
@@ -514,6 +540,33 @@ static Value *findBaseDefiningValue(Value *I, DefiningValueMapTy &Cache,
     Cache[I] = I;
     setKnownBase(I, /* IsKnownBase */true, KnownBases);
     return I;
+  }
+
+  if (auto *AI = dyn_cast<AllocaInst>(I)) {
+    // c2go (#326): an alloca's address is a stack pointer base. Normal GC
+    // configs track only a managed address space, so allocas (AS0) never reach
+    // here; the c2go-gc strategy tracks AS0 too (the Go goroutine stack is
+    // movable, so a C pointer holding &local must be relocated by copystack),
+    // which makes an alloca a legitimate base-defining value, exactly like a
+    // load or call result. The gc.relocate is the identity at the IR level; Go
+    // performs the real relocation at runtime via the locals bitmap.
+    //
+    // Finding 5: gate this behavior to the c2go-gc strategy. The comment
+    // above asserts "normal GC configs never reach here", but ENFORCES
+    // nothing; any future GC strategy that opts to track AS0 (e.g. via
+    // `isGCManagedPointer` returning nullopt or true for AS0) would inherit
+    // the alloca-as-base treatment unintentionally — possibly inserting
+    // spurious gc.relocates for stack locals. Explicit gate by GC name
+    // keeps the c2go path unchanged and isolates other strategies. The
+    // generic fallthrough below treats the alloca as a PHI/Select-shaped
+    // value and asserts — which preserves the pre-#326 behavior for any
+    // non-c2go GC that does manage to reach here.
+    const Function *F = AI->getFunction();
+    if (F && F->hasGC() && F->getGC() == "c2go-gc") {
+      Cache[I] = I;
+      setKnownBase(I, /* IsKnownBase */ true, KnownBases);
+      return I;
+    }
   }
 
   if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(I)) {

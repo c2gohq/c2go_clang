@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Scalar/MemCpyOptimizer.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
@@ -681,6 +682,15 @@ bool MemCpyOptPass::processStoreOfLoad(StoreInst *SI, LoadInst *LI,
         M = Builder.CreateMemCpy(SI->getPointerOperand(), SI->getAlign(),
                                  LI->getPointerOperand(), LI->getAlign(), Size);
       M->copyMetadata(*SI, LLVMContext::MD_DIAssignID);
+      // c2go (v2 step 4): propagate `!c2go.elem.type` from the original
+      // store/load to the new memcpy/memmove. The store-of-load pattern
+      // (store (load p), q) is what MemCpyOpt promotes; if the store
+      // or load was over c2go_struct memory, the new mem-transfer must
+      // route through runtime.typedmemmove for write-barrier safety.
+      if (MDNode *ET = SI->getMetadata(c2go::kElemTypeMD))
+        M->setMetadata(c2go::kElemTypeMD, ET);
+      else if (MDNode *ET = LI->getMetadata(c2go::kElemTypeMD))
+        M->setMetadata(c2go::kElemTypeMD, ET);
 
       LLVM_DEBUG(dbgs() << "Promoting " << *LI << " to " << *SI << " => " << *M
                         << "\n");
@@ -1259,6 +1269,15 @@ bool MemCpyOptPass::processMemCpyMemCpyDependence(MemCpyInst *M,
                                 CopySourceAlign, CopyLength, M->isVolatile());
 
   NewM->copyMetadata(*M, LLVMContext::MD_DIAssignID);
+  // c2go (v2 step 4): in memcpy(t,s,n); memcpy(d,t,n) → memcpy(d,s,n)
+  // forwarding, the destination memcpy M is the surviving semantic.
+  // If either M or the dependency MDep was typed over a c2go_struct,
+  // the new memcpy must keep that typing so write barriers fire when
+  // the C2GoMemcpyTypingPass routes it to runtime.typedmemmove.
+  if (MDNode *ET = M->getMetadata(c2go::kElemTypeMD))
+    NewM->setMetadata(c2go::kElemTypeMD, ET);
+  else if (MDNode *ET = MDep->getMetadata(c2go::kElemTypeMD))
+    NewM->setMetadata(c2go::kElemTypeMD, ET);
 
   assert(isa<MemoryDef>(MSSA->getMemoryAccess(M)));
   auto *LastDef = cast<MemoryDef>(MSSA->getMemoryAccess(M));

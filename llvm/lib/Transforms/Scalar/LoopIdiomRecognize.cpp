@@ -28,6 +28,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Scalar/LoopIdiomRecognize.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
@@ -1481,6 +1482,18 @@ bool LoopIdiomRecognize::processLoopStoreOfLoopLoad(
         AATags);
   }
   NewCall->setDebugLoc(TheStore->getDebugLoc());
+
+  // c2go (v2 step 3): propagate `!c2go.elem.type` metadata from the
+  // loop's original store/load onto the new memcpy/memmove call. This
+  // preserves write-barrier requirements when LoopIdiom recognizes a
+  // copy loop over a c2go_struct typed field. Without this, the
+  // C2GoMemcpyTypingPass would see an untyped memcpy and route it to
+  // the byte-blob path, missing the GC write barrier for managed-
+  // pointer fields.
+  if (MDNode *ElemTy = TheStore->getMetadata(c2go::kElemTypeMD))
+    NewCall->setMetadata(c2go::kElemTypeMD, ElemTy);
+  else if (MDNode *ElemTy = TheLoad->getMetadata(c2go::kElemTypeMD))
+    NewCall->setMetadata(c2go::kElemTypeMD, ElemTy);
 
   if (MSSAU) {
     MemoryAccess *NewMemAcc = MSSAU->createMemoryAccessInBB(
