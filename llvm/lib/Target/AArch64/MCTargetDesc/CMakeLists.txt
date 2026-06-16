@@ -3,6 +3,7 @@ add_llvm_component_library(LLVMAArch64Desc
   AArch64ELFObjectWriter.cpp
   AArch64ELFStreamer.cpp
   AArch64InstPrinter.cpp
+  AArch64Plan9InstPrinter.cpp
   AArch64MCAsmInfo.cpp
   AArch64MCCodeEmitter.cpp
   AArch64MCExpr.cpp

@@ -16,6 +16,7 @@
 #include "AArch64WinCOFFStreamer.h"
 #include "MCTargetDesc/AArch64AddressingModes.h"
 #include "MCTargetDesc/AArch64InstPrinter.h"
+#include "MCTargetDesc/AArch64Plan9InstPrinter.h"
 #include "TargetInfo/AArch64TargetInfo.h"
 #include "llvm/DebugInfo/CodeView/CodeView.h"
 #include "llvm/MC/MCAsmBackend.h"
@@ -375,6 +376,11 @@ static MCInstPrinter *createAArch64MCInstPrinter(const Triple &T,
     return new AArch64InstPrinter(MAI, MII, MRI);
   if (SyntaxVariant == 1)
     return new AArch64AppleInstPrinter(MAI, MII, MRI);
+  if (SyntaxVariant == 2)
+    // c2go Phase E v0+1: Plan 9 (Go assembler) syntax. Selected via
+    // OutputAsmVariant=2 in MCTargetOptions, which clang sets when
+    // -fc2go-emit-plan9-asm is in effect (step 4 of the redo).
+    return new AArch64Plan9InstPrinter(MAI, MII, MRI);
 
   return nullptr;
 }
