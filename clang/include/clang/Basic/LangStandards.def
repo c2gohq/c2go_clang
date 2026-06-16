@@ -110,6 +110,16 @@ LANGSTANDARD(gnu2y, "gnu2y",
              LineComment | C99 | C11 | C17 | C23 | C2y | Digraphs | GNUMode | HexFloat, 202400)
 // TODO: Add the iso9899:202y alias once ISO publishes the standard.
 
+// C with GNU + c2go extensions mode. Selecting this is equivalent to
+// targeting a `-goabi` triple; the C2GoMode flag flips Sema to expect the
+// c2go_struct / c2go_unmanaged annotations and enables the malloc-to-
+// runtime.mallocgc rewrite pass. Only the C23-baseline variant is offered:
+// `c2go` is an alias for `c2go23`.
+LANGSTANDARD(c2go23, "c2go23",
+             C, "ISO C 2023 with GNU + c2go extensions",
+             LineComment | C99 | C11 | C17 | C23 | Digraphs | GNUMode | C2GoMode | HexFloat, 202311)
+LANGSTANDARD_ALIAS(c2go23, "c2go")
+
 // C++ modes
 LANGSTANDARD(cxx98, "c++98",
              CXX, "ISO C++ 1998 with amendments",

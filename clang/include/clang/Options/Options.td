@@ -3285,6 +3285,32 @@ def fmessage_length_EQ : Joined<["-"], "fmessage-length=">, Group<f_Group>,
   Visibility<[ClangOption, CC1Option]>,
   HelpText<"Format message diagnostics so that they fit within N columns">,
   MarshallingInfoInt<DiagnosticOpts<"MessageLength">>;
+
+// c2go driver flags (v14 §10)
+def fc2go : Flag<["-"], "fc2go">, Group<f_Group>,
+  Visibility<[ClangOption, CC1Option]>,
+  HelpText<"Enable c2go mode (managed-by-default C, GoABI0 codegen).">,
+  MarshallingInfoFlag<LangOpts<"C2GoMode">>;
+def fc2go_package_EQ : Joined<["-"], "fc2go-package=">, Group<f_Group>,
+  Visibility<[ClangOption, CC1Option]>,
+  MetaVarName<"<pkgpath>">,
+  HelpText<"Set the Go package path used for symbol mangling under c2go mode (default: main).">,
+  MarshallingInfoString<LangOpts<"C2GoPackagePath">, [{"main"}]>;
+def fc2go_emit_manifest_EQ : Joined<["-"], "fc2go-emit-manifest=">, Group<f_Group>,
+  Visibility<[ClangOption, CC1Option]>,
+  MetaVarName<"<path>">,
+  HelpText<"Emit the c2go export manifest JSON sidecar to <path>. When omitted, no manifest is written; pass an explicit path to enable.">,
+  MarshallingInfoString<LangOpts<"C2GoEmitManifestPath">>;
+def fc2go_emit_plan9_asm_EQ : Joined<["-"], "fc2go-emit-plan9-asm=">, Group<f_Group>,
+  Visibility<[ClangOption, CC1Option]>,
+  MetaVarName<"<path>">,
+  HelpText<"Emit a Plan 9 syntax assembly file (consumed by the Go assembler) to <path> alongside the object file. Replaces the external c2go-plan9asm post-process step. v0+1 byte-packaged form; opcodes are upgraded to symbolic Plan 9 mnemonics as the InstPrinter table grows.">,
+  MarshallingInfoString<LangOpts<"C2GoEmitPlan9AsmPath">>;
+def fc2go_target_go_version_EQ : Joined<["-"], "fc2go-target-go-version=">, Group<f_Group>,
+  Visibility<[ClangOption, CC1Option]>,
+  MetaVarName<"<lo>-<hi>">,
+  HelpText<"Pin the supported Go runtime range for c2go output (default: 1.22-1.26; max is exclusive).">,
+  MarshallingInfoString<LangOpts<"C2GoTargetGoVersion">, [{"1.22-1.26"}]>;
 def frandomize_layout_seed_EQ : Joined<["-"], "frandomize-layout-seed=">,
   MetaVarName<"<seed>">, Group<f_clang_Group>,
   Visibility<[ClangOption, CC1Option]>,

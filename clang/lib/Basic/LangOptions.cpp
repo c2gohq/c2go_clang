@@ -124,6 +124,13 @@ void LangOptions::setLangDefaults(LangOptions &Opts, Language Lang,
   Opts.CPlusPlus23 = Std.isCPlusPlus23();
   Opts.CPlusPlus26 = Std.isCPlusPlus26();
   Opts.GNUMode = Std.isGNUMode();
+  // CGO mode is enabled by an explicit -std=cgoNN choice or by targeting
+  // the dedicated Go ABI (--target=...-goabi). The goabi path is a separate
+  // toolchain configuration from Go's existing cgo mechanism: it is meant
+  // for compiling C that links directly into a Go-runtime-only binary, not
+  // for use inside `go build`'s cgo compile step. Mixing the two breaks
+  // Go's runtime/cgo support files which expect libc malloc.
+  Opts.C2GoMode = Std.isC2GoMode() || T.getEnvironment() == llvm::Triple::GoABI;
   Opts.GNUCVersion = 0;
   Opts.HexFloats = Std.hasHexFloats();
   Opts.WChar = Std.isCPlusPlus();

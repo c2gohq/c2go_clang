@@ -355,9 +355,18 @@ protected:
 
 class LLVM_LIBRARY_VISIBILITY DarwinAArch64TargetInfo
     : public DarwinTargetInfo<AArch64leTargetInfo> {
+  // c2go (§2.3 void** vararg): in c2go mode use a void* va_list whose value is
+  // a void** cursor over the caller-packed `void* argptrs[]` array, instead of
+  // Darwin's char* / the AAPCS register-save-area va_list. va_start/va_arg/
+  // va_end are lowered specially (no AAPCS walk, no reg-save-area prologue).
+  // Set in adjust() from LangOpts.
+  bool C2GoVoidPtrVaList = false;
+
 public:
   DarwinAArch64TargetInfo(const llvm::Triple &Triple, const TargetOptions &Opts);
 
+  void adjust(DiagnosticsEngine &Diags, LangOptions &Opts,
+              const TargetInfo *Aux) override;
   BuiltinVaListKind getBuiltinVaListKind() const override;
 
  protected:

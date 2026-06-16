@@ -1416,6 +1416,8 @@ AArch64TargetInfo::checkCallingConvention(CallingConv CC) const {
   case CC_AArch64VectorCall:
   case CC_AArch64SVEPCS:
   case CC_Win64:
+  case CC_GoABI0:
+  case CC_C2GoInternal:
     return CCCR_OK;
   default:
     return CCCR_Warning;
@@ -1862,7 +1864,19 @@ void DarwinAArch64TargetInfo::getOSDefines(const LangOptions &Opts,
   DarwinTargetInfo<AArch64leTargetInfo>::getOSDefines(Opts, Triple, Builder);
 }
 
+void DarwinAArch64TargetInfo::adjust(DiagnosticsEngine &Diags,
+                                     LangOptions &Opts, const TargetInfo *Aux) {
+  DarwinTargetInfo<AArch64leTargetInfo>::adjust(Diags, Opts, Aux);
+  // c2go (§2.3 void** vararg): use a void* va_list whose value is a void**
+  // cursor over the caller-packed `void* argptrs[]` array. va_start/va_arg/
+  // va_end are lowered specially (no AAPCS register-save-area walk, no
+  // llvm.va_start), so the callee prologue has no reg-save and the call site
+  // has no per-callsite SUB/ADD sp. Set from LangOpts.
+  C2GoVoidPtrVaList = Opts.C2GoMode;
+}
+
 TargetInfo::BuiltinVaListKind
 DarwinAArch64TargetInfo::getBuiltinVaListKind() const {
-  return TargetInfo::CharPtrBuiltinVaList;
+  return C2GoVoidPtrVaList ? TargetInfo::VoidPtrBuiltinVaList
+                           : TargetInfo::CharPtrBuiltinVaList;
 }

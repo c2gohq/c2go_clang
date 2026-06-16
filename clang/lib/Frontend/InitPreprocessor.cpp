@@ -461,6 +461,12 @@ static void InitializeStandardPredefinedMacros(const TargetInfo &TI,
   if (!LangOpts.CPlusPlus) {
     if (std::optional<uint32_t> Lang = LangOpts.getCLangStd())
       Builder.defineMacro("__STDC_VERSION__", Twine(*Lang) + "L");
+
+    //   -- __STDC_NO_VLA__
+    //      The integer literal 1 if the implementation does not support
+    //      variable length arrays. c2go disables VLAs/alloca as a feature.
+    if (!LangOpts.VLASupport)
+      Builder.defineMacro("__STDC_NO_VLA__", "1");
   } else {
     //   -- __cplusplus
     Builder.defineMacro("__cplusplus",
@@ -847,6 +853,17 @@ static void InitializePredefinedMacros(const TargetInfo &TI,
   Builder.defineMacro("__clang_version__",
                       "\"" CLANG_VERSION_STRING " "
                       + getClangFullRepositoryVersion() + "\"");
+
+  // Mark c2go-mode so headers shipped with the toolchain (e.g.
+  // <c2go.h>) can guard their content with an unambiguous predicate.
+  // c2go-mode is enabled by either:
+  //   - target triple environment == goabi (e.g. arm64-apple-darwin-goabi)
+  //   - explicit -fc2go flag (LangOpts.C2GoMode set)
+  if (TI.getTriple().getEnvironment() == llvm::Triple::GoABI ||
+      LangOpts.C2GoMode) {
+    Builder.defineMacro("__C2GO__");
+    Builder.defineMacro("__clang_c2go__");
+  }
 
   if (LangOpts.GNUCVersion != 0) {
     // Major, minor, patch, are given two decimal places each, so 4.2.1 becomes

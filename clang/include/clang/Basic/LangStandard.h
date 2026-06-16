@@ -63,7 +63,11 @@ enum LangFeatures {
   GNUMode = (1 << 14),
   HexFloat = (1 << 15),
   OpenCL = (1 << 16),
-  HLSL = (1 << 17)
+  HLSL = (1 << 17),
+  // Allocate from the next free bit. Avoid skipping the unused 18..29
+  // range — those bits are reserved for future LangFeatures growth.
+  // LangFeatures::Flags 是 unsigned (32 bit); 下一空位 = 1<<19。
+  C2GoMode = (1 << 18)
 };
 
 /// LangStandard - Information about the properties of a particular language
@@ -145,6 +149,10 @@ public:
 
   /// isGNUMode - Language includes GNU extensions.
   bool isGNUMode() const { return Flags & GNUMode; }
+
+  /// isC2GoMode - Language includes c2go extensions (cgo_struct,
+  /// cgo_unmanaged, go_linkname, transparent unions, malloc→mallocgc).
+  bool isC2GoMode() const { return Flags & C2GoMode; }
 
   /// hasHexFloats - Language supports hexadecimal float constants.
   bool hasHexFloats() const { return Flags & HexFloat; }

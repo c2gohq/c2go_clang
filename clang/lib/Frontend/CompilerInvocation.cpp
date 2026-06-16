@@ -1802,6 +1802,39 @@ void CompilerInvocationBase::GenerateCodeGenArgs(const CodeGenOptions &Opts,
     GenerateArg(Consumer, OPT_static_libclosure);
 }
 
+// c2go (Plan 9 .s emit): collected default overrides applied whenever
+// LangOpts.C2GoMode is on. Split into two halves because the two
+// consumers live in different Parse functions:
+//   * CodeGen half: invoked from ParseCodeGenArgs (NoUseJumpTables).
+//     Reads LangOptsRef which is finalized by then.
+//   * Lang half:    invoked from ParseLangArgs (StackProtector, VLASupport).
+// Rationale for each override is documented at the call site comments.
+static void applyC2GoCodeGenDefaults(CodeGenOptions &Opts,
+                                     const LangOptions &LangOptsRef) {
+  if (!LangOptsRef.C2GoMode)
+    return;
+  // Plan 9 assembler can't express the two possible jump-table encodings:
+  // 4-byte label-difference ("unexpected L2 evaluating expression" in DATA),
+  // nor 8-byte absolute (cross-function L-labels aren't addressable from
+  // DATA). Compare-chain dispatch is the only working path. Equivalent to
+  // `-fno-jump-tables` on every c2go invocation.
+  Opts.NoUseJumpTables = true;
+}
+
+static void applyC2GoLangDefaults(LangOptions &Opts) {
+  if (!Opts.C2GoMode)
+    return;
+  // Stack-guard cookie via `__stack_chk_guard` doesn't exist in Go-runtime
+  // linkage, and the canary check epilogue is Plan-9-asm-unfriendly.
+  // Equivalent to `-fno-stack-protector` on every c2go invocation.
+  Opts.setStackProtector(LangOptions::SSPOff);
+  // Go uses fixed-size stack frames (fp = sp + autosize, sp0 == fp) and
+  // movable goroutine stacks -- pcsp / GC stackmap / unwind all assume a
+  // constant frame size, so dynamic stack allocation is fundamentally
+  // unsupported. Also predefines __STDC_NO_VLA__ (C11) for the source.
+  Opts.VLASupport = false;
+}
+
 bool CompilerInvocation::ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args,
                                           InputKind IK,
                                           DiagnosticsEngine &Diags,
@@ -2303,6 +2336,10 @@ bool CompilerInvocation::ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args,
     Diags.Report(diag::err_drv_amdgpu_ieee_without_no_honor_nans);
 
   Opts.StaticClosure = Args.hasArg(options::OPT_static_libclosure);
+
+  // c2go (Plan 9 .s emit): apply collected c2go-mode CodeGen defaults
+  // (NoUseJumpTables, ...). See applyC2GoCodeGenDefaults for rationale.
+  applyC2GoCodeGenDefaults(Opts, LangOptsRef);
 
   return Diags.getNumErrors() == NumErrorsBefore;
 }
@@ -4645,6 +4682,11 @@ bool CompilerInvocation::ParseLangArgs(LangOptions &Opts, ArgList &Args,
           << Requested.getName() << Recommended.getName();
     }
   }
+
+  // c2go (Plan 9 .s emit): apply collected c2go-mode Lang defaults
+  // (StackProtector=Off, VLASupport=false). See applyC2GoLangDefaults
+  // for rationale.
+  applyC2GoLangDefaults(Opts);
 
   return Diags.getNumErrors() == NumErrorsBefore;
 }

@@ -499,6 +499,24 @@ public:
   /// The module currently being compiled as specified by -fmodule-name.
   std::string ModuleName;
 
+  /// c2go: Go package path for symbol mangling (set by -fc2go-package=).
+  /// Default "main" when -fc2go-package= is not given.
+  std::string C2GoPackagePath;
+
+  /// c2go: Sidecar manifest output path (set by -fc2go-emit-manifest=).
+  /// Default "<output>.c2go-export.json" when flag is not given.
+  std::string C2GoEmitManifestPath;
+
+  /// c2go: Plan 9 .s output path (set by -fc2go-emit-plan9-asm=).
+  /// When empty (flag not given), no .s is emitted. When non-empty,
+  /// clang writes a Plan 9 assembly file directly, replacing the
+  /// external c2go-plan9asm post-process step.
+  std::string C2GoEmitPlan9AsmPath;
+
+  /// c2go: Supported Go runtime version range, e.g. "1.22-1.25"
+  /// (set by -fc2go-target-go-version=). Default "1.22-1.25".
+  std::string C2GoTargetGoVersion;
+
   /// The name of the current module, of which the main source file
   /// is a part. If CompilingModule is set, we are compiling the interface
   /// of this module, otherwise we are compiling an implementation file of

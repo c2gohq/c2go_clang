@@ -473,6 +473,11 @@ KEYWORD(__builtin_source_location   , KEYCXX)
 // type trait.
 TYPE_TRAIT_2(__builtin_types_compatible_p, TypeCompatible, KEYNOCXX)
 KEYWORD(__builtin_va_arg            , KEYALL)
+// c2go: __c2go_typeinfo(type) yields the Go-runtime `*_type` RTTI pointer for
+// a managed record type by referencing the per-type `_typeinfo_<Name>` symbol
+// that c2gobind emits. Spelled with the `__c2go_` prefix; the user-facing
+// `c2go_typeinfo(T)` macro in <c2go.h> forwards to it.
+KEYWORD(__c2go_typeinfo             , KEYALL)
 KEYWORD(__extension__               , KEYALL)
 KEYWORD(__float128                  , KEYALL)
 KEYWORD(__ibm128                    , KEYALL)

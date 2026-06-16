@@ -6762,6 +6762,15 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     CmdArgs.push_back("--offload-new-driver");
   }
 
+  // c2go-mode forwarding (v14 §10). MarshallingInfo handles cc1
+  // parsing of these, but the driver still needs to forward them to
+  // cc1 and claim them to suppress "argument unused" warnings.
+  Args.AddLastArg(CmdArgs, options::OPT_fc2go);
+  Args.AddLastArg(CmdArgs, options::OPT_fc2go_package_EQ);
+  Args.AddLastArg(CmdArgs, options::OPT_fc2go_emit_manifest_EQ);
+  Args.AddLastArg(CmdArgs, options::OPT_fc2go_emit_plan9_asm_EQ);
+  Args.AddLastArg(CmdArgs, options::OPT_fc2go_target_go_version_EQ);
+
   const XRayArgs &XRay = TC.getXRayArgs(Args);
   XRay.addArgs(TC, Args, CmdArgs, InputType);
 
