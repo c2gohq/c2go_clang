@@ -1,0 +1,41 @@
+set(LLVM_LINK_COMPONENTS
+  AArch64CodeGen
+  AArch64AsmParser
+  AArch64Desc
+  AArch64Disassembler
+  AArch64Info
+  AArch64Utils
+  AsmPrinter
+  BitReader
+  BitWriter
+  C2Go
+  CodeGen
+  Core
+  IPO
+  IRReader
+  Linker
+  MC
+  MCParser
+  Object
+  Passes
+  Scalar
+  Support
+  Target
+  TargetParser
+  TransformUtils
+  X86AsmParser
+  X86CodeGen
+  X86Desc
+  X86Disassembler
+  X86Info
+  )
+
+add_llvm_tool(c2go-lto
+  c2go-lto.cpp
+  C2GoArCli.cpp
+  C2GoEscapeAudit.cpp
+  C2GoManifestRebuilder.cpp
+
+  DEPENDS
+  intrinsics_gen
+  )
