@@ -9,6 +9,7 @@
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/ASTDiagnostic.h"
 #include "clang/AST/Attr.h"
+#include "clang/AST/C2GoUtil.h"
 #include "clang/AST/CXXInheritance.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
@@ -1371,6 +1372,34 @@ void ItaniumRecordLayoutBuilder::Layout(const RecordDecl *D) {
   // Finally, round the size of the total struct up to the alignment of the
   // struct itself.
   FinishLayout(D);
+
+  // c2go §3.9 / T3 — a `c2go_variant` union is re-described as a struct whose
+  // pointer slots and scalar blob are GC-class-partitioned into *separate*
+  // bytes (so the pointer slots can be scanned precisely). That layout is
+  // generally larger than the default overlay size, and that enlarged size is
+  // the storage the converted-struct redirection (CGExpr) and the gcdata
+  // bitmap (CGC2GoTypeInfo) both assume. Make the AST size/align agree so an
+  // enclosing struct's field offsets, sizeof(union), and malloc all match.
+  // computeC2GoVariantLayout intentionally does NOT consult getASTRecordLayout
+  // (it derives every member offset as 0, per the C standard), so calling it
+  // here — before this layout is cached — is safe.
+  if (D->isUnion() && c2go::isC2GoVariantUnion(D)) {
+    auto VL = c2go::computeC2GoVariantLayout(D, Context);
+    if (VL.Valid) {
+      CharUnits NewAlign = CharUnits::fromQuantity(VL.AlignBytes);
+      if (NewAlign > Alignment) {
+        Alignment = NewAlign;
+        PreferredAlignment = NewAlign;
+        UnpackedAlignment = std::max(UnpackedAlignment, NewAlign);
+      }
+      uint64_t NewSizeBits = Context.toBits(CharUnits::fromQuantity(
+          llvm::alignTo(VL.SizeBytes, Alignment.getQuantity())));
+      if (NewSizeBits > getSizeInBits()) {
+        setSize(NewSizeBits);
+        setDataSize(NewSizeBits);
+      }
+    }
+  }
 }
 
 void ItaniumRecordLayoutBuilder::Layout(const CXXRecordDecl *RD) {

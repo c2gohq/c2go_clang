@@ -2217,6 +2217,26 @@ def select_special_member_kind : TextSubstitution<
 def note_member_declared_at : Note<"member is declared here">;
 def note_ivar_decl : Note<"instance variable is declared here">;
 def note_bitfield_decl : Note<"bit-field is declared here">;
+// c2go §3.9 / task T3: c2go_variant is the opt-in "variant container" marker;
+// the convert-to-struct representation only makes sense for a union (which can
+// hold one of several alternatives). Mirrors err_c2go_struct_union_type.
+def err_c2go_variant_not_union : Error<
+  "%0 attribute can only be applied to a union type">;
+// c2go §3.9 / task T3b (soundness fail-closed): the convert-to-struct layout
+// descends into each alternative's natural layout and scans its pointer words
+// precisely, so nested structs and arrays (including array-of-pointer) are
+// accepted. A member is rejected only when its pointer words cannot be
+// described by a static bitmap without dropping or over-scanning a word: a
+// nested *union* that puns a scannable pointer with a scalar at the same word
+// (an ambiguous byte), a pointer at a non-pointer-aligned (packed) offset, or a
+// flexible/VLA member. Splitting the alternatives so each scannable pointer
+// sits at a consistent, pointer-aligned word resolves it.
+def err_c2go_variant_nested_scan_ptr : Error<
+  "c2go_variant union %0 member %1 has an ambiguous pointer layout the Go GC "
+  "cannot scan precisely (a nested union punning a pointer with a scalar, a "
+  "packed/misaligned pointer, or a flexible/VLA member). Give each scannable "
+  "pointer its own consistent, pointer-aligned word, or split the offending "
+  "member out of the union">;
 // c2go v15 §3.5 AS1 interconversion (D1/D2/D3): managed-pointer -> void* /
 // unmanaged-pointer drops the Go-managed-heap discriminator, so storing it
 // into an unmanaged location, returning it as void*, or passing it to an

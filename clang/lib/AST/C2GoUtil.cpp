@@ -359,6 +359,368 @@ C2GoUnionClassification classifyC2GoUnion(const RecordDecl *UnionRD,
   return Result;
 }
 
+bool isC2GoVariantUnion(const RecordDecl *RD) {
+  if (!RD)
+    return false;
+  const RecordDecl *Def = RD->getDefinition();
+  if (!Def || !Def->isUnion())
+    return false;
+  return Def->hasAttr<C2GoVariantAttr>();
+}
+
+bool isInsideC2GoVariantUnion(const RecordDecl *RD) {
+  // §3.9 / T3b — a `c2go_variant` union is re-described as a struct whose
+  // pointer words are scanned PRECISELY (computeC2GoVariantLayout descends
+  // into nested-struct alternatives and gives each scan pointer its own slot).
+  // A nested anonymous struct that appears as an alternative therefore has its
+  // managed pointer scanned, even though, analyzed in isolation as a plain
+  // record, that pointer looks unscanned. Walk the lexical DeclContext chain:
+  // a nested record alternative is lexically declared *inside* the variant
+  // union (the union's DeclContext is its parent, possibly through further
+  // anonymous-struct nesting). Stop climbing the moment we leave record scope
+  // so a genuinely top-level plain record (whose DeclContext is the TU /
+  // function) is never matched.
+  if (!RD)
+    return false;
+  const DeclContext *DC = RD->getDeclContext();
+  while (DC) {
+    const auto *Parent = dyn_cast<RecordDecl>(DC);
+    if (!Parent)
+      return false; // left record scope: not inside any variant union
+    if (isC2GoVariantUnion(Parent))
+      return true;
+    DC = Parent->getDeclContext();
+  }
+  return false;
+}
+
+namespace {
+
+// c2go §3.9 / T3b — recursive GC-layout of one union alternative.
+//
+// A `c2go_variant` alternative no longer has to be a *bare* data pointer to
+// earn precise scanning: T3b descends into nested structs and arrays, keeping
+// the alternative's NATURAL layout, and records which pointer-sized words hold
+// a scannable data pointer. The converted struct overlays alternatives with the
+// same word-classification "signature" into one shared region and concatenates
+// distinct signatures into non-overlapping regions, so the soundness invariant
+// (no byte is "ptr in one alternative, scalar in another") is preserved.
+//
+// Per pointer-word state while walking an alternative's natural layout. A
+// conflict (a nested *union* overlaying a scan pointer with a scalar at the
+// same word — a genuinely ambiguous byte) is reported by classifyLayout
+// returning false, not by a dedicated state; Unset is only the initial map
+// value before a word is claimed.
+enum class WordState { Unset, Ptr, Scalar };
+
+// Result of walking one alternative.
+struct AltLayout {
+  uint64_t Footprint = 0; // sizeof the alternative (bytes)
+  uint64_t Align = 1;     // alignof the alternative (bytes)
+  // Pointer-word indices (relative to the alternative base, in units of
+  // PtrSize) that hold a scannable data pointer. Sorted ascending.
+  llvm::SmallVector<uint64_t, 4> PtrWords;
+  bool HasManaged = false; // any scan word is a *managed* pointer
+  bool Ok = true;          // false -> unrepresentable (ambiguous / misaligned)
+};
+
+// Recursively classify the natural layout of QualType T (placed at byte offset
+// BaseOff within the alternative) into per-word states. PtrSize is the pointer
+// width; OutHasManaged is set when any scanned word is a *managed* pointer.
+// Returns false on an unrepresentable construct (ptr at a non-pointer-aligned
+// offset, or a nested union that puns a scan pointer with a scalar).
+static bool classifyLayout(QualType T, uint64_t BaseOff, unsigned PtrSize,
+                           const ASTContext &Ctx,
+                           llvm::SmallDenseMap<uint64_t, WordState, 8> &Words,
+                           bool &OutHasManaged) {
+  if (T.isNull())
+    return true;
+
+  // Arrays: classify the element type at each element offset.
+  if (const ArrayType *AT = T->getAsArrayTypeUnsafe()) {
+    if (const ConstantArrayType *CAT = Ctx.getAsConstantArrayType(T)) {
+      QualType Elem = CAT->getElementType();
+      uint64_t N = CAT->getSize().getZExtValue();
+      uint64_t ElemSz = Ctx.getTypeSizeInChars(Elem).getQuantity();
+      for (uint64_t i = 0; i < N; ++i)
+        if (!classifyLayout(Elem, BaseOff + i * ElemSz, PtrSize, Ctx, Words,
+                            OutHasManaged))
+          return false;
+      return true;
+    }
+    // VLA / incomplete array — unrepresentable as a fixed bitmap.
+    (void)AT;
+    return false;
+  }
+
+  // Pointer leaf.
+  if (T->isPointerType()) {
+    if (T->isFunctionPointerType())
+      return true; // function pointers are no-scan (§3.4) -> Scalar by default
+    // A scannable data pointer must land on a pointer-aligned word.
+    if (BaseOff % PtrSize != 0)
+      return false; // misaligned (e.g. packed) -> unrepresentable
+    uint64_t W = BaseOff / PtrSize;
+    auto It = Words.find(W);
+    if (It != Words.end() && It->second == WordState::Scalar)
+      return false; // a scalar already claimed this word -> conflict
+    Words[W] = WordState::Ptr;
+    if (isManagedPointerType(T))
+      OutHasManaged = true;
+    return true;
+  }
+
+  // Record: descend.
+  if (const RecordType *RT = T->getAs<RecordType>()) {
+    const RecordDecl *RD = RT->getDecl();
+    RD = RD ? RD->getDefinition() : nullptr;
+    if (!RD)
+      return true; // incomplete -> treat as opaque scalar bytes
+    const ASTRecordLayout &RL = Ctx.getASTRecordLayout(RD);
+    if (RD->isUnion()) {
+      // A nested union overlays every member at the same base. Each member's
+      // word classification must AGREE with the others (and with anything
+      // already claimed) or the byte is ambiguous -> fail-closed.
+      for (const FieldDecl *F : RD->fields()) {
+        llvm::SmallDenseMap<uint64_t, WordState, 8> Sub;
+        bool SubManaged = false;
+        if (!classifyLayout(F->getType(), BaseOff, PtrSize, Ctx, Sub,
+                            SubManaged))
+          return false;
+        // Mark this member's footprint: ptr words from Sub, every other word in
+        // the member's span as Scalar, then reconcile with Words.
+        uint64_t MSz = Ctx.getTypeSizeInChars(F->getType()).getQuantity();
+        for (uint64_t off = BaseOff; off < BaseOff + MSz; off += PtrSize) {
+          uint64_t W = off / PtrSize;
+          WordState WS = WordState::Scalar;
+          auto SIt = Sub.find(W);
+          if (SIt != Sub.end() && SIt->second == WordState::Ptr)
+            WS = WordState::Ptr;
+          auto It = Words.find(W);
+          if (It == Words.end())
+            Words[W] = WS;
+          else if (It->second != WS)
+            return false; // ptr in one alternative, scalar in another
+        }
+        OutHasManaged |= SubManaged;
+      }
+      return true;
+    }
+    // Struct: classify each field at its natural offset.
+    unsigned FieldNo = 0;
+    for (const FieldDecl *F : RD->fields()) {
+      uint64_t FOff = BaseOff + RL.getFieldOffset(FieldNo) / 8;
+      ++FieldNo;
+      if (!classifyLayout(F->getType(), FOff, PtrSize, Ctx, Words,
+                          OutHasManaged))
+        return false;
+    }
+    return true;
+  }
+
+  // Plain scalar (int/float/_Bool/enum/...): occupies bytes but holds no
+  // pointer. We do not need to record Scalar words for a top-level scalar
+  // alternative — the only reason to track Scalar is to detect a conflict
+  // against a Ptr at the same word, which only arises when a nested union
+  // overlays. The union case above handles that explicitly.
+  return true;
+}
+
+// Walk one direct union member into an AltLayout.
+static AltLayout computeAltLayout(const FieldDecl *F, unsigned PtrSize,
+                                  const ASTContext &Ctx) {
+  AltLayout A;
+  QualType FT = F->getType();
+  A.Footprint = Ctx.getTypeSizeInChars(FT).getQuantity();
+  A.Align = Ctx.getTypeAlignInChars(FT).getQuantity();
+  llvm::SmallDenseMap<uint64_t, WordState, 8> Words;
+  bool HasManaged = false;
+  // An explicit c2go_managed on the field promotes a bare data pointer member.
+  if (FT->isPointerType() && !FT->isFunctionPointerType() &&
+      F->hasAttr<C2GoManagedAttr>())
+    HasManaged = true;
+  A.Ok = classifyLayout(FT, /*BaseOff=*/0, PtrSize, Ctx, Words, HasManaged);
+  A.HasManaged = HasManaged;
+  if (A.Ok) {
+    for (const auto &KV : Words)
+      if (KV.second == WordState::Ptr)
+        A.PtrWords.push_back(KV.first);
+    llvm::sort(A.PtrWords);
+  }
+  return A;
+}
+
+} // namespace
+
+C2GoVariantLayout computeC2GoVariantLayout(const RecordDecl *UnionRD,
+                                           const ASTContext &Ctx) {
+  C2GoVariantLayout L;
+  if (!isC2GoVariantUnion(UnionRD))
+    return L; // Valid stays false
+  const RecordDecl *RD = UnionRD->getDefinition();
+
+  const unsigned PtrSize =
+      Ctx.getTargetInfo().getPointerWidth(LangAS::Default) / 8;
+  const unsigned PtrAlign = PtrSize;
+
+  // ── Slot-allocation algorithm (T3b: by-signature region grouping) ─────────
+  //
+  // Each direct union member (alternative) is classified by its NATURAL layout
+  // into a "signature" = (footprint, sorted set of pointer-word offsets). The
+  // converted struct then places one *region* per distinct signature:
+  //
+  //   * Alternatives with the SAME signature overlay into ONE shared region of
+  //     size = footprint, keeping the alternative's natural layout. (A flat
+  //     bare-pointer alternative has signature {footprint=8, ptrwords={0}}; all
+  //     such members share one ptr region. Pure-scalar / funcptr / pointer-free
+  //     aggregate alternatives all have an empty ptr-word set; they group by
+  //     footprint — and the largest such region subsumes the smaller ones via
+  //     the max-footprint coalescing below, exactly the old flat blob.)
+  //   * DISTINCT signatures get distinct, non-overlapping regions, concatenated
+  //     in first-appearance order. Region bases are pointer-aligned so every
+  //     in-region pointer word lands on a pointer-aligned struct offset.
+  //
+  // Within a region we emit Ptr slots at the alternative's pointer-word offsets
+  // and Scalar slots tiling the gaps, so the slot list is an ordered, gap-free
+  // cover of [0, SizeBytes) — the Go-type emitter and the gcdata bitmap walker
+  // both consume that list verbatim. No byte is ever "ptr here, scalar there":
+  // regions never overlap, and within a region a word that any overlaid
+  // alternative scans is scanned for all (a disagreement is a hard error
+  // detected in classifyLayout / the Sema fail-closed guard).
+  //
+  // NOTE: classifyLayout DOES consult getASTRecordLayout on NESTED records, but
+  // never on RD (the variant union) itself — RecordLayoutBuilder calls into
+  // here while building RD's layout (not yet cached). Direct members of a C
+  // union all sit at byte offset 0, which we use without querying RD's layout.
+
+  // Per-member analysis.
+  llvm::SmallVector<AltLayout, 8> Alts;
+  Alts.reserve(8);
+  llvm::SmallVector<const FieldDecl *, 8> Fields;
+  for (const FieldDecl *F : RD->fields()) {
+    Alts.push_back(computeAltLayout(F, PtrSize, Ctx));
+    Fields.push_back(F);
+  }
+
+  // T3b fail-closed: any unrepresentable alternative (ambiguous nested-union
+  // pun, misaligned/packed pointer, or VLA member) makes a precise static
+  // bitmap impossible. Flag it so the Sema guard rejects the union rather than
+  // silently dropping a pointer word. We still complete the (best-effort)
+  // layout so a defensive caller has well-formed sizes.
+  for (unsigned i = 0; i < Alts.size(); ++i)
+    if (!Alts[i].Ok) {
+      L.Representable = false;
+      if (L.BlockerFieldName.empty())
+        L.BlockerFieldName = Fields[i]->getNameAsString();
+    }
+
+  // A region groups members sharing a (footprint, ptrwords) signature. The
+  // pure-no-pointer members all share the empty-ptrwords signature but may have
+  // different footprints; we coalesce them into the single largest no-scan blob
+  // (matches the historic flat behavior and keeps the struct compact). Members
+  // that DO have pointer words must match footprint *and* ptrword set exactly
+  // to overlay (otherwise their ptr offsets would disagree).
+  struct Region {
+    uint64_t Footprint = 0;
+    uint64_t Align = 1;
+    llvm::SmallVector<uint64_t, 4> PtrWords; // empty => no-scan blob
+    uint64_t BaseOff = 0;
+  };
+  llvm::SmallVector<Region, 8> Regions;
+  llvm::SmallVector<int, 8> MemberRegion(Alts.size(), -1);
+
+  auto sameSig = [](const Region &R, const AltLayout &A) {
+    if (A.PtrWords.empty())
+      return R.PtrWords.empty();
+    if (R.PtrWords.size() != A.PtrWords.size())
+      return false;
+    for (unsigned i = 0; i < A.PtrWords.size(); ++i)
+      if (R.PtrWords[i] != A.PtrWords[i])
+        return false;
+    // Identical pointer layout -> overlay regardless of footprint differences;
+    // the region footprint grows to the max so every alternative fits.
+    return true;
+  };
+
+  for (unsigned i = 0; i < Alts.size(); ++i) {
+    const AltLayout &A = Alts[i];
+    if (!A.PtrWords.empty()) {
+      L.HasScanPtr = true;
+      if (A.HasManaged)
+        L.HasManagedPtr = true;
+    }
+    int Found = -1;
+    for (unsigned r = 0; r < Regions.size(); ++r)
+      if (sameSig(Regions[r], A)) {
+        Found = (int)r;
+        break;
+      }
+    if (Found < 0) {
+      Region R;
+      R.Footprint = A.Footprint;
+      R.Align = A.Align;
+      R.PtrWords = A.PtrWords;
+      Regions.push_back(std::move(R));
+      Found = (int)Regions.size() - 1;
+    } else {
+      Regions[Found].Footprint =
+          std::max(Regions[Found].Footprint, A.Footprint);
+      Regions[Found].Align = std::max(Regions[Found].Align, A.Align);
+    }
+    MemberRegion[i] = Found;
+  }
+
+  // Assign region base offsets (concatenate, pointer-aligned), then emit the
+  // ordered, gap-free slot list region by region.
+  uint64_t Cursor = 0;
+  uint64_t StructAlign = 1;
+  for (Region &R : Regions) {
+    uint64_t RAlign = R.Align;
+    if (!R.PtrWords.empty())
+      RAlign = std::max<uint64_t>(RAlign, PtrAlign);
+    Cursor = (Cursor + RAlign - 1) / RAlign * RAlign;
+    R.BaseOff = Cursor;
+    StructAlign = std::max(StructAlign, RAlign);
+
+    // Tile the region: Ptr slots at the pointer-word offsets, Scalar slots in
+    // the gaps. PtrWords is sorted ascending.
+    uint64_t pos = 0; // byte offset within the region
+    for (uint64_t W : R.PtrWords) {
+      uint64_t PtrByte = W * PtrSize;
+      if (PtrByte > pos)
+        L.Slots.push_back({C2GoVariantSlot::Kind::Scalar, R.BaseOff + pos,
+                           PtrByte - pos});
+      L.Slots.push_back(
+          {C2GoVariantSlot::Kind::Ptr, R.BaseOff + PtrByte, (uint64_t)PtrSize});
+      pos = PtrByte + PtrSize;
+    }
+    if (R.Footprint > pos)
+      L.Slots.push_back(
+          {C2GoVariantSlot::Kind::Scalar, R.BaseOff + pos, R.Footprint - pos});
+
+    Cursor = R.BaseOff + R.Footprint;
+  }
+
+  // pos(field): the first-hop redirection target is the member's region base.
+  L.FieldStructOffsets.resize(Alts.size());
+  for (unsigned i = 0; i < Alts.size(); ++i)
+    L.FieldStructOffsets[i] = Regions[MemberRegion[i]].BaseOff;
+
+  // Total size / alignment.
+  uint64_t End = Cursor;
+  if (StructAlign > 1)
+    End = (End + StructAlign - 1) / StructAlign * StructAlign;
+  // Defensive: a variant struct is at least one word so an empty/edge union
+  // still has well-defined storage.
+  if (End == 0)
+    End = PtrSize;
+
+  L.SizeBytes = End;
+  L.AlignBytes = StructAlign;
+  L.Valid = true;
+  return L;
+}
+
 std::string getStableRecordName(const RecordDecl *RD, const ASTContext &Ctx) {
   if (!RD)
     return std::string();
