@@ -88,12 +88,20 @@ private:
   RValue EmitAAPCSVAArg(Address VAListAddr, QualType Ty, CodeGenFunction &CGF,
                         AArch64ABIKind Kind, AggValueSlot Slot) const;
 
+  RValue EmitC2GoVAArg(CodeGenFunction &CGF, Address VAListAddr, QualType Ty,
+                       AggValueSlot Slot) const;
+
   RValue EmitVAArg(CodeGenFunction &CGF, Address VAListAddr, QualType Ty,
                    AggValueSlot Slot) const override {
     llvm::Type *BaseTy = CGF.ConvertType(Ty);
     if (isa<llvm::ScalableVectorType>(BaseTy))
       llvm::report_fatal_error("Passing SVE types to variadic functions is "
                                "currently not supported");
+
+    // c2go §2.3: va_list is a void** cursor over the caller-packed
+    // `void* argptrs[]` array; va_arg(ap,T) == *(T*)(*ap++).
+    if (getContext().getLangOpts().C2GoMode)
+      return EmitC2GoVAArg(CGF, VAListAddr, Ty, Slot);
 
     return Kind == AArch64ABIKind::Win64
                ? EmitMSVAArg(CGF, VAListAddr, Ty, Slot)
@@ -1181,6 +1189,35 @@ RValue AArch64ABIInfo::EmitMSVAArg(CodeGenFunction &CGF, Address VAListAddr,
                           CGF.getContext().getTypeInfoInChars(Ty),
                           CharUnits::fromQuantity(8),
                           /*allowHigherAlign*/ false, Slot);
+}
+
+// c2go §2.3: the va_list (`ap`) is a void* whose value is a void** cursor
+// pointing at the current element of the caller-packed `void* argptrs[]`
+// array. Each array element points to the storage of one vararg. Thus
+//   va_arg(ap, T) == *(T*)(*ap++).
+// No AAPCS register-save-area walk; the callee has no reg-save prologue.
+RValue AArch64ABIInfo::EmitC2GoVAArg(CodeGenFunction &CGF, Address VAListAddr,
+                                     QualType Ty, AggValueSlot Slot) const {
+  CGBuilderTy &Builder = CGF.Builder;
+  llvm::Type *PtrTy = llvm::PointerType::getUnqual(CGF.getLLVMContext());
+  CharUnits PtrSize = CharUnits::fromQuantity(8);
+
+  // `ap` holds the current cursor (a void** value). VAListAddr is `&ap`.
+  Address CursorSlot = VAListAddr.withElementType(PtrTy);
+  llvm::Value *Cursor = Builder.CreateLoad(CursorSlot, "c2go.va.cur");
+
+  // Load the i-th argptr (the address of the vararg's storage), then advance
+  // the cursor by one pointer for the next va_arg.
+  Address ArgPtrAddr(Cursor, PtrTy, PtrSize);
+  llvm::Value *ArgStorage = Builder.CreateLoad(ArgPtrAddr, "c2go.va.argp");
+  llvm::Value *NextCursor = Builder.CreateConstInBoundsGEP1_64(
+      PtrTy, Cursor, 1, "c2go.va.next");
+  Builder.CreateStore(NextCursor, CursorSlot);
+
+  // The storage holds the vararg value; load it as T.
+  CharUnits TyAlign = getContext().getTypeUnadjustedAlignInChars(Ty);
+  Address ResAddr(ArgStorage, CGF.ConvertTypeForMem(Ty), TyAlign);
+  return CGF.EmitLoadOfAnyValue(CGF.MakeAddrLValue(ResAddr, Ty), Slot);
 }
 
 static bool isStreamingCompatible(const FunctionDecl *F) {

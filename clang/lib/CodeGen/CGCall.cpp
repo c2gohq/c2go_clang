@@ -43,6 +43,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Type.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include <optional>
 using namespace clang;
@@ -117,6 +118,13 @@ unsigned CodeGenTypes::ClangCallConvToLLVMCallConv(CallingConv CC) {
     CC_VLS_CASE(32768)
     CC_VLS_CASE(65536)
 #undef CC_VLS_CASE
+  case CC_GoABI0: return llvm::CallingConv::GoABI0;
+  // c2go (#290): CC_C2GoInternal is the front-end type for c2go internal abi0
+  // (unannotated / c2go_managed functions). It currently lowers identically to
+  // GoABI0 stack passing (register-return per §2.0.2 is not yet implemented);
+  // CodeGenModule::useC2GoGoABI0CallingConv overrides this for real c2go
+  // functions, so this only serves as a coherent fallback value.
+  case CC_C2GoInternal: return llvm::CallingConv::GoABI0;
   }
 }
 
@@ -230,7 +238,8 @@ using ExtParameterInfoList =
 static const CGFunctionInfo &
 arrangeLLVMFunctionInfo(CodeGenTypes &CGT, bool instanceMethod,
                         SmallVectorImpl<CanQualType> &prefix,
-                        CanQual<FunctionProtoType> FTP) {
+                        CanQual<FunctionProtoType> FTP,
+                        FnInfoOpts extraOpts = FnInfoOpts::None) {
   ExtParameterInfoList paramInfos;
   RequiredArgs Required = RequiredArgs::forPrototypePlus(FTP, prefix.size());
   appendParameterTypes(CGT, prefix, paramInfos, FTP);
@@ -238,11 +247,18 @@ arrangeLLVMFunctionInfo(CodeGenTypes &CGT, bool instanceMethod,
 
   FnInfoOpts opts =
       instanceMethod ? FnInfoOpts::IsInstanceMethod : FnInfoOpts::None;
+  opts |= extraOpts;
   return CGT.arrangeLLVMFunctionInfo(resultType, opts, prefix,
                                      FTP->getExtInfo(), paramInfos, Required);
 }
 
 using CanQualTypeList = SmallVector<CanQualType, 16>;
+
+// c2go (ABI foundation): defined below; used by arrangeFunctionDeclaration
+// to keep the definition's CGFunctionInfo IsGoABI0 flag in sync with the
+// GoABI0 call site.
+static bool isC2GoABI0Function(CodeGenModule &CGM, const Decl *D,
+                               const FunctionType *fnType);
 
 /// Arrange the argument and result information for a value of the
 /// given freestanding function type.
@@ -539,15 +555,29 @@ CodeGenTypes::arrangeFunctionDeclaration(const GlobalDecl GD) {
     FTy = FT->getCanonicalTypeUnqualified();
   }
 
+  // c2go (ABI foundation): mark the definition's CGFunctionInfo with
+  // IsGoABI0 so its IR signature (record-return slot lowering) matches the
+  // GoABI0 call site arranged in arrangeFreeFunctionCall. Without this the
+  // def and call would compute distinct CGFunctionInfo (Profile differs on
+  // goABI0) and a struct-returning function could be lowered two different
+  // ways. isC2GoABI0Function excludes boundary symbols' callees and internal
+  // variadic functions (those take the void** path, which needs !isGoABI0).
+  FnInfoOpts GoABI0Opt =
+      isC2GoABI0Function(CGM, FD, FTy->getAs<FunctionType>())
+          ? FnInfoOpts::IsGoABI0
+          : FnInfoOpts::None;
+
   // When declaring a function without a prototype, always use a
   // non-variadic type.
   if (CanQual<FunctionNoProtoType> noProto = FTy.getAs<FunctionNoProtoType>()) {
-    return arrangeLLVMFunctionInfo(noProto->getReturnType(), FnInfoOpts::None,
-                                   {}, noProto->getExtInfo(), {},
+    return arrangeLLVMFunctionInfo(noProto->getReturnType(), GoABI0Opt, {},
+                                   noProto->getExtInfo(), {},
                                    RequiredArgs::All);
   }
 
-  return arrangeFreeFunctionType(FTy.castAs<FunctionProtoType>());
+  CanQualTypeList prefix;
+  return ::arrangeLLVMFunctionInfo(*this, /*instanceMethod=*/false, prefix,
+                                   FTy.castAs<FunctionProtoType>(), GoABI0Opt);
 }
 
 /// Arrange the argument and result information for the declaration or
@@ -652,12 +682,38 @@ CodeGenTypes::arrangeMSCtorClosure(const CXXConstructorDecl *CD,
                                  RequiredArgs::All);
 }
 
+/// c2go: true when a call's CGFunctionInfo should use GoABI0 ABI lowering
+/// (FnInfoOpts::IsGoABI0) — GoABI0 return-slot lowering for record returns,
+/// and suppression of the platform variadic register-save-area path.
+///
+/// This holds for:
+///   * GoABI0 boundary symbols (c2go_extern / c2go_linkname) — v15 §P5;
+///   * every internal c2go function (ABI foundation) — args/results on the
+///     Go ABI0 stack frame, mirroring the IR-level CC override at the call
+///     site (CommonEmitCall) and definition (SetLLVMFunctionAttributes).
+///
+/// Internal *variadic* functions are excluded: they go through the c2go
+/// `void**` tagged-argument-pack path (arrangeLLVMFunctionInfo), which
+/// rewrites them to a non-variadic IR signature and requires !isGoABI0 to
+/// fire. The CC override still tags the resulting (non-variadic) call/def
+/// with GoABI0 so the packed args land on the stack.
+static bool isC2GoABI0Function(CodeGenModule &CGM, const Decl *D,
+                               const FunctionType *fnType) {
+  if (D && (D->hasAttr<C2GoExternAttr>() || D->hasAttr<C2GoLinknameAttr>()))
+    return true;
+  if (!CGM.useC2GoGoABI0CC(D))
+    return false;
+  const auto *FPT = dyn_cast_or_null<FunctionProtoType>(fnType);
+  return !(FPT && FPT->isVariadic());
+}
+
 /// Arrange a call as unto a free function, except possibly with an
 /// additional number of formal parameters considered required.
 static const CGFunctionInfo &
 arrangeFreeFunctionLikeCall(CodeGenTypes &CGT, CodeGenModule &CGM,
                             const CallArgList &args, const FunctionType *fnType,
-                            unsigned numExtraRequiredArgs, bool chainCall) {
+                            unsigned numExtraRequiredArgs, bool chainCall,
+                            bool isGoABI0) {
   assert(args.size() >= numExtraRequiredArgs);
 
   ExtParameterInfoList paramInfos;
@@ -688,6 +744,8 @@ arrangeFreeFunctionLikeCall(CodeGenTypes &CGT, CodeGenModule &CGM,
   for (const auto &arg : args)
     argTypes.push_back(CGT.getContext().getCanonicalParamType(arg.Ty));
   FnInfoOpts opts = chainCall ? FnInfoOpts::IsChainCall : FnInfoOpts::None;
+  if (isGoABI0)
+    opts |= FnInfoOpts::IsGoABI0;
   return CGT.arrangeLLVMFunctionInfo(GetReturnType(fnType->getReturnType()),
                                      opts, argTypes, fnType->getExtInfo(),
                                      paramInfos, required);
@@ -698,9 +756,12 @@ arrangeFreeFunctionLikeCall(CodeGenTypes &CGT, CodeGenModule &CGM,
 /// because the function might be unprototyped, in which case it's
 /// target-dependent in crazy ways.
 const CGFunctionInfo &CodeGenTypes::arrangeFreeFunctionCall(
-    const CallArgList &args, const FunctionType *fnType, bool chainCall) {
+    const CallArgList &args, const FunctionType *fnType, bool chainCall,
+    const Decl *targetDecl) {
   return arrangeFreeFunctionLikeCall(*this, CGM, args, fnType,
-                                     chainCall ? 1 : 0, chainCall);
+                                     chainCall ? 1 : 0, chainCall,
+                                     isC2GoABI0Function(CGM, targetDecl,
+                                                        fnType));
 }
 
 /// A block function is essentially a free function with an
@@ -709,7 +770,7 @@ const CGFunctionInfo &
 CodeGenTypes::arrangeBlockFunctionCall(const CallArgList &args,
                                        const FunctionType *fnType) {
   return arrangeFreeFunctionLikeCall(*this, CGM, args, fnType, 1,
-                                     /*chainCall=*/false);
+                                     /*chainCall=*/false, /*isGoABI0=*/false);
 }
 
 const CGFunctionInfo &
@@ -844,8 +905,31 @@ const CGFunctionInfo &CodeGenTypes::arrangeLLVMFunctionInfo(
       (opts & FnInfoOpts::IsChainCall) == FnInfoOpts::IsChainCall;
   bool isDelegateCall =
       (opts & FnInfoOpts::IsDelegateCall) == FnInfoOpts::IsDelegateCall;
+  bool isGoABI0 = (opts & FnInfoOpts::IsGoABI0) == FnInfoOpts::IsGoABI0;
+
+  // c2go §2.3: a c2go-internal variadic function uses the void** tagged
+  // argument-pack ABI. Lower it to a *non-variadic* IR signature whose trailing
+  // parameter is the caller-packed `void**` argptrs cursor. This both kills the
+  // callee's platform register-save-area prologue (the function is no longer
+  // IR-variadic) and turns the call site into a plain non-variadic call (no
+  // per-callsite SUB/ADD sp from #130). GoABI0 boundary symbols keep the
+  // platform ABI and are excluded via isGoABI0. The matching extra argument
+  // value is supplied at the call site (the argptrs array) and the matching
+  // synthetic parameter is added on the definition side in BuildFunctionArgList.
+  CanQualTypeList c2goArgTypes;
+  if (getContext().getLangOpts().C2GoMode && required.allowsOptionalArgs() &&
+      !isGoABI0) {
+    c2goArgTypes.assign(argTypes.begin(),
+                        argTypes.begin() + required.getNumRequiredArgs());
+    c2goArgTypes.push_back(getContext().getCanonicalParamType(
+        getContext().getPointerType(getContext().VoidPtrTy)));
+    argTypes = c2goArgTypes;
+    required = RequiredArgs::All;
+    paramInfos = {};
+  }
   CGFunctionInfo::Profile(ID, isInstanceMethod, isChainCall, isDelegateCall,
-                          info, paramInfos, required, resultType, argTypes);
+                          isGoABI0, info, paramInfos, required, resultType,
+                          argTypes);
 
   void *insertPos = nullptr;
   CGFunctionInfo *FI = FunctionInfos.FindNodeOrInsertPos(ID, insertPos);
@@ -856,7 +940,8 @@ const CGFunctionInfo &CodeGenTypes::arrangeLLVMFunctionInfo(
 
   // Construct the function info.  We co-allocate the ArgInfos.
   FI = CGFunctionInfo::create(CC, isInstanceMethod, isChainCall, isDelegateCall,
-                              info, paramInfos, resultType, argTypes, required);
+                              isGoABI0, info, paramInfos, resultType, argTypes,
+                              required);
   FunctionInfos.InsertNode(FI, insertPos);
 
   bool inserted = FunctionsBeingProcessed.insert(FI).second;
@@ -872,6 +957,47 @@ const CGFunctionInfo &CodeGenTypes::arrangeLLVMFunctionInfo(
     swiftcall::computeABIInfo(CGM, *FI);
   } else {
     CGM.getABIInfo().computeInfo(*FI);
+  }
+
+  // c2go v15 §P5: a GoABI0 function returning a struct carries a Go
+  // multiple-return tuple (or a single Go struct result). Go's ABI0 lays
+  // ALL results on the caller's stack frame after the args, one slot per
+  // result — it never uses a hidden sret pointer, and never packs several
+  // sub-word results into one word the way the AArch64 C ABI's `[N x i64]`
+  // coercion would for a >16-byte aggregate. Force the return to a Direct
+  // coerce of the *literal* struct type so the backend's RetCC_*_GoABI0
+  // flattens it field-by-field into consecutive ABI0 result slots, matching
+  // the field<->return 1:1 contract validated by Sema for `c2g_return_type`.
+  // The GoABI0 CC is applied as an IR-level skin (the AST type keeps the C
+  // CC), so it is signalled here via FnInfoOpts::IsGoABI0 set by the
+  // attribute-aware arrange paths. (See design.md §2 "大返回值用 result slot
+  // 而非隐式 sret pointer" and §P5.)
+  if ((opts & FnInfoOpts::IsGoABI0) == FnInfoOpts::IsGoABI0 &&
+      FI->getReturnType().getTypePtr()->isRecordType()) {
+    llvm::Type *RetTy = ConvertTypeForMem(FI->getReturnType());
+    FI->getReturnInfo() = ABIArgInfo::getDirect(RetTy);
+  }
+
+  // c2go #273: a GoABI0 function taking a record (struct/union) by value
+  // must lay its fields out *inline* on the caller's stack frame, one
+  // field per slot, matching what `cmd/asm` would emit for the same
+  // signature in Plan 9 .s. The AArch64 platform ABI's classify routine
+  // would otherwise hand back either an [N x i64] coerce (≤16B, fields
+  // happen to align by accident) or a `byval ptr` (>16B, fields land
+  // behind an indirect pointer slot — structurally wrong vs Go ABI0).
+  //
+  // Mirror the return-side fix above: force a Direct coerce to the
+  // *literal* struct type. The backend's LowerFormalArguments /
+  // LowerCall split the literal aggregate into per-field parts, each of
+  // which falls into the CC_AArch64_GoABI0 scalar rules (i32 → 4B slot,
+  // i64/ptr → 8B slot) and lands at the correct caller-stack offset.
+  if ((opts & FnInfoOpts::IsGoABI0) == FnInfoOpts::IsGoABI0) {
+    for (auto &I : FI->arguments()) {
+      if (I.type.getTypePtr()->isRecordType()) {
+        llvm::Type *ArgTy = ConvertTypeForMem(I.type);
+        I.info = ABIArgInfo::getDirect(ArgTy);
+      }
+    }
   }
 
   // Loop over all of the computed argument and return value info.  If any of
@@ -894,6 +1020,7 @@ const CGFunctionInfo &CodeGenTypes::arrangeLLVMFunctionInfo(
 
 CGFunctionInfo *CGFunctionInfo::create(unsigned llvmCC, bool instanceMethod,
                                        bool chainCall, bool delegateCall,
+                                       bool goABI0,
                                        const FunctionType::ExtInfo &info,
                                        ArrayRef<ExtParameterInfo> paramInfos,
                                        CanQualType resultType,
@@ -913,6 +1040,7 @@ CGFunctionInfo *CGFunctionInfo::create(unsigned llvmCC, bool instanceMethod,
   FI->InstanceMethod = instanceMethod;
   FI->ChainCall = chainCall;
   FI->DelegateCall = delegateCall;
+  FI->GoABI0 = goABI0;
   FI->CmseNSCall = info.getCmseNSCall();
   FI->NoReturn = info.getNoReturn();
   FI->ReturnsRetained = info.getProducesResult();
@@ -4310,6 +4438,66 @@ static AggValueSlot createPlaceholderSlot(CodeGenFunction &CGF, QualType Ty) {
       AggValueSlot::IsNotAliased, AggValueSlot::DoesNotOverlap);
 }
 
+void CodeGenFunction::EmitC2GoVarArgPack(CallArgList &Args, unsigned NumFixed) {
+  assert(Args.size() >= NumFixed);
+  unsigned NumVarArgs = Args.size() - NumFixed;
+
+  llvm::Type *PtrTy = llvm::PointerType::getUnqual(getLLVMContext());
+  CharUnits PtrAlign = getPointerAlign();
+
+  // The `void* argptrs[N]` array. A fixed-size entry-block alloca (folded into
+  // the frame; no SP movement). It is a pointer array → it must be GC-scanned
+  // so that any managed pointer passed as a vararg stays reachable and is
+  // relocated by copystack. Tag it `!c2go.ptr.managed` like other managed
+  // locals so the §B3 stackmap machinery includes it in gclocals.
+  llvm::ArrayType *ArrTy = llvm::ArrayType::get(PtrTy, NumVarArgs);
+  RawAddress ArgPtrs =
+      CreateTempAlloca(ArrTy, PtrAlign, "c2go.va.argptrs");
+  if (auto *AI = dyn_cast<llvm::AllocaInst>(
+          ArgPtrs.getPointer()->stripPointerCasts())) {
+    llvm::LLVMContext &Ctx = AI->getContext();
+    llvm::Metadata *Ops[] = {llvm::MDString::get(Ctx, "c2go.va")};
+    AI->setMetadata(llvm::c2go::kPtrManagedMD, llvm::MDNode::get(Ctx, Ops));
+    // #327: also flag the argptrs array as a vararg pack (see the va.slot
+    // tagging below) so the statepoint path excludes it from per-PC
+    // aggregate-field expansion.
+    AI->setMetadata(llvm::c2go::kVaPackMD, llvm::MDNode::get(Ctx, {}));
+  }
+
+  // For each vararg: allocate a fixed storage slot, copy the value in, and
+  // record &storage in argptrs[i].
+  for (unsigned i = 0; i != NumVarArgs; ++i) {
+    const CallArg &A = Args[NumFixed + i];
+    QualType Ty = A.getType();
+    RawAddress Storage = CreateMemTemp(Ty, "c2go.va.slot");
+    // #327: mark the vararg storage slot `!c2go.va.pack` (a dedicated flag,
+    // NOT c2go.ptr.managed — we must not change StackColoring / the lightweight
+    // -O0 gclocals behavior). The statepoint GC path (the #327 fold pass /
+    // LowerSTATEPOINT) uses this flag to EXCLUDE vararg-pack allocas from
+    // per-PC aggregate-field expansion: RS4GC keeps their ADDRESS live across
+    // unrelated safepoints, but each slot's pointer content is only valid in
+    // the narrow window right before its own vararg call (and stack-coloring
+    // merges disjoint-lifetime va slots), so expanding the field elsewhere
+    // marks an uninitialized word as a pointer ("bad pointer in frame ... 0x1").
+    if (auto *AI = dyn_cast<llvm::AllocaInst>(
+            Storage.getPointer()->stripPointerCasts())) {
+      llvm::LLVMContext &Ctx = AI->getContext();
+      AI->setMetadata(llvm::c2go::kVaPackMD, llvm::MDNode::get(Ctx, {}));
+    }
+    A.copyInto(*this, Storage);
+
+    llvm::Value *Slot = Builder.CreateConstInBoundsGEP2_64(
+        ArrTy, ArgPtrs.getPointer(), 0, i, "c2go.va.elt");
+    Builder.CreateStore(Storage.getPointer(),
+                        Address(Slot, PtrTy, PtrAlign));
+  }
+
+  // Drop the spread varargs and append the single void** array base pointer.
+  Args.truncate(NumFixed);
+  QualType VaTy = getContext().getPointerType(getContext().VoidPtrTy);
+  Args.add(RValue::get(ArgPtrs.getPointer()), VaTy);
+}
+
 void CodeGenFunction::EmitDelegateCallArg(CallArgList &args,
                                           const VarDecl *param,
                                           SourceLocation loc) {
@@ -5996,6 +6184,37 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
 
   // Apply the attributes and calling convention.
   CI->setAttributes(Attrs);
+
+  // c2go (ABI foundation): every c2go call site uses the GoABI0 calling
+  // convention, matching the function-definition CC in
+  // CodeGenModule::SetLLVMFunctionAttributes so call and callee agree on
+  // ABI. This covers indirect calls (TargetDecl == null) too — SQLite
+  // dispatches heavily through function pointers, and every call must use the
+  // same stack ABI. Boundary symbols (c2go_extern / c2go_linkname) are
+  // INCLUDED via useC2GoGoABI0CallingConv: a C caller of an exported function
+  // must match the GoABI0 definition CC (useC2GoGoABI0CC alone would exclude
+  // them and produce an ABI mismatch).
+  if (CGM.useC2GoGoABI0CallingConv(TargetDecl)) {
+    CallingConv = llvm::CallingConv::GoABI0;
+    // c2go §2.0.2/§2.0.3: internal callees return results in registers
+    // (ABIInternal). Direct boundary calls (c2go_extern / c2go_linkname) keep
+    // ABI0 stack returns; indirect calls (TargetDecl == null) default to the
+    // internal register convention (SQLite vtable/callback pointers point at
+    // internal static functions). The backend reads this call-site attr to
+    // pick the result RetCC. Note: useC2GoGoABI0CallingConv is true for
+    // boundary too (CC match), so the register decision must explicitly
+    // exclude boundary here.
+    // c2go §2.0.2 (#281): both the IsBoundary check and the opt-level gate
+    // are folded into CGM.shouldUseC2GoRegReturn — this is the single source
+    // of truth shared with the callee body in CodeGenModule.cpp. For indirect
+    // calls (TargetDecl == null), shouldUseC2GoRegReturn treats the target as
+    // internal (no boundary attrs) and just consults the opt-level. Without
+    // this, a caller at -O2 would read X0 while a -O0 callee wrote the result
+    // slot on the stack.
+    if (CGM.shouldUseC2GoRegReturn(TargetDecl))
+      CI->addFnAttr(llvm::Attribute::get(CI->getContext(), "c2go-reg-return"));
+  }
+
   CI->setCallingConv(static_cast<llvm::CallingConv::ID>(CallingConv));
 
   // Apply various metadata.

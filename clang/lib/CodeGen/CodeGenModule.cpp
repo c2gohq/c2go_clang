@@ -13,6 +13,7 @@
 #include "CodeGenModule.h"
 #include "ABIInfo.h"
 #include "CGBlocks.h"
+#include "CGC2GoManifestHelpers.h"
 #include "CGCUDARuntime.h"
 #include "CGCXXABI.h"
 #include "CGCall.h"
@@ -55,6 +56,8 @@
 #include "llvm/IR/AttributeMask.h"
 #include "llvm/IR/CallingConv.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -72,8 +75,12 @@
 #include "llvm/TargetParser/RISCVISAInfo.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/TargetParser/X86TargetParser.h"
+#include "llvm/Transforms/C2Go/C2GoExportName.h"
+#include "llvm/Transforms/C2Go/C2GoLeafEligibility.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include "llvm/Transforms/Instrumentation/KCFI.h"
 #include "llvm/Transforms/Utils/BuildLibCalls.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <optional>
 #include <set>
 
@@ -142,12 +149,24 @@ createTargetCodeGenInfo(CodeGenModule &CGM) {
   case llvm::Triple::aarch64_32:
   case llvm::Triple::aarch64_be: {
     AArch64ABIKind Kind = AArch64ABIKind::AAPCS;
-    if (Target.getABI() == "darwinpcs")
-      Kind = AArch64ABIKind::DarwinPCS;
-    else if (Triple.isOSWindows())
-      return createWindowsAArch64TargetCodeGenInfo(CGM, AArch64ABIKind::Win64);
-    else if (Target.getABI() == "aapcs-soft")
-      Kind = AArch64ABIKind::AAPCSSoft;
+    // c2go (#260): force the AAPCS ABI regardless of host. c2go's internal
+    // ABI is AAPCS and the Plan 9 .s is codegen'd with a host-neutral ELF
+    // triple (#255); the host's DarwinPCS/Win64 variants would make the
+    // front end emit host-flavored IR the neutral backend can't lower — most
+    // critically the Darwin `va_arg` ISD node (only Darwin's LowerVAARG
+    // handles it). AAPCS uses an explicit register-save-area va_arg the
+    // neutral backend lowers, and the matching AAPCS va_list type is forced
+    // in DarwinAArch64TargetInfo::getBuiltinVaListKind. (Internal-ABI only;
+    // the GoABI0 boundary CC is applied separately. External host-ABI calls
+    // go through the purego path.)
+    if (!CGM.getLangOpts().C2GoMode) {
+      if (Target.getABI() == "darwinpcs")
+        Kind = AArch64ABIKind::DarwinPCS;
+      else if (Triple.isOSWindows())
+        return createWindowsAArch64TargetCodeGenInfo(CGM, AArch64ABIKind::Win64);
+      else if (Target.getABI() == "aapcs-soft")
+        Kind = AArch64ABIKind::AAPCSSoft;
+    }
 
     return createAArch64TargetCodeGenInfo(CGM, Kind);
   }
@@ -855,6 +874,197 @@ void CodeGenModule::clear() {
     OpenMPRuntime->clear();
 }
 
+bool CodeGenModule::usesC2GoVoidPtrVararg(const FunctionType *FnType,
+                                          const Decl *D) const {
+  if (!getLangOpts().C2GoMode)
+    return false;
+  const auto *FPT = dyn_cast_or_null<FunctionProtoType>(FnType);
+  if (!FPT || !FPT->isVariadic())
+    return false;
+  // GoABI0 boundary symbols (c2go_extern / c2go_linkname) keep the platform
+  // ABI; everything else internal uses the void** tagged argument pack.
+  if (D && (D->hasAttr<C2GoExternAttr>() || D->hasAttr<C2GoLinknameAttr>()))
+    return false;
+  return true;
+}
+
+bool CodeGenModule::useC2GoGoABI0CC(const Decl *D) const {
+  if (!getLangOpts().C2GoMode)
+    return false;
+  // GoABI0 boundary symbols keep the platform ABI (the Go side calls them
+  // through an ABI0 wrapper / the external host-ABI bridge). Everything else
+  // internal uses GoABI0 stack passing.
+  if (D && (D->hasAttr<C2GoExternAttr>() || D->hasAttr<C2GoLinknameAttr>()))
+    return false;
+  return true;
+}
+
+bool CodeGenModule::useC2GoGoABI0CallingConv(const Decl *D) const {
+  if (!getLangOpts().C2GoMode)
+    return false;
+  // Boundary symbols are excluded by useC2GoGoABI0CC (void** vararg path), but
+  // Go calls them via ABI0, so their definitions/call sites still need the
+  // GoABI0 LLVM calling convention. Add them back here.
+  if (D && (D->hasAttr<C2GoExternAttr>() || D->hasAttr<C2GoLinknameAttr>()))
+    return true;
+  return useC2GoGoABI0CC(D);
+}
+
+bool CodeGenModule::shouldUseC2GoRegReturn(const Decl *D) const {
+  // c2go §2.0.2 (#281): only c2go-mode internal (non-boundary) functions get
+  // the register-return convention, and only at -O2+ (the -O0/-O1 path keeps
+  // ABI0 stack returns for debuggability). Boundary symbols (c2go_extern /
+  // c2go_linkname) are excluded by useC2GoGoABI0CC; indirect calls (D==null)
+  // default to internal — SQLite vtable/callback pointers target internal
+  // static functions.
+  if (!useC2GoGoABI0CC(D))
+    return false;
+  return CodeGenOpts.OptimizationLevel >= 2;
+}
+
+uint64_t CodeGenModule::computeC2GoArgSize(const FunctionDecl *FD,
+                                           bool ResultInRegisters) const {
+  // RegSize on the c2go target (arm64) is the pointer size. Mirrors Go's
+  // TFUNCARGS Argwid computation (cmd/compile types/size.go) that `go vet`'s
+  // asmdecl checker validates `$framesize-argsize` against.
+  const ASTContext &Ctx = getContext();
+  const uint64_t RegSize =
+      Ctx.getTargetInfo().getPointerWidth(LangAS::Default) / 8;
+  auto alignUp = [](uint64_t Off, uint64_t Align) {
+    if (Align == 0)
+      Align = 1;
+    return (Off + Align - 1) & ~(Align - 1);
+  };
+  auto Place = [&](QualType QT, uint64_t &Cur) {
+    QT = QT.getCanonicalType();
+    if (QT->isVoidType())
+      return;
+    uint64_t Sz = Ctx.getTypeSizeInChars(QT).getQuantity();
+    uint64_t Al = Ctx.getTypeAlignInChars(QT).getQuantity();
+    Cur = alignUp(Cur, Al);
+    Cur += Sz;
+  };
+  uint64_t Total = 0;
+  for (const ParmVarDecl *PVD : FD->parameters())
+    Place(PVD->getType(), Total);
+  // c2go §2.3: an internal variadic function carries a synthetic trailing
+  // `void**` argptrs pointer (BuildFunctionArgList), so its arg area gains
+  // one pointer slot beyond the named params.
+  if (usesC2GoVoidPtrVararg(FD->getType()->getAs<FunctionType>(), FD))
+    Place(Ctx.getPointerType(Ctx.VoidPtrTy), Total);
+  // Round the arg area up to RegSize.
+  Total = alignUp(Total, RegSize);
+  // c2go §2.0.2: internal (register-return) functions place results in
+  // registers (ABIInternal), so their argsize (`M` in `$N-M`) covers params
+  // only — no trailing result slot. Boundary (c2go_extern / c2go_linkname)
+  // functions keep ABI0 stack results, so they still reserve the result slot.
+  if (!ResultInRegisters) {
+    Place(FD->getReturnType(), Total);
+    Total = alignUp(Total, RegSize);
+  }
+  return Total;
+}
+
+std::string CodeGenModule::computeC2GoArgPtrMask(const FunctionDecl *FD,
+                                                 bool ResultInRegisters) const {
+  // Mirror computeC2GoArgSize's placement EXACTLY so the produced mask aligns
+  // with the declared argsize `M`. We additionally record the pointer-word
+  // index of every pointer-typed argument word.
+  const ASTContext &Ctx = getContext();
+  const uint64_t RegSize =
+      Ctx.getTargetInfo().getPointerWidth(LangAS::Default) / 8;
+  auto alignUp = [](uint64_t Off, uint64_t Align) {
+    if (Align == 0)
+      Align = 1;
+    return (Off + Align - 1) & ~(Align - 1);
+  };
+  uint64_t Total = 0;
+  std::vector<uint64_t> PtrWords;
+  auto Place = [&](QualType QT, bool MarkIfPointer) {
+    QT = QT.getCanonicalType();
+    if (QT->isVoidType())
+      return;
+    uint64_t Sz = Ctx.getTypeSizeInChars(QT).getQuantity();
+    uint64_t Al = Ctx.getTypeAlignInChars(QT).getQuantity();
+    Total = alignUp(Total, Al);
+    if (MarkIfPointer && QT->isPointerType())
+      PtrWords.push_back(Total / RegSize);
+    Total += Sz;
+  };
+  for (const ParmVarDecl *PVD : FD->parameters())
+    Place(PVD->getType(), /*MarkIfPointer=*/true);
+  // The synthetic trailing `void**` argptrs of a c2go variadic function is a
+  // genuine pointer into the varargs area; mark it too (sound either way).
+  if (usesC2GoVoidPtrVararg(FD->getType()->getAs<FunctionType>(), FD))
+    Place(Ctx.getPointerType(Ctx.VoidPtrTy), /*MarkIfPointer=*/true);
+  Total = alignUp(Total, RegSize);
+  // Result slot (boundary functions only): callee-written, not an incoming
+  // caller-stack pointer, so it is never marked.
+  if (!ResultInRegisters) {
+    Place(FD->getReturnType(), /*MarkIfPointer=*/false);
+    Total = alignUp(Total, RegSize);
+  }
+  if (PtrWords.empty())
+    return std::string();
+  // ArgNbit = number of pointer-sized words in the arg area — must match the
+  // streamer's `(ArgSize + 7) / 8` so the bitmap width agrees.
+  uint64_t ArgNbit = (Total + 7) / 8;
+  std::vector<uint8_t> Bits((ArgNbit + 7) / 8, 0);
+  for (uint64_t W : PtrWords) {
+    if (W >= ArgNbit)
+      continue;
+    Bits[W / 8] |= uint8_t(1) << (W % 8);
+  }
+  std::string Hex;
+  Hex.reserve(Bits.size() * 2);
+  static const char HexDigits[] = "0123456789abcdef";
+  for (uint8_t B : Bits) {
+    Hex.push_back(HexDigits[B >> 4]);
+    Hex.push_back(HexDigits[B & 0xF]);
+  }
+  return Hex;
+}
+
+void CodeGenModule::attachC2GoAllocTargetMetadata(llvm::CallBase *CB,
+                                                 QualType DestPointerType) {
+  // Only meaningful in CGO mode.
+  if (!getLangOpts().C2GoMode)
+    return;
+  if (!CB)
+    return;
+
+  // The call must be to a known C allocator. We match by name to avoid
+  // pulling in TargetLibraryInfo at the frontend layer.
+  llvm::Function *Callee = CB->getCalledFunction();
+  if (!Callee)
+    return;
+  llvm::StringRef Name = Callee->getName();
+  if (Name != "malloc" && Name != "calloc" && Name != "realloc" &&
+      Name != "aligned_alloc" && Name != "valloc")
+    return;
+
+  // Need a pointer-to-record destination.
+  if (DestPointerType.isNull() || !DestPointerType->isPointerType())
+    return;
+  QualType Pointee = DestPointerType->getPointeeType();
+  const RecordType *RT = Pointee->getAs<RecordType>();
+  if (!RT)
+    return;
+  RecordDecl *RD = RT->getDecl();
+  if (!RD || !RD->hasAttr<C2GoStructAttr>())
+    return;
+
+  // Encode the LLVM struct type as a poison value inside the metadata, so
+  // the LLVM pass can recover it via ValueAsMetadata->getType().
+  llvm::Type *StructTy = getTypes().ConvertTypeForMem(Pointee);
+  if (!StructTy || !StructTy->isStructTy())
+    return;
+  llvm::Metadata *Ops[] = {
+      llvm::ValueAsMetadata::get(llvm::PoisonValue::get(StructTy))};
+  CB->setMetadata(llvm::c2go::kAllocTargetTypeMD,
+                  llvm::MDNode::get(getLLVMContext(), Ops));
+}
+
 void InstrProfStats::reportDiagnostics(DiagnosticsEngine &Diags,
                                        StringRef MainFile) {
   if (!hasDiagnostics())
@@ -958,6 +1168,62 @@ void CodeGenModule::Release() {
   DeferredDecls.insert_range(EmittedDeferredDecls);
   EmittedDeferredDecls.clear();
   EmitVTablesOpportunistically();
+  // c2go (#495): synthesize ABI0 forwarding wrappers for address-taken static
+  // register-return functions and redirect the escaping function pointers to
+  // them, so the original bodies can keep the private register ABI. Runs after
+  // EmitDeferred() so every in-TU use is materialized (address-taken is final).
+  if (LangOpts.C2GoMode)
+    EmitC2GoLeafWrappers();
+  // c2go WF2 (#319, C5): materialize and pin every c2go_extern function
+  // declaration so it survives dead-stripping into the bitcode. Without this,
+  // unreferenced unmanaged externs (e.g. raw_read prototype) and
+  // c2go_linkname path-b bridges (e.g. hyphen_helper) get dropped by clang's
+  // dead-decl elimination, and c2go-lto cannot rebuild the corresponding
+  // manifest entries from combined bitcode. Use appendToCompilerUsed so the
+  // pin is LTO-droppable once c2go-lto has read the symbol; appendToUsed
+  // would survive into the final linker output (we do not want that).
+  if (LangOpts.C2GoMode) {
+    llvm::SmallVector<llvm::GlobalValue *, 8> KeepAlive;
+    for (const Decl *D : Context.getTranslationUnitDecl()->decls()) {
+      const auto *FD = dyn_cast<FunctionDecl>(D);
+      if (!FD || !FD->hasAttr<C2GoExternAttr>())
+        continue;
+      if (FD->doesThisDeclarationHaveABody())
+        continue;
+      llvm::Constant *C = GetAddrOfFunction(FD);
+      if (auto *GV = dyn_cast_or_null<llvm::GlobalValue>(C))
+        KeepAlive.push_back(GV);
+    }
+    if (!KeepAlive.empty())
+      llvm::appendToCompilerUsed(getModule(), KeepAlive);
+
+    // c2go WF2 (#319 C4a): walk every c2go_struct RecordDecl in the TU and
+    // emit `c2go.struct.<X>.meta` (managed/scheme/ptr_offset/linkname). The
+    // existing lazy emit in CodeGenTypes::ConvertRecordDeclType only fires
+    // when LLVM actually converts the record by-value (e.g. `agg_by_val(Pair)`);
+    // a c2go_struct only ever used through pointers (e.g. `struct Node *`)
+    // never triggers it, so without this walk c2go-lto would miss Node, U, U1
+    // in cov.c's coverage set. The .godef sibling is filled by
+    // buildC2GoManifest after it has computed the Go-side struct text.
+    auto emitMetaForRD = [&](const RecordDecl *RD) {
+      if (!RD)
+        return;
+      const RecordDecl *Def = RD->getDefinition();
+      if (!Def || !Def->hasAttr<C2GoStructAttr>())
+        return;
+      clang::c2go::emitC2GoStructMeta(getModule(), Def, getContext());
+    };
+    std::function<void(const DeclContext *)> WalkDC =
+        [&](const DeclContext *DC) {
+          for (const Decl *D : DC->decls()) {
+            if (const auto *RD = dyn_cast<RecordDecl>(D))
+              emitMetaForRD(RD);
+            if (const auto *NDC = dyn_cast<DeclContext>(D))
+              WalkDC(NDC);
+          }
+        };
+    WalkDC(Context.getTranslationUnitDecl());
+  }
   applyGlobalValReplacements();
   applyReplacements();
   emitMultiVersionFunctions();
@@ -1165,6 +1431,87 @@ void CodeGenModule::Release() {
   uint64_t WCharWidth =
       Context.getTypeSizeInChars(Context.getWideCharType()).getQuantity();
   getModule().addModuleFlag(llvm::Module::Error, "wchar_size", WCharWidth);
+
+  // c2go Phase B7: when in c2go-mode, tag the module so the backend
+  // reserves X28 (arm64) / R14 (x86_64) — Go's g pseudo-register — in
+  // every function, not just GoABI0 ones. Otherwise a non-GoABI0
+  // helper could clobber g and corrupt the goroutine state seen by a
+  // subsequent GoABI0 call.
+  if (LangOpts.C2GoMode) {
+    // Use Error (not Warning) so LTO IRMover refuses to merge a c2go
+    // module with a non-c2go module instead of silently keeping
+    // inconsistent IR. Same reasoning for the pkgname/pkgpath/version
+    // tags below: they MUST agree across all linked modules of one
+    // c2go package.
+    getModule().addModuleFlag(llvm::Module::Error, llvm::c2go::kGoabiModuleFlag,
+                              uint32_t(1));
+    // c2go #281/#283: publish the clang optimization level so AArch64
+    // backend passes and downstream IR consumers share a single source of
+    // truth for opt-level gating. Error policy mirrors c2go.goabi: LTO
+    // IRMover must refuse to merge modules built at different -O levels
+    // (their c2go-reg-return decisions diverge).
+    getModule().addModuleFlag(llvm::Module::Error,
+                              llvm::c2go::kOptLevelFlag,
+                              uint32_t(CodeGenOpts.OptimizationLevel));
+    // c2go #433: also stamp the target CPU + target-features so a downstream
+    // tool (c2go-lto's Plan-9 codegen) can rebuild a TargetMachine that
+    // matches the .bc producer's view — the previous WF2 path hard-wired
+    // CPU="generic" / Features="+neon" / OptLevel=Aggressive, masking any
+    // .bc compiled at -O0/1 or with a different CPU/feature set.
+    const auto &TargetOpts = getTarget().getTargetOpts();
+    getModule().addModuleFlag(llvm::Module::Error,
+                              llvm::c2go::kTargetCpuFlag,
+                              llvm::MDString::get(VMContext, TargetOpts.CPU));
+    std::string FeaturesJoined =
+        llvm::join(TargetOpts.Features.begin(), TargetOpts.Features.end(), ",");
+    getModule().addModuleFlag(llvm::Module::Error,
+                              llvm::c2go::kTargetFeaturesFlag,
+                              llvm::MDString::get(VMContext, FeaturesJoined));
+    // c2go (#134): the Plan 9 emitter needs the Go package path so it
+    // can rewrite typeinfo references to the standard Go `type:<pkg>.<X>`
+    // form (matching what Go compiler emits for `type X struct {...}`).
+    // We use the LAST path component as the Go package name (Go convention:
+    // import path's tail is the package name unless `package foo` declares
+    // otherwise).
+    StringRef PkgPath = LangOpts.C2GoPackagePath;
+    if (PkgPath.empty())
+      PkgPath = "main";
+    StringRef PkgName = PkgPath;
+    if (auto Pos = PkgPath.find_last_of('/'); Pos != StringRef::npos)
+      PkgName = PkgPath.drop_front(Pos + 1);
+    getModule().addModuleFlag(llvm::Module::Error, "c2go.pkgname",
+                              llvm::MDString::get(VMContext, PkgName));
+    // c2go WF2 (#319, C1): publish the full pkgpath and the version range so
+    // c2go-lto can rebuild the manifest pkgpath / min_go_version /
+    // max_go_version fields without consulting the AST. pkgpath differs from
+    // pkgname (e.g. "foo/bar" vs "bar"); both are needed.
+    getModule().addModuleFlag(llvm::Module::Error, "c2go.pkgpath",
+                              llvm::MDString::get(VMContext, PkgPath));
+    StringRef VerRange = LangOpts.C2GoTargetGoVersion;
+    if (VerRange.empty()) VerRange = "1.22-1.25";
+    getModule().addModuleFlag(llvm::Module::Error, "c2go.target_go_version",
+                              llvm::MDString::get(VMContext, VerRange));
+    // c2go #420 invariant IR-enforce: stamp the legacy managed-alloca
+    // seed/default list as a named metadata so the .bc is self-describing
+    // and downstream tools
+    // (c2go-lto, opt-only LIT, future helpers) can extend it without
+    // patching LLVMC2Go. The list is sourced from
+    // `llvm/Transforms/C2Go/C2GoProtocol.h` (#463 single-source) so this
+    // producer and `C2GoSafepoint.cpp::getBuiltinSafepointCallees()`
+    // cannot drift textually.
+    {
+      auto *NMD = getModule().getOrInsertNamedMetadata(
+          llvm::c2go::kSafepointCalleesMDName);
+      // Idempotent: skip if the module already carries an entry (e.g. an
+      // earlier serialize/deserialize round).
+      if (NMD->getNumOperands() == 0) {
+        for (llvm::StringRef N : llvm::c2go::getBuiltinSafepointCalleeNames()) {
+          llvm::Metadata *Ops[] = {llvm::MDString::get(VMContext, N)};
+          NMD->addOperand(llvm::MDNode::get(VMContext, Ops));
+        }
+      }
+    }
+  }
 
   if (getTriple().isOSzOS()) {
     getModule().addModuleFlag(llvm::Module::Warning,
@@ -2034,6 +2381,40 @@ static void AppendCPUSpecificCPUDispatchMangling(const CodeGenModule &CGM,
     Out << ".resolver";
 }
 
+// c2go (#317): C functions named `init` / `main` collide with Go's
+// language-special symbols once the Plan 9 emitter prepends `·`
+// (`·init` / `·main` would enter the Go symbol space as the package's
+// language-level init/main). To keep them out of that space we
+// UNCONDITIONALLY rename the emitted symbol of any C function named
+// `init`/`main` to a reserved, non-special name. This is independent of
+// c2go_extern — even a plain/static C `main`/`init` is renamed. Doing it
+// here in the mangled-name path makes every reference (definition,
+// call site, address-of) use the renamed symbol consistently.
+//
+// The returned name is the IR-level symbol; the Plan 9 streamer still
+// prepends `·`, so the final Go-visible symbol is `·c2go_cinit` /
+// `·c2go_cmain` (i.e. `<pkg>.c2go_cinit`). buildC2GoManifest mirrors
+// this exact rename when computing `asm_symbol`. (No leading underscore:
+// the Plan 9 streamer/InstPrinter strip a leading `_` from emitted
+// symbols, so a `_`-prefixed IR name would desync the `.s` symbol from
+// the manifest's `asm_symbol`.)
+//
+// Returns the renamed symbol, or an empty StringRef when no rename
+// applies. The bare-name → renamed-symbol mapping lives in the shared
+// helper `llvm::c2go::c2goInitMainRenamedSymbol`
+// (llvm/Transforms/C2Go/C2GoExportName.h), so the WF1 manifest writer
+// and the WF2 fallback path stay in lock-step with this rename emitter
+// by construction (#444).
+static StringRef c2goInitMainRename(const CodeGenModule &CGM,
+                                    const NamedDecl *ND) {
+  if (!CGM.getLangOpts().C2GoMode)
+    return {};
+  const auto *FD = dyn_cast<FunctionDecl>(ND);
+  if (!FD)
+    return {};
+  return llvm::c2go::c2goInitMainRenamedSymbol(FD->getName());
+}
+
 // Returns true if GD is a function decl with internal linkage and
 // needs a unique suffix after the mangled name.
 static bool isUniqueInternalLinkageDecl(GlobalDecl GD,
@@ -2054,7 +2435,12 @@ static std::string getMangledNameImpl(CodeGenModule &CGM, GlobalDecl GD,
   bool ShouldMangle = MC.shouldMangleDeclName(ND);
   if (ShouldMangle)
     MC.mangleName(GD.getWithDecl(ND), Out);
-  else {
+  else if (StringRef C2GoName = c2goInitMainRename(CGM, ND);
+           !C2GoName.empty()) {
+    // c2go (#317): emitted symbol of a C `init`/`main` is renamed so it
+    // never enters Go's language-special symbol space. See helper above.
+    Out << C2GoName;
+  } else {
     IdentifierInfo *II = ND->getIdentifier();
     assert(II && "Attempt to mangle unnamed decl.");
     const auto *FD = dyn_cast<FunctionDecl>(ND);
@@ -2468,6 +2854,184 @@ void CodeGenModule::SetLLVMFunctionAttributes(GlobalDecl GD,
     Error(Loc, "__vectorcall calling convention is not currently supported");
   }
   F->setAttributes(PAL);
+
+  // c2go (ABI foundation): every c2go function uses the GoABI0 stack-passing
+  // calling convention — all args/results live on the caller's stack frame
+  // matching the Go ABI0 layout, so morestack / copystack relocate them across
+  // a stack move (register-passed args are clobbered, the #277 /
+  // sqlite3RunParser crash class). This covers BOTH internal functions and the
+  // boundary symbols (c2go_extern / c2go_linkname): Go calls the latter via
+  // ABI0 (Go auto-generates the ABIInternal->ABI0 wrapper), so their
+  // definitions must expose the GoABI0 CC. Applies regardless of the CC
+  // computed from FunctionType ExtInfo above.
+  if (useC2GoGoABI0CallingConv(GD.getDecl())) {
+    CallingConv = llvm::CallingConv::GoABI0;
+    // c2go (ABI foundation): carry the true Go ABI0 argsize on the IR
+    // function as a string attribute. The AArch64 backend reads it off the
+    // MachineFunction (AArch64FrameLowering::emitC2GoPrologue) and emits
+    // `TEXT ·f(SB), $N-M` with M = argsize, so the GC scans the incoming
+    // argument region. Internal c2go functions never went through the
+    // manifest, so without this they would emit a bogus `$N-0`. Keyed by the
+    // Function object (not a name lookup), so there is no name-mangling skew.
+    // Boundary symbols (c2go_extern / c2go_linkname) are EXCLUDED here: their
+    // argsize comes from the manifest side-channel (emitC2GoPrologue passes
+    // ArgSize=-1 to preserve it), so they use useC2GoGoABI0CC, not the broader
+    // CC predicate above.
+    if (useC2GoGoABI0CC(GD.getDecl())) {
+      if (const auto *FD = dyn_cast_or_null<FunctionDecl>(GD.getDecl())) {
+        // c2go §2.0.2 (#281): internal functions return results in registers
+        // (ABIInternal) ONLY at -O2+; at -O0/-O1 they keep ABI0 stack returns
+        // for debuggability (argsize includes the result slot). The decision
+        // is centralized in shouldUseC2GoRegReturn so callee body and call
+        // site (CGCall.cpp) cannot disagree — a mismatch would have the
+        // caller read X0 while the callee wrote the result slot on the stack
+        // (or vice versa). Boundary symbols (c2go_extern / c2go_linkname) are
+        // already excluded by the outer useC2GoGoABI0CC.
+        const bool RegRet = shouldUseC2GoRegReturn(FD);
+        if (RegRet)
+          F->addFnAttr("c2go-reg-return");
+        // c2go (#495): a static register-return function is a leaf-flip
+        // candidate. If its address escapes (any non-direct-call use), the
+        // backend disqualifies it today (isC2GoAddressTaken). Record it now —
+        // while we still hold the FunctionDecl — and decide in
+        // EmitC2GoLeafWrappers() (after EmitDeferred, when the whole-TU use
+        // set is final) whether to synthesize an ABI0 wrapper for the escaped
+        // pointer so the body can keep the register ABI.
+        //
+        // NOTE: F's linkage is NOT set yet here — SetFunctionAttributes calls
+        // SetLLVMFunctionAttributes (this code) BEFORE setLinkageForGV. So we
+        // must NOT gate on hasLocalLinkage() now (it would always be false);
+        // the static-only check is enforced in EmitC2GoLeafWrappers(), which
+        // runs at Release after linkage is final.
+        if (RegRet)
+          C2GoLeafWrapperCandidates.emplace_back(FD, F);
+        F->addFnAttr("c2go-argsize",
+                     llvm::utostr(computeC2GoArgSize(FD,
+                                                     /*ResultInRegisters=*/RegRet)));
+        // c2go #287 (Option 3): publish the pointer-word mask of the incoming
+        // argument area. The AArch64 backend forwards it to MCPlan9AsmStreamer,
+        // which sets the matching bits in FUNCDATA $0 (args pointer map) so
+        // Go's copystack RELOCATES pointer args that point into the moving
+        // goroutine stack — the cross-Exec dangling-`&local` fix (#282). Empty
+        // => no pointer args => backend keeps the all-zeros args map.
+        std::string ArgPtrMask =
+            computeC2GoArgPtrMask(FD, /*ResultInRegisters=*/RegRet);
+        // c2go #330: always publish the mask (even when all-zero / non-pointer
+        // args) so the AArch64 backend forwards the function's argsize to the
+        // Plan 9 streamer and FUNCDATA $0 is emitted. Without this, an
+        // internal function with non-pointer args (e.g. `int + char`) gets
+        // c2go-argsize=8 but no c2go-argptrmask → the streamer skips the args
+        // funcdata → Go's `getStackMap` aborts with "missing stackmap /
+        // untyped args" when copystack walks the frame.
+        if (ArgPtrMask.empty())
+          ArgPtrMask = "00";
+        F->addFnAttr("c2go-argptrmask", ArgPtrMask);
+      }
+    } else if (const auto *FD =
+                   dyn_cast_or_null<FunctionDecl>(GD.getDecl())) {
+      // c2go #332: c2go_extern (boundary) functions DEFINED in this TU also
+      // need their args pointer bitmap published — Go's copystack walks the
+      // incoming arg area of every c2go frame via FUNCDATA $0 (argsmap) and
+      // would otherwise see an all-zero mask, missing pointer args. Skipped
+      // by the branch above because useC2GoGoABI0CC() excludes boundary
+      // symbols; we add only the argptrmask attr here (NOT c2go-reg-return:
+      // c2go_extern keeps ABI0 stack return; NOT c2go-argsize: the boundary
+      // argsize is fed by the manifest side-channel, emitC2GoPrologue passes
+      // ArgSize=-1 to preserve it).
+      //
+      // c2go_linkname is a DECLARATION referencing a symbol implemented
+      // elsewhere — no function body to scan here, and the implementing side
+      // publishes the bitmap. Intentionally unchanged.
+      if (FD->hasAttr<C2GoExternAttr>() && !FD->hasAttr<C2GoLinknameAttr>() &&
+          FD->doesThisDeclarationHaveABody()) {
+        std::string ArgPtrMask =
+            computeC2GoArgPtrMask(FD, /*ResultInRegisters=*/false);
+        if (ArgPtrMask.empty())
+          ArgPtrMask = "00";
+        F->addFnAttr("c2go-argptrmask", ArgPtrMask);
+      }
+    }
+
+    // c2go WF2 (#319, C2 subset): stamp manifest-grade Go spellings onto the
+    // IR function as string attributes so c2go-lto can rebuild the manifest
+    // from combined bitcode without re-reading the AST. Covers BOTH internal
+    // helpers and boundary symbols (c2go_extern / c2go_linkname) — every
+    // function emitted with the GoABI0 calling convention gets a Go-side
+    // signature; the boundary marker / export-case / boundary-argsize are
+    // added only for c2go_extern, since they only matter for manifest
+    // emission of exported symbols. The strings are computed from the same
+    // helpers buildC2GoManifest uses (clang::c2go::buildC2GoGoSig /
+    // computeC2GoArgSize), keeping round-trip results byte-identical.
+    if (const auto *FD =
+            dyn_cast_or_null<FunctionDecl>(GD.getDecl())) {
+      F->addFnAttr("c2go-c-name", FD->getNameAsString());
+      F->addFnAttr("c2go-go-sig",
+                   clang::c2go::buildC2GoGoSig(FD, getContext()));
+      if (const auto *EA = FD->getAttr<C2GoExternAttr>()) {
+        F->addFnAttr("c2go-boundary");
+        F->addFnAttr("c2go-export-case", llvm::utostr(EA->getExportCase()));
+        F->addFnAttr("c2go-boundary-argsize",
+                     llvm::utostr(clang::c2go::computeC2GoArgSize(
+                         FD, getContext())));
+      }
+      // c2go WF2 (#319 C2 follow-up): stamp the three remaining manifest-
+      // grade attrs that affect symbol "world" (managed vs. unmanaged) and
+      // linkname-host bridging. These are applied to every GoABI0 function,
+      // not just boundaries — e.g. a static helper marked c2go_unmanaged
+      // still flips its return world. param-worlds is a packed
+      // "p<i>=u" CSV; absent attr means "all managed", matching
+      // computeC2GoArgPtrMask's default.
+      if (FD->hasAttr<C2GoUnmanagedAttr>())
+        F->addFnAttr("c2go-unmanaged-return");
+      if (const auto *LN = FD->getAttr<C2GoLinknameAttr>()) {
+        F->addFnAttr("c2go-linkname", LN->getName());
+        // #304: teach native LLVM DSE/GVN that c2go_libc.GCMalloc returns
+        // zero-initialized memory, so redundant `memset(p, 0, n)` / `*p = 0`
+        // sequences after `gc_malloc(typeinfo, n)` are dropped without a
+        // bespoke pass.
+        //   - Match the linkname suffix (ignore the leading "\01"/import-path
+        //     prefix variants), mirroring c2go-lto.cpp:195's ends_with check.
+        //   - allocsize uses ElemSizeArg = 1: in `gc_malloc(type_info, n)`
+        //     the byte size lives at param idx 1; type_info at idx 0 is not
+        //     a size operand.
+        //   - allockind(alloc,zeroed) makes DSE's storeIsNoop /
+        //     getInitialValueOfAllocation treat the return slot as
+        //     zeroinitializer; it does NOT let DCE drop the allocation
+        //     itself (GCMalloc still has visible side effects), so this is
+        //     a pure store-side optimization.
+        //   - noalias on the return value matches calloc/malloc semantics
+        //     (each call yields a fresh object distinct from prior pointers),
+        //     enabling SROA/MemorySSA disambiguation. Statepoint/GC passes
+        //     are unaffected — they operate on calls, not on store DSE.
+        if (LN->getName().ends_with("c2go_libc.GCMalloc")) {
+          auto &Ctx = F->getContext();
+          F->addFnAttr(llvm::Attribute::getWithAllocKind(
+              Ctx, llvm::AllocFnKind::Alloc | llvm::AllocFnKind::Zeroed));
+          F->addFnAttr(llvm::Attribute::getWithAllocSizeArgs(
+              Ctx, /*ElemSizeArg=*/1, /*NumElemsArg=*/std::nullopt));
+          F->addRetAttr(llvm::Attribute::NoAlias);
+          // GCMalloc 只读写 runtime allocator 私有状态 + 入参指向的内存,
+          // 不触及 caller globals / unknown heap. 让 GVN/LICM/DSE 不再假设
+          // 它能 clobber unrelated memory.
+          F->setMemoryEffects(llvm::MemoryEffects::inaccessibleOrArgMemOnly());
+        }
+      }
+      // `c2go-param-worlds` fn attr: per-parameter unmanaged-world marking
+      // surviving -flto/llvm-link round-trip (validated by #319 C2 checkpoint;
+      // see .build_status/c2go_feature_gaps.md §3).
+      std::string ParamWorlds;
+      for (unsigned I = 0, E = FD->getNumParams(); I < E; ++I) {
+        if (FD->getParamDecl(I)->hasAttr<C2GoUnmanagedAttr>()) {
+          if (!ParamWorlds.empty())
+            ParamWorlds += ",";
+          ParamWorlds += "p" + llvm::utostr(I) + "=u";
+        }
+      }
+      if (!ParamWorlds.empty())
+        F->addFnAttr("c2go-param-worlds", ParamWorlds);
+    }
+  }
+
   F->setCallingConv(static_cast<llvm::CallingConv::ID>(CallingConv));
 }
 
@@ -3550,6 +4114,234 @@ void CodeGenModule::EmitModuleLinkOptions() {
     for (auto *MD : LinkerOptionsMetadata)
       NMD->addOperand(MD);
   }
+}
+
+namespace {
+// c2go (#495): a use of F is "escaping" (address-taken) unless it is a direct
+// call where F is the callee operand. Mirrors isC2GoAddressTaken in
+// llvm/Transforms/C2Go/C2GoLeafEligibility.cpp so that after we redirect every
+// escaping use to the wrapper, the backend's address-taken predicate agrees
+// that F is no longer address-taken (and thus leaf-flippable).
+static bool isC2GoEscapingUse(const llvm::Use &U) {
+  const llvm::User *FU = U.getUser();
+  if (const auto *CB = llvm::dyn_cast<llvm::CallBase>(FU))
+    return !CB->isCallee(&U); // arg/bundle operand => escaping; callee => not
+  return true;                // stored / global init / cast => escaping
+}
+
+// c2go (#495): true when an escaping use lives in a constant/global form we do
+// NOT rewrite (alias, ifunc, blockaddress, or inline-asm). For these the whole
+// transform is skipped (fail-closed) — F is left untouched and unoptimized.
+static bool isC2GoUnsupportedEscapeUser(const llvm::User *FU) {
+  return llvm::isa<llvm::GlobalAlias>(FU) || llvm::isa<llvm::GlobalIFunc>(FU) ||
+         llvm::isa<llvm::BlockAddress>(FU) || llvm::isa<llvm::InlineAsm>(FU);
+}
+} // namespace
+
+void CodeGenModule::EmitC2GoLeafWrappers() {
+  // c2go #495 v2 gate (a): run the shared leaf-eligibility analysis ONCE over
+  // the whole module to learn which candidates the backend leaf-flip pass could
+  // actually flip to the register ABI. We pass IgnoreAddressTaken=true because
+  // this runs on PRE-RAUW IR (every candidate is still address-taken via its
+  // escaped pointer); the analysis must answer "is F eligible MODULO being
+  // address-taken?". This is a coarse pre-inline heuristic — it is fail-closed
+  // by the backend's own flip decision (the final authority), so an over-wide
+  // answer only costs one degenerate wrapper and an over-narrow one only skips
+  // an optimization; both are safe. The hooks mirror makeAArch64Hooks /
+  // makeX86Hooks (cushion=16, triple-derived NOSPLIT budget).
+  llvm::c2go::LeafEligibilityTargetHooks Hooks;
+  Hooks.FrameOf = [](const llvm::Function &F) -> uint64_t {
+    return llvm::c2go::estimateLeafFrameBytes(F, /*LinkageCushionBytes=*/16);
+  };
+  Hooks.Budget =
+      llvm::c2go::getNosplitBudgetForTriple(TheModule.getTargetTriple().str());
+  llvm::DenseMap<const llvm::Function *, llvm::c2go::LeafEligibility> Elig =
+      llvm::c2go::analyzeC2GoLeafEligibility(TheModule, Hooks,
+                                             /*PerFuncFrameBytes=*/nullptr,
+                                             /*IgnoreAddressTaken=*/true);
+
+  for (auto &Cand : C2GoLeafWrapperCandidates) {
+    const FunctionDecl *FD = Cand.first;
+    llvm::Function *F = Cand.second;
+    // The candidate may have been replaced/erased after collection.
+    if (!F || F->isDeclaration() || !F->hasLocalLinkage())
+      continue;
+
+    // (a) Leaf-eligible (modulo address-taken)? If the backend leaf-flip pass
+    // could never flip F to the register ABI (its subtree calls an external /
+    // indirect callee, recurses, exceeds the NOSPLIT budget, ...), then a
+    // wrapper is pure dead weight: the escaped pointer would route through an
+    // extra hop + ABI0 marshaling into a body that stays ABI0 anyway. Skip it.
+    auto EligIt = Elig.find(F);
+    if (EligIt == Elig.end() || !EligIt->second.Eligible)
+      continue;
+
+    // (b) Directly called? A wrapper only pays off when F ALSO has at least one
+    // direct call site — those calls benefit from the register body. A function
+    // that is ONLY address-taken (never directly called) gains nothing from a
+    // wrapper: its sole reach is indirect → wrapper → register body, which is
+    // strictly slower than just calling the ABI0 body indirectly. Leave it as
+    // plain ABI0 (no wrapper, no flip).
+    bool HasDirectCall = false;
+    for (const llvm::Use &U : F->uses()) {
+      const auto *CB = llvm::dyn_cast<llvm::CallBase>(U.getUser());
+      if (CB && CB->isCallee(&U)) {
+        HasDirectCall = true;
+        break;
+      }
+    }
+    if (!HasDirectCall)
+      continue;
+
+    // (2) Simple signature only. A wrapper that just forwards its params can
+    // only be synthesized when the IR signature is a plain by-value pass: no
+    // varargs, no indirect-result (sret) / by-value-on-stack (byval) / inalloca
+    // / preallocated / byref / nest / swift* parameter attrs. Anything more
+    // exotic is skipped (F is left as-is, will be disqualified by the backend).
+    if (F->isVarArg() || FD->isVariadic())
+      continue;
+    auto hasExoticAttr = [&](unsigned ArgNo) {
+      return F->hasParamAttribute(ArgNo, llvm::Attribute::StructRet) ||
+             F->hasParamAttribute(ArgNo, llvm::Attribute::ByVal) ||
+             F->hasParamAttribute(ArgNo, llvm::Attribute::ByRef) ||
+             F->hasParamAttribute(ArgNo, llvm::Attribute::InAlloca) ||
+             F->hasParamAttribute(ArgNo, llvm::Attribute::Preallocated) ||
+             F->hasParamAttribute(ArgNo, llvm::Attribute::Nest) ||
+             F->hasParamAttribute(ArgNo, llvm::Attribute::SwiftSelf) ||
+             F->hasParamAttribute(ArgNo, llvm::Attribute::SwiftError) ||
+             F->hasParamAttribute(ArgNo, llvm::Attribute::SwiftAsync);
+    };
+    bool Exotic = false;
+    for (unsigned I = 0, E = F->arg_size(); I < E && !Exotic; ++I)
+      Exotic |= hasExoticAttr(I);
+    // A struct-return that lands as an sret pointer also shows up on the
+    // (synthetic) result; hasStructRetAttr() covers arg 0/1.
+    if (Exotic || F->hasStructRetAttr())
+      continue;
+
+    // (3) Address-taken? Collect escaping uses and bail on unsupported forms.
+    bool HasEscape = false;
+    bool Unsupported = false;
+    for (const llvm::Use &U : F->uses()) {
+      if (!isC2GoEscapingUse(U))
+        continue;
+      HasEscape = true;
+      if (isC2GoUnsupportedEscapeUser(U.getUser())) {
+        Unsupported = true;
+        break;
+      }
+    }
+    if (!HasEscape)
+      continue; // not address-taken: backend already flips it; no wrapper.
+    if (Unsupported)
+      continue; // fail-closed: leave F (GoABI0, unoptimized).
+
+    // Synthesize the internal GoABI0-only forwarding wrapper. Same IR signature
+    // as F (simple by-value pass), so params forward 1:1.
+    llvm::Function *Wrapper = llvm::Function::Create(
+        F->getFunctionType(), llvm::GlobalValue::InternalLinkage,
+        F->getName() + ".c2gowrap", &getModule());
+    // Mirror F's codegen/target attributes onto the wrapper. THIS IS THE #495
+    // amd64 fix: clang stamps "frame-pointer"="all" (+ uwtable, target-cpu /
+    // target-features, ...) on every c2go function. A synthesized wrapper that
+    // LACKS "frame-pointer"="all" makes the X86 backend OMIT the frame pointer,
+    // so a *framed* marshaling wrapper computes its incoming-arg stack offsets
+    // WITHOUT the Go amd64 saved-BP word and reads each arg 8 bytes too low —
+    // the first arg load returns the saved return address, the flipped callee
+    // then receives garbage pointers, and SQLite crashes (sqlite3VdbeExec
+    // nil-deref). aarch64 has no saved-BP word, so it was unaffected (the arch
+    // split). Copying is the right model: a thin ABI shim must codegen like the
+    // function it shims.
+    Wrapper->copyAttributesFrom(F);
+    // Do NOT duplicate F's manifest/naming attrs onto a synthesized internal
+    // forwarder (these drive the c2go-bind manifest entry for the C symbol).
+    Wrapper->removeFnAttr("c2go-c-name");
+    Wrapper->removeFnAttr("c2go-go-sig");
+
+    Wrapper->setCallingConv(llvm::CallingConv::GoABI0); // == F's CC; explicit.
+    // ABI shape: GoABI0 STACK params + REGISTER return (reg-return). This is
+    // NOT a pure-ABI0 stack-return function. c2go indirect calls (function
+    // pointers / vtables) default to the internal register-return convention
+    // (CGCall.cpp ~6199-6215: "indirect calls (TargetDecl==null) default to the
+    // internal register convention ... SQLite vtable/callback pointers point at
+    // internal static functions"). The escaped pointer is redirected to this
+    // wrapper below, so the wrapper MUST return in registers to match those
+    // indirect callers — a stack-return wrapper makes the caller read a garbage
+    // register result (#495 v2 deterministic SQLite crash through the
+    // sqlite3MemSize mem-methods vtable). The wrapper stays STACK-args: it is
+    // address-taken, so the backend leaf flip never converts it to register
+    // args — exactly matching the indirect-call arg convention. It forwards to
+    // F (register args once F flips); F's reg-return passes through either way.
+    Wrapper->addFnAttr(
+        llvm::Attribute::get(getLLVMContext(), "c2go-reg-return"));
+    // argsize/argptrmask computed with ResultInRegisters=true (result in a
+    // register, no stack result slot) to match this reg-return wrapper. Do NOT
+    // copy F's attrs blindly: they happen to coincide here (F is also
+    // reg-return, same signature), but the recompute is the source of truth.
+    Wrapper->addFnAttr(
+        "c2go-argsize",
+        llvm::utostr(computeC2GoArgSize(FD, /*ResultInRegisters=*/true)));
+    std::string ArgPtrMask =
+        computeC2GoArgPtrMask(FD, /*ResultInRegisters=*/true);
+    if (ArgPtrMask.empty())
+      ArgPtrMask = "00";
+    Wrapper->addFnAttr("c2go-argptrmask", ArgPtrMask);
+    // Match F's section so the Plan 9 streamer emits both in the c2go text.
+    if (F->hasSection())
+      Wrapper->setSection(F->getSection());
+
+    // Body: forward every param to F, return its result. The call keeps the
+    // GoABI0 CC (the backend leaf-flip pass rewrites it to C2GoABIInternal in
+    // lockstep once F is flipped) and carries the `c2go-reg-return` call-site
+    // attr so the backend reads F's register result even before any flip.
+    llvm::BasicBlock *BB =
+        llvm::BasicBlock::Create(getLLVMContext(), "entry", Wrapper);
+    llvm::IRBuilder<> B(BB);
+    llvm::SmallVector<llvm::Value *, 8> Args;
+    for (llvm::Argument &A : Wrapper->args())
+      Args.push_back(&A);
+    llvm::CallInst *Fwd = B.CreateCall(F->getFunctionType(), F, Args);
+    Fwd->setCallingConv(llvm::CallingConv::GoABI0);
+    Fwd->addFnAttr(
+        llvm::Attribute::get(getLLVMContext(), "c2go-reg-return"));
+    if (Wrapper->getReturnType()->isVoidTy())
+      B.CreateRetVoid();
+    else
+      B.CreateRet(Fwd);
+
+    // Redirect every escaping use of F to the wrapper; direct calls stay on F.
+    // replaceUsesWithIf handles instruction operands (U.set) and rebuilds any
+    // non-GlobalValue constant tree (bitcast/GEP/array/struct) that contains F.
+    F->replaceUsesWithIf(Wrapper, [](llvm::Use &U) {
+      // The wrapper's own forwarding call is a direct call (callee=F) and is
+      // therefore NOT escaping — it is correctly left pointing at F.
+      return isC2GoEscapingUse(U);
+    });
+
+    // ★ Fail-closed post-assertion: if F still has ANY escaping use, some
+    // escape was not rewritten cleanly. Roll the whole thing back — delete the
+    // wrapper, move every escaped pointer back to F — and leave F unoptimized
+    // (GoABI0, address-taken). We must NEVER leave a state where F is later
+    // flipped to the register ABI while an ABI0 indirect caller still targets
+    // it. The wrapper's only uses are the escaped pointers we just redirected
+    // (its body calls F, not itself), so replaceAllUsesWith(F) restores them.
+    bool StillEscaping = false;
+    for (const llvm::Use &U : F->uses()) {
+      if (isC2GoEscapingUse(U)) {
+        StillEscaping = true;
+        break;
+      }
+    }
+    if (StillEscaping) {
+      Wrapper->replaceAllUsesWith(F);
+      Wrapper->eraseFromParent();
+      continue;
+    }
+    // Success: F is now non-address-taken and will be leaf-flipped by the
+    // backend; the escaped function pointer (Go-visible) targets the ABI0
+    // wrapper, which forwards into F's register ABI.
+  }
+  C2GoLeafWrapperCandidates.clear();
 }
 
 void CodeGenModule::EmitDeferred() {
@@ -6223,6 +7015,33 @@ void CodeGenModule::EmitGlobalVarDefinition(const VarDecl *D,
   if (CGDebugInfo *DI = getModuleDebugInfo())
     if (getCodeGenOpts().hasReducedDebugInfo())
       DI->EmitGlobalVariable(GV, D);
+
+  // c2go §B4: emit `@c2go.global.gcmask.<varname>` for file-scope globals
+  // whose type transitively contains a c2go-managed pointer. Scalar globals
+  // (no managed payload) are skipped — phase-2 runtime integration treats
+  // missing gcmask as "no scan needed".
+  if (getLangOpts().C2GoMode) {
+    emitC2GoGlobalGCMask(D, GV);
+    // c2go WF2 (#319 C3): stamp manifest-grade metadata onto every
+    // c2go_extern file-scope variable so c2go-lto can rebuild the
+    // corresponding `symbols[] kind=var` entry from combined bitcode
+    // without re-reading the AST. We attach a single MDNode (name,
+    // go_type, managed bit) using GlobalVariable::setMetadata; the
+    // bitcode writer preserves it through link-time IRMover.
+    if (D->hasAttr<C2GoExternAttr>()) {
+      bool Unmanaged = D->hasAttr<C2GoUnmanagedAttr>();
+      std::string GoType =
+          clang::c2go::mapC2GoType(D->getType(), getContext(), Unmanaged);
+      llvm::LLVMContext &MCtx = getModule().getContext();
+      llvm::Metadata *Ops[] = {
+          llvm::MDString::get(MCtx, D->getNameAsString()),
+          llvm::MDString::get(MCtx, GoType),
+          llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+              llvm::Type::getInt1Ty(MCtx), Unmanaged ? 0u : 1u)),
+      };
+      GV->setMetadata(llvm::c2go::kVarGVMD, llvm::MDNode::get(MCtx, Ops));
+    }
+  }
 }
 
 static bool isVarDeclStrongDefinition(const ASTContext &Context,

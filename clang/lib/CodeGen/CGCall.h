@@ -431,6 +431,13 @@ enum class FnInfoOpts {
   IsInstanceMethod = 1 << 0,
   IsChainCall = 1 << 1,
   IsDelegateCall = 1 << 2,
+  // c2go v15 §P5: the callee/definition uses the GoABI0 boundary CC (a
+  // c2go_linkname/c2go_extern function). GoABI0 is applied as an IR-level
+  // skin, so the AST type keeps the C CC; this bit carries the intent into
+  // arrangeLLVMFunctionInfo so a struct return can be laid out as Go ABI0
+  // per-field result slots instead of a C-ABI sret/[N x i64]. Profiled so
+  // GoABI0 function infos never alias a plain-C one with the same signature.
+  IsGoABI0 = 1 << 3,
 };
 
 inline FnInfoOpts operator|(FnInfoOpts A, FnInfoOpts B) {

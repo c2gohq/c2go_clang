@@ -459,6 +459,13 @@ private:
   /// A queue of (optional) vtables that may be emitted opportunistically.
   std::vector<const CXXRecordDecl *> OpportunisticVTables;
 
+  /// c2go (#495): candidate static + register-return functions whose address
+  /// may be taken. Collected during attr-stamping (SetLLVMFunctionAttributes)
+  /// while we still hold the FunctionDecl, processed in EmitC2GoLeafWrappers()
+  /// after EmitDeferred() — only then is the whole-TU address-taken set final.
+  SmallVector<std::pair<const FunctionDecl *, llvm::Function *>, 16>
+      C2GoLeafWrapperCandidates;
+
   /// List of global values which are required to be present in the object file;
   /// bitcast to i8*. This is used for forcing visibility of symbols which may
   /// otherwise be optimized out.
@@ -1729,6 +1736,148 @@ public:
                             const FunctionDecl *FD = nullptr,
                             CodeGenFunction *CGF = nullptr);
 
+  /// In CGO mode, tag a malloc/calloc/realloc call instruction with the
+  /// inferred allocation target type, so a later LLVM pass can replace it
+  /// with runtime.mallocgc carrying the right Go type-info argument.
+  /// DestPointerType is the pointer-to-T type being cast to. The metadata is
+  /// only attached when T is a CGO struct (i.e. the call result is being
+  /// cast to a pointer to a struct that Sema marked as c2go_struct).
+  void attachC2GoAllocTargetMetadata(llvm::CallBase *CB, QualType DestPointerType);
+
+  /// c2go §2.3: true when a C-variadic function uses the c2go `void**` tagged
+  /// argument-pack ABI rather than the platform AAPCS variadic ABI. This is
+  /// every c2go-mode variadic function that is NOT a GoABI0 boundary symbol
+  /// (c2go_extern / c2go_linkname) — those keep the platform ABI for the Go
+  /// boundary. \p D may be null (e.g. an indirect call through a function
+  /// pointer); in that case only the c2go-mode + variadic test applies.
+  bool usesC2GoVoidPtrVararg(const FunctionType *FnType, const Decl *D) const;
+
+  /// c2go (ABI foundation): true when a c2go-mode function uses the GoABI0
+  /// stack-passing calling convention rather than the platform AAPCS. This
+  /// is EVERY internal c2go function — args/results live on the caller's Go
+  /// ABI0 stack frame, so morestack/copystack relocate them across a stack
+  /// move (a register-passed arg would be clobbered, the #277/sqlite3RunParser
+  /// class of crashes). The GoABI0 boundary symbols (c2go_extern /
+  /// c2go_linkname) keep the platform ABI and are excluded. \p D may be null
+  /// (an indirect call through a function pointer); in c2go-mode that still
+  /// uses GoABI0 — every internal call agrees on the stack ABI.
+  bool useC2GoGoABI0CC(const Decl *D) const;
+
+  /// c2go (ABI foundation): true when a function/call must use the GoABI0
+  /// *LLVM calling convention* (stack-passed args). This is BROADER than
+  /// useC2GoGoABI0CC: it also covers the boundary symbols (c2go_extern /
+  /// c2go_linkname), which Go calls via ABI0 (Go auto-generates the
+  /// ABIInternal->ABI0 wrapper), so their definitions and call sites must
+  /// expose the GoABI0 CC too. useC2GoGoABI0CC excludes boundary only for the
+  /// void**-vararg / FnInfo-flag path (isC2GoABI0Function handles boundary
+  /// separately there); the underlying LLVM CC is uniform across all c2go
+  /// functions. Variadic functions are included (their packed void** arg still
+  /// lands on the stack). \p D may be null (an indirect call).
+  bool useC2GoGoABI0CallingConv(const Decl *D) const;
+
+  /// c2go §2.0.2 (#281): true when the function/call should use the internal
+  /// register-return convention (ABIInternal-style result placement). This is
+  /// the SINGLE source of truth shared by callee body (`CodeGenModule`) and
+  /// call site (`CGCall`) — they must agree so caller/callee don't disagree on
+  /// where the result lives. Gating: c2go-mode + internal (non-boundary) +
+  /// -O2 or higher. The -O0/-O1 path keeps GoABI0 stack returns (simpler to
+  /// debug + matches the older default before opt-level gating was added).
+  /// \p D may be null (indirect call); the boundary check is skipped and the
+  /// opt-level gate alone decides (SQLite vtable callbacks point at internal
+  /// static functions, which keep the internal register convention).
+  bool shouldUseC2GoRegReturn(const Decl *D) const;
+
+  /// c2go (ABI foundation): compute the Go ABI0 argument-area size (the `M`
+  /// in a Plan 9 `TEXT ·f(SB), $N-M` directive) for \p FD, following Go's
+  /// TFUNCARGS layout (type-aligned arg slots rounded up to RegSize, then
+  /// results, then the whole frame rounded up). The GC scans this region, so
+  /// it must be the true argsize, not 0. Precise for scalar/pointer
+  /// signatures (SQLite's main path); aggregate-by-value is a known gap
+  /// (the AAPCS coerce can split a struct into IR pieces the GoABI0 stack
+  /// lowering lays out differently — tracked separately).
+  uint64_t computeC2GoArgSize(const FunctionDecl *FD,
+                              bool ResultInRegisters = false) const;
+
+  /// c2go #287 (Option 3): compute the pointer-word bitmap of \p FD's GoABI0
+  /// argument area (FUNCDATA $0 / args pointer map), using the SAME placement
+  /// as computeC2GoArgSize so the mask is consistent with the declared `M`.
+  /// Each pointer-typed argument word gets its bit set; the result is the
+  /// little-endian byte vector hex-encoded (matching the streamer's bitmap
+  /// byte order). Returns "" when there are no pointer-typed args (the backend
+  /// then keeps the all-zeros map). Marking only genuine pointer words is
+  /// sound: Go's copystack relocates a marked value only if it points into the
+  /// moving stack (range check), and GC's findObject ignores non-Go-heap
+  /// pointers — so libc/stack/RODATA pointers are safely skipped.
+  std::string computeC2GoArgPtrMask(const FunctionDecl *FD,
+                                    bool ResultInRegisters = false) const;
+
+  /// c2go (#120 / §A2): tag a memcpy/memmove call instruction \p Call with
+  /// `!c2go.elem.type !{!"<RecName>", i64 N}` when its destination element
+  /// type is a `c2go_struct`-attributed record. The C2GoMemcpyTyping pass
+  /// reads this and routes such copies through runtime.typedmemmove
+  /// (write-barrier-aware) instead of a plain `@llvm.memcpy` lowering, so
+  /// the GC sees managed-pointer destinations correctly.
+  ///
+  /// \p DstPointerType is the (canonical or not) pointer-to-T type of the
+  /// copy destination; the helper strips one pointer level and inspects T.
+  /// For array copies pass a pointer to the element record type — the helper
+  /// derives the element count from the byte length, so an `N`-element array
+  /// copy yields ElemCount == N.
+  ///
+  /// \p ByteLenArgIdx is the operand index on \p Call carrying the copy's
+  /// byte length (operand 2 for both `@llvm.memcpy`/`@llvm.memmove` and the
+  /// c2go-libc Memcpy/Memmove stubs). ElemCount is `byteLen / sizeof(T)`.
+  ///
+  /// The metadata is skipped (no-op) when not in c2go mode, when T is not a
+  /// c2go record, when the stable record name is empty, or when the byte
+  /// length is non-constant, zero, or not a whole multiple of `sizeof(T)`.
+  /// The record name comes from `clang::c2go::getStableRecordName`, so
+  /// anonymous c2go records get their synthesized stable key (no silent miss).
+  void attachC2GoElemTypeMetadata(llvm::CallInst *Call, QualType DstPointerType,
+                                  unsigned ByteLenArgIdx);
+
+  /// In c2go mode, emit the Go runtime `_type` typeinfo global for a
+  /// `c2go_struct`-attributed RecordDecl. Two ownership policies are
+  /// supported, distinguished by the presence of `c2go_linkname`:
+  ///
+  ///  * C-owner (no `c2go_linkname`): emit a `linkonce_odr` definition of
+  ///    `@c2go.typeinfo.<TypeName>` together with `@c2go.gcbitmap.<TypeName>`,
+  ///    populated from the AST field-world hierarchy (per-field /
+  ///    enclosing-struct / pragma-pushed `c2go_managed` / `c2go_unmanaged`).
+  ///  * Go-owner (has `c2go_linkname("pkg.X")`): emit only an external
+  ///    declaration of `@"type:pkg.X"` (matching Go's `type:<pkg>.<name>`
+  ///    runtime symbol convention) so call sites can reference the
+  ///    Go-side definition without producing a local copy. The matching
+  ///    `@c2go.typeinfo.<TypeName>` alias makes the C2GoMemcpyTyping pass'
+  ///    name-based lookup land on the right external symbol.
+  ///
+  /// Idempotent — calling this multiple times for the same RecordDecl
+  /// returns immediately if the typeinfo global is already present in
+  /// the module. Safe to call before the LLVM C2GoMallocReplacement pass:
+  /// that pass checks for an existing `@c2go.typeinfo.<X>` global and
+  /// reuses it rather than emitting its own.
+  void emitC2GoTypeinfo(const RecordDecl *RD);
+
+  /// c2go §B4: emit a per-global GC pointer-mask bitmap when \p D is a
+  /// file-scope variable whose type transitively contains a c2go-managed
+  /// pointer (a pointer field inside a `c2go_struct`, or a pointer field
+  /// explicitly annotated `c2go_managed`). The bitmap is emitted as
+  /// `@c2go.global.gcmask.<varname>` — an `internal constant [N x i8]`
+  /// with one bit per pointer-sized word (LSB-first inside each byte),
+  /// matching the encoding used by Go runtime's `moduledata.gcdatamask` /
+  /// `gcbssmask`. This metadata is consumed by the future phase-2 runtime
+  /// integration that exposes c2go module data through `activeModules()`
+  /// so `bulkBarrierPreWrite` can scan static `.data` / `.bss` globals.
+  ///
+  /// Scalar globals (int, char[], structs of scalars, etc.) get no
+  /// gcmask — the absence is the signal to runtime that the global has
+  /// no managed pointers and need not be scanned.
+  ///
+  /// Idempotent and side-effect free outside the new gcmask global;
+  /// safe to call after the variable's own `llvm::GlobalVariable` has
+  /// been created and initialized.
+  void emitC2GoGlobalGCMask(const VarDecl *D, llvm::GlobalVariable *GV);
+
   /// Get target specific null pointer.
   /// \param T is the LLVM type of the null pointer.
   /// \param QT is the clang QualType of the null pointer.
@@ -1960,6 +2109,16 @@ private:
 
   /// Emit any needed decls for which code generation was deferred.
   void EmitDeferred();
+
+  /// c2go (#495): for each static + register-return candidate whose address
+  /// escapes, synthesize an internal GoABI0-only forwarding wrapper, rewrite
+  /// the escaping (non-direct-call) uses to point at the wrapper, and leave
+  /// the direct calls on the original. The original then becomes non
+  /// address-taken so the backend leaf-flip pass can give it the register ABI,
+  /// while the escaped function pointer (a Go-visible ABI0 entry) targets the
+  /// wrapper. Fail-closed: if any escaping use cannot be rewritten, the whole
+  /// transform is rolled back for that function. Must run after EmitDeferred().
+  void EmitC2GoLeafWrappers();
 
   /// Try to emit external vtables as available_externally if they have emitted
   /// all inlined virtual functions.  It runs after EmitDeferred() and therefore

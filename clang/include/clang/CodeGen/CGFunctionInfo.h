@@ -629,6 +629,13 @@ class CGFunctionInfo final
   LLVM_PREFERRED_TYPE(bool)
   unsigned CmseNSCall : 1;
 
+  /// c2go v15 §P5: whether this is a GoABI0 boundary function
+  /// (c2go_linkname / c2go_extern). Tracked here so the function info is
+  /// uniqued separately from a plain-C function with the same signature,
+  /// and so the GoABI0 struct-return-as-result-slots lowering can fire.
+  LLVM_PREFERRED_TYPE(bool)
+  unsigned GoABI0 : 1;
+
   /// Whether this function is noreturn.
   LLVM_PREFERRED_TYPE(bool)
   unsigned NoReturn : 1;
@@ -683,7 +690,7 @@ class CGFunctionInfo final
 public:
   static CGFunctionInfo *
   create(unsigned llvmCC, bool instanceMethod, bool chainCall,
-         bool delegateCall, const FunctionType::ExtInfo &extInfo,
+         bool delegateCall, bool goABI0, const FunctionType::ExtInfo &extInfo,
          ArrayRef<ExtParameterInfo> paramInfos, CanQualType resultType,
          ArrayRef<CanQualType> argTypes, RequiredArgs required);
   void operator delete(void *p) { ::operator delete(p); }
@@ -814,6 +821,7 @@ public:
     ID.AddBoolean(InstanceMethod);
     ID.AddBoolean(ChainCall);
     ID.AddBoolean(DelegateCall);
+    ID.AddBoolean(GoABI0);
     ID.AddBoolean(NoReturn);
     ID.AddBoolean(ReturnsRetained);
     ID.AddBoolean(NoCallerSavedRegs);
@@ -832,7 +840,7 @@ public:
       I.type.Profile(ID);
   }
   static void Profile(llvm::FoldingSetNodeID &ID, bool InstanceMethod,
-                      bool ChainCall, bool IsDelegateCall,
+                      bool ChainCall, bool IsDelegateCall, bool IsGoABI0,
                       const FunctionType::ExtInfo &info,
                       ArrayRef<ExtParameterInfo> paramInfos,
                       RequiredArgs required, CanQualType resultType,
@@ -841,6 +849,7 @@ public:
     ID.AddBoolean(InstanceMethod);
     ID.AddBoolean(ChainCall);
     ID.AddBoolean(IsDelegateCall);
+    ID.AddBoolean(IsGoABI0);
     ID.AddBoolean(info.getNoReturn());
     ID.AddBoolean(info.getProducesResult());
     ID.AddBoolean(info.getNoCallerSavedRegs());

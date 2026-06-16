@@ -3050,8 +3050,48 @@ static Address EmitX86_64VAArgFromMemory(CodeGenFunction &CGF,
   return Address(Res, LTy, Align);
 }
 
+// c2go §2.3: the va_list (`ap`) is a void* whose value is a void** cursor
+// pointing at the current element of the caller-packed `void* argptrs[]`
+// array. Each array element points to the storage of one vararg. Thus
+//   va_arg(ap, T) == *(T*)(*ap++).
+// No SysV register-save-area walk; the callee has no reg-save prologue.
+// Mirrors AArch64ABIInfo::EmitC2GoVAArg (Targets/AArch64.cpp).
+static RValue emitC2GoVAArg(CodeGenFunction &CGF, Address VAListAddr,
+                            QualType Ty, AggValueSlot Slot) {
+  CGBuilderTy &Builder = CGF.Builder;
+  llvm::Type *PtrTy = llvm::PointerType::getUnqual(CGF.getLLVMContext());
+  CharUnits PtrSize = CharUnits::fromQuantity(8);
+
+  // `ap` holds the current cursor (a void** value). VAListAddr is `&ap`.
+  // (On x86-64 the C va_list type is the SysV __va_list_tag[1]; c2go's
+  // va_start stored the cursor over its first pointer-sized word, and we
+  // read it back the same way. The SysV fields are never materialized.)
+  Address CursorSlot = VAListAddr.withElementType(PtrTy);
+  llvm::Value *Cursor = Builder.CreateLoad(CursorSlot, "c2go.va.cur");
+
+  // Load the i-th argptr (the address of the vararg's storage), then advance
+  // the cursor by one pointer for the next va_arg.
+  Address ArgPtrAddr(Cursor, PtrTy, PtrSize);
+  llvm::Value *ArgStorage = Builder.CreateLoad(ArgPtrAddr, "c2go.va.argp");
+  llvm::Value *NextCursor =
+      Builder.CreateConstInBoundsGEP1_64(PtrTy, Cursor, 1, "c2go.va.next");
+  Builder.CreateStore(NextCursor, CursorSlot);
+
+  // The storage holds the vararg value; load it as T.
+  CharUnits TyAlign = CGF.getContext().getTypeUnadjustedAlignInChars(Ty);
+  Address ResAddr(ArgStorage, CGF.ConvertTypeForMem(Ty), TyAlign);
+  return CGF.EmitLoadOfAnyValue(CGF.MakeAddrLValue(ResAddr, Ty), Slot);
+}
+
 RValue X86_64ABIInfo::EmitVAArg(CodeGenFunction &CGF, Address VAListAddr,
                                 QualType Ty, AggValueSlot Slot) const {
+  // c2go §2.3: va_list is a void** cursor over the caller-packed
+  // `void* argptrs[]` array; va_arg(ap,T) == *(T*)(*ap++). Must bypass the
+  // SysV classification below entirely (one argptr slot per vararg, in
+  // lockstep with EmitC2GoVarArgPack on the caller side).
+  if (getContext().getLangOpts().C2GoMode)
+    return emitC2GoVAArg(CGF, VAListAddr, Ty, Slot);
+
   // Assume that va_list type is correct; should be pointer to LLVM type:
   // struct {
   //   i32 gp_offset;
