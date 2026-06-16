@@ -297,6 +297,29 @@ namespace CallingConv {
     /// stateless compartment.
     CHERIoT_LibraryCall = 127,
 
+    /// c2go: Go ABI0 calling convention.
+    ///
+    /// All arguments and return values pass through the caller's
+    /// stack frame at fixed offsets reachable via +N(FP), per Go
+    /// ABI0 type layout (struct/array Go layout, not C layout).
+    /// No register passing. Used for c2go_extern function bodies
+    /// and c2go_linkname call sites.
+    ///
+    /// See clang/docs/c2go_design.md §2.
+    GoABI0 = 128,
+
+    /// c2go: private register-passing convention for NOSPLIT
+    /// leaf / near-leaf internal functions (optimization layer).
+    ///
+    /// Symbols still declare ABI0 to Go (`<ABIInternal>` is reserved
+    /// for the runtime package); this convention is invisible to the
+    /// Go ABI. Arguments and results are passed in registers following
+    /// Go's ABIInternal algorithm on arm64 (R0-R15 integer,
+    /// F0-F15 floating-point). Only valid c2go↔c2go, and only for
+    /// functions proven NOSPLIT-eligible (no morestack → register args
+    /// survive). See clang/docs/c2go_design.md §2.0.1 / §4.2.
+    C2GoABIInternal = 129,
+
     /// The highest possible ID. Must be some 2^k - 1.
     MaxID = 1023
   };

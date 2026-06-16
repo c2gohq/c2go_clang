@@ -648,6 +648,8 @@ lltok::Kind LLLexer::LexIdentifier() {
   KEYWORD(aarch64_sme_preservemost_from_x0);
   KEYWORD(aarch64_sme_preservemost_from_x1);
   KEYWORD(aarch64_sme_preservemost_from_x2);
+  KEYWORD(goabi0cc);                 // c2go GoABI0 calling convention
+  KEYWORD(c2goabiinternalcc);        // c2go private register convention
   KEYWORD(msp430_intrcc);
   KEYWORD(avr_intrcc);
   KEYWORD(avr_signalcc);

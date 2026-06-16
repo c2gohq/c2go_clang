@@ -2256,6 +2256,8 @@ bool LLParser::parseOptionalCallingConv(unsigned &CC) {
   case lltok::kw_aarch64_sme_preservemost_from_x2:
     CC = CallingConv::AArch64_SME_ABI_Support_Routines_PreserveMost_From_X2;
     break;
+  case lltok::kw_goabi0cc:       CC = CallingConv::GoABI0; break;
+  case lltok::kw_c2goabiinternalcc: CC = CallingConv::C2GoABIInternal; break;
   case lltok::kw_msp430_intrcc:  CC = CallingConv::MSP430_INTR; break;
   case lltok::kw_avr_intrcc:     CC = CallingConv::AVR_INTR; break;
   case lltok::kw_avr_signalcc:   CC = CallingConv::AVR_SIGNAL; break;

@@ -382,6 +382,8 @@ static void printCallingConv(unsigned cc, raw_ostream &Out) {
   case CallingConv::AArch64_SME_ABI_Support_Routines_PreserveMost_From_X2:
     Out << "aarch64_sme_preservemost_from_x2";
     break;
+  case CallingConv::GoABI0:        Out << "goabi0cc"; break;
+  case CallingConv::C2GoABIInternal: Out << "c2goabiinternalcc"; break;
   case CallingConv::MSP430_INTR:   Out << "msp430_intrcc"; break;
   case CallingConv::AVR_INTR:      Out << "avr_intrcc "; break;
   case CallingConv::AVR_SIGNAL:    Out << "avr_signalcc "; break;
