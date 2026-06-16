@@ -9721,3 +9721,36 @@ of the same size, while the GCC/Itanium variant packs all fields in a bitfield
 tightly.
   }];
 }
+
+def C2GoDocs : Documentation {
+  let Category = DocCatType;
+  let Heading = "c2go_managed, c2go_unmanaged, c2go_struct";
+  let Content = [{
+The ``c2go_managed``, ``c2go_unmanaged`` and ``c2go_struct`` attributes are
+part of Clang's c2go mode (``-fc2go``), which compiles C source into objects
+the Go linker can link against the Go runtime. They control how pointers
+and aggregate types straddle the C/Go heap boundary.
+
+* ``c2go_managed`` — a *managed* declaration or function/function-pointer
+  type. Pointers in/out of managed code live on the Go GC heap (LLVM
+  ``addrspace(1)``); function-type uses additionally select the
+  ``CC_C2GoInternal`` calling convention (c2go internal ABI0: stack args,
+  register return). Decl-level uses propagate the managed mark through the
+  type system so unrelated extern declarations cannot silently re-interpret
+  a managed pointer as a raw C pointer.
+
+* ``c2go_unmanaged`` — the opposite mark: this declaration / record / field
+  stays on the unmanaged (C) heap. Used on records, functions, variables,
+  fields and parameters to opt back out of the managed default inside an
+  otherwise c2go-managed translation unit.
+
+* ``c2go_struct`` — marks a C ``struct`` as a Go-visible record. The struct
+  layout, field names and field types are exported through the c2go
+  manifest so c2gobind can generate matching Go declarations.
+
+These attributes are c2go-internal: they only have meaning when the
+translation unit is compiled with ``-fc2go``. See ``docs/c2go_design.md``
+for the wider design rationale (hybrid C/Go ABI, managed vs unmanaged heap
+separation, manifest format).
+  }];
+}

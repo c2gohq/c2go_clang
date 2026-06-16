@@ -1263,6 +1263,185 @@ def CarriesDependency : InheritableParamAttr {
   let Documentation = [CarriesDependencyDocs];
 }
 
+// c2go attributes (v14 design) ─────────────────────────────────
+//
+// World system: every pointer, field, and record has a world =
+// {managed, unmanaged}. `managed` participates in Go GC; `unmanaged`
+// does not (mapped to Go uintptr in c2gobind output). See
+// docs/c2go_design.md §3.
+//
+// Default world is governed by:
+//   1. explicit attribute (highest priority),
+//   2. enclosing #pragma c2go push region,
+//   3. c2go-mode global default = `managed`.
+//
+// Record world is auto-inferred from field worlds (see §3.3); the
+// explicit `managed`/`unmanaged` attribute on a Record overrides
+// inference.
+
+def C2GoManaged : DeclOrTypeAttr {
+  // Note: spelled `c2go_managed` (not `managed`) to avoid collision
+  // with HIPManaged's `GNU<"managed">`. c2go.h exposes a `managed`
+  // macro that wraps __attribute__((c2go_managed)).
+  //
+  // #290: DeclOrTypeAttr (still derives InheritableAttr) — c2go_managed
+  // doubles as a calling-convention TYPE attribute (on function /
+  // function pointer types, sets CC_C2GoInternal = c2go internal abi0:
+  // stack args + register return) AND a declaration/world-tracking
+  // attribute. Making it a type CC lets clang's existing CC compatibility
+  // check forbid assigning a CC_GoABI0 (c2go_extern) function pointer to a
+  // CC_C2GoInternal (c2go_managed) one and vice versa. See SemaType.cpp
+  // handleFunctionTypeAttr (AT_C2GoManaged -> CC_C2GoInternal).
+  let Spellings = [GNU<"c2go_managed">, CXX11<"clang", "c2go_managed">];
+  // No ErrorDiag SubjectList: as a calling-convention type attribute c2go_managed
+  // legitimately appears on function-pointer types / typedefs, where the generic
+  // decl-subject check (run before type processing has consumed it) would wrongly
+  // fire. Decl-subject applicability is validated in handleC2GoManagedAttr,
+  // mirroring the standard CC attrs (cdecl/_Nullable have their SubjectList
+  // commented out for the same reason).
+  let Documentation = [C2GoDocs];
+  let LangOpts = [COnly];
+}
+
+def C2GoUnmanaged : InheritableAttr {
+  let Spellings = [GNU<"c2go_unmanaged">, CXX11<"clang", "c2go_unmanaged">];
+  let Subjects = SubjectList<[Record, Function, Var, Field, ParmVar], ErrorDiag>;
+  let Documentation = [C2GoDocs];
+  let LangOpts = [COnly];
+}
+
+def C2GoExtern : DeclOrTypeAttr {
+  // #286: DeclOrTypeAttr (still derives InheritableAttr) — c2go_extern doubles
+  // as a calling-convention TYPE attribute (on function pointer types, sets
+  // CC_GoABI0 for indirect calls) AND a declaration attribute (export). See
+  // SemaType.cpp handleFunctionTypeAttr (type-CC path) + handleC2GoExternAttr
+  // (decl/export path); both fire — the custom decl dispatch keeps the
+  // C2GoExternAttr attached to the Decl for CodeGen's export logic.
+  //
+  // Exports a function definition or variable from c2go-managed C to
+  // the Go side. Body uses GoABI0 calling convention; symbol is
+  // mangled `objabi.PathToPrefix(pkg) + "." + name` and emitted as
+  // a public ABI0 entry in Plan 9 .s. Go compiler auto-generates the
+  // matching ABIInternal wrapper given the bodyless Go declaration
+  // produced by c2gobind.
+  //
+  // Optional int arg (#269) controls the generated `.go` function name
+  // casing: 1 (default) → exported/upper-first (`foo`→`Foo`); 0 → keep
+  // the C symbol's original casing. When the Go name's case differs
+  // from the C symbol, c2gobind emits a `//go:linkname` to bind them.
+  let Spellings = [GNU<"c2go_extern">, CXX11<"clang", "c2go_extern">];
+  // No ErrorDiag SubjectList: as a calling-convention type attribute c2go_extern
+  // legitimately appears on function-pointer types / typedefs, where the generic
+  // decl-subject check (run before type processing has consumed it) would wrongly
+  // fire ("only applies to functions and variables"). Decl-subject applicability
+  // (the export semantics target Function/Var) is validated in handleC2GoExternAttr,
+  // mirroring the standard CC attrs (cdecl has its SubjectList commented out).
+  let Args = [DefaultIntArgument<"ExportCase", 1>];
+  let Documentation = [Undocumented];
+  let LangOpts = [COnly];
+}
+
+def C2GoLinkname : InheritableAttr {
+  // Binds a c2go C declaration to a specific Go symbol name (e.g.
+  // "runtime.mallocgc", or "github.com/c2go-project/c2go-libc.PthreadMutexLock").
+  // Call sites use GoABI0 calling convention. The target package must
+  // provide an ABI0 entry, which Go's compiler does automatically for
+  // any function with //go:linkname push (single-arg form).
+  let Spellings = [GCC<"c2go_linkname">];
+  let Subjects = SubjectList<[Function, Var, Record], ErrorDiag>;
+  let Args = [StringArgument<"Name">];
+  let Documentation = [Undocumented];
+  let LangOpts = [COnly];
+}
+
+def C2GoReturnType : InheritableAttr {
+  // c2go v15 §P5: binds a C struct type as the tuple of a called Go
+  // function's return values. The struct's fields correspond 1:1 (order
+  // + type) to the Go function's results. Applies to a c2go_linkname /
+  // c2go_extern function whose declared return type IS the named struct.
+  // Spelled `c2go_returntype` (aligns with the c2go_<word> attribute family).
+  //
+  // ROLE: Sema-only contract validator. The struct + every field is checked
+  // by handleC2GoReturnTypeAttr (SemaDeclAttr.cpp) at attribute-parse time,
+  // so a user mistake (incomplete struct, mismatched return type, field that
+  // can't map to a single Go ABI0 result slot) is rejected with a precise
+  // diagnostic instead of a silent ABI mismatch at link time.
+  //
+  // NO CodeGen consumer needed — the GoABI0 multi-return ABI is driven by
+  // the FnInfoOpts::IsGoABI0 + RecordType-return path in
+  // arrangeLLVMFunctionInfo (CGCall.cpp), which fires for every GoABI0
+  // boundary symbol (c2go_extern / c2go_linkname) that returns a struct,
+  // independently of whether c2go_returntype is also present. Adding the
+  // attribute therefore changes neither the emitted IR nor the call-site
+  // lowering; pinned by clang/test/CodeGen/c2go-returntype-noop-codegen.c.
+  let Spellings = [GNU<"c2go_returntype">, CXX11<"clang", "c2go_returntype">];
+  let Subjects = SubjectList<[Function], ErrorDiag>;
+  let Args = [TypeArgument<"Type">];
+  let Documentation = [Undocumented];
+  let LangOpts = [COnly];
+}
+
+// Legacy v8 attribute names — kept temporarily during the v8→v14
+// rename; remove after Phase A is complete. These are equivalent to
+// the new attributes but Sema will eventually warn about deprecation.
+def C2GoStruct : InheritableAttr {
+  let Spellings = [GNU<"c2go_struct">, CXX11<"clang", "c2go_struct">];
+  let Subjects = SubjectList<[Record], ErrorDiag>;
+  let Documentation = [C2GoDocs];
+  let LangOpts = [COnly];
+}
+
+// c2go §3.9 / task T3 — opt-in "variant container" marker on a union. The
+// union promises to hold one alternative at a time (no cross-alternative byte
+// punning), which lets c2go convert it to a struct whose pointer slots can be
+// GC-scanned precisely (instead of the default force-scan that would trip Go's
+// `invalidptr` on a type-punned scalar). Only applicable to unions; the
+// union-only check is enforced in handleC2GoVariantAttr (SemaDeclAttr.cpp),
+// mirroring err_c2go_struct_union_type's style. Spelled `c2go_variant`
+// (aligns with the c2go_<word> attribute family).
+def C2GoVariant : InheritableAttr {
+  let Spellings = [GNU<"c2go_variant">, CXX11<"clang", "c2go_variant">];
+  // Subject validated in the handler (must be a union, not just any Record).
+  let Documentation = [C2GoDocs];
+  let LangOpts = [COnly];
+}
+
+// c2go #385 — internal carrier attribute attached by ActOnC2GoTypeInfo to
+// the synthesized `__c2go_typeinfo_<Name>` VarDecl. Carries the originating
+// RecordDecl so CodeGen can drive CGC2GoTypeInfo's descriptor-emission
+// without inferring it from the VarDecl's type (which is intentionally an
+// AS-neutral scalar — `const unsigned char` — so the address-of result no
+// longer trips Sema's D1/D2/D3/D4 managed-pointer predicates).
+//
+// Has no user-facing spelling; never produced by the parser. The fake
+// Record DeclArgument lets us thread the original RecordDecl through the
+// generated CreateImplicit factory without expanding the public surface.
+// Precedents (c2go #416):
+//   - Uuid (Attr.td) is the FULL precedent: an InheritableAttr that pairs
+//     a string arg with a fake DeclArgument<MSGuid> threaded through the
+//     CreateImplicit factory -- the exact pattern we mirror for the
+//     inheritance + fake-arg combination.
+//   - RootSignature (Attr.td) is a PARTIAL precedent: it shares the fake
+//     DeclArgument trick (here for HLSLRootSignature) but is a plain Attr,
+//     not InheritableAttr, and has a user-facing spelling.
+def C2GoTypeInfo : InheritableAttr {
+  let Spellings = [];
+  let SemaHandler = 0;
+  let Subjects = SubjectList<[Var], ErrorDiag>;
+  let Args = [DeclArgument<Record, "Record", 0, /*fake=*/1>];
+  let Documentation = [InternalOnly];
+  let LangOpts = [COnly];
+}
+
+def GoLinkname : InheritableAttr {
+  // Legacy alias for c2go_linkname. Deprecated.
+  let Spellings = [GCC<"go_linkname">];
+  let Subjects = SubjectList<[Function, Var], ErrorDiag>;
+  let Args = [StringArgument<"Name">];
+  let Documentation = [Undocumented];
+  let LangOpts = [COnly];
+}
+
 def CDecl : DeclOrTypeAttr {
   let Spellings = [GCC<"cdecl">, CustomKeyword<"__cdecl">, CustomKeyword<"_cdecl">];
 //  let Subjects = [Function, ObjCMethod];

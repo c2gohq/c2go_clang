@@ -5423,8 +5423,10 @@ bool Sema::CheckCallingConvAttr(const ParsedAttr &Attrs, CallingConv &CC,
     return false;
   }
 
-  if (Attrs.getKind() == ParsedAttr::AT_RISCVVLSCC) {
-    // riscv_vls_cc only accepts 0 or 1 argument.
+  if (Attrs.getKind() == ParsedAttr::AT_RISCVVLSCC ||
+      Attrs.getKind() == ParsedAttr::AT_C2GoExtern) {
+    // riscv_vls_cc / c2go_extern accept 0 or 1 argument. (c2go_extern's
+    // optional int is the .go export-name casing; it does not affect the CC.)
     if (!Attrs.checkAtLeastNumArgs(*this, 0) ||
         !Attrs.checkAtMostNumArgs(*this, 1)) {
       Attrs.setInvalid();
@@ -5547,6 +5549,16 @@ bool Sema::CheckCallingConvAttr(const ParsedAttr &Attrs, CallingConv &CC,
     CC = CC_DeviceKernel;
     break;
   }
+  // c2go (#290): the two c2go ABI markers double as calling-convention type
+  // attributes so cross-ABI function pointers are type-incompatible.
+  // c2go_extern → CC_GoABI0 (standard Go ABI0 boundary); c2go_managed →
+  // CC_C2GoInternal (c2go internal abi0, == the c2go-mode default CC).
+  case ParsedAttr::AT_C2GoExtern:
+    CC = CC_GoABI0;
+    break;
+  case ParsedAttr::AT_C2GoManaged:
+    CC = CC_C2GoInternal;
+    break;
   default: llvm_unreachable("unexpected attribute kind");
   }
 
@@ -6256,6 +6268,254 @@ static void handleBTFDeclTagAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 
   D->addAttr(::new (S.Context) BTFDeclTagAttr(S.Context, AL, Str));
 }
+
+static void handleGoLinknameAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+  StringRef Name;
+  if (!S.checkStringLiteralArgumentAttr(AL, 0, Name))
+    return;
+  if (Name.empty()) {
+    S.Diag(AL.getLoc(), diag::err_attribute_argument_is_zero)
+        << AL << AL.getRange();
+    return;
+  }
+
+  // Refuse if another asm label or go_linkname is already in effect: the
+  // user's intent would be ambiguous and the resulting symbol name would
+  // depend on declaration order.
+  if (D->hasAttr<AsmLabelAttr>() || D->hasAttr<GoLinknameAttr>()) {
+    S.Diag(AL.getLoc(), diag::warn_attribute_ignored) << AL;
+    return;
+  }
+
+  D->addAttr(::new (S.Context) GoLinknameAttr(S.Context, AL, Name));
+
+  // Drive the final IR symbol through Clang's regular asm-label path. We
+  // mark the label as non-literal so the target's user-label prefix
+  // ("_" on Mach-O / Win32 COFF, empty on ELF) is applied automatically:
+  // the same go_linkname("runtime.mallocgc") emits "_runtime.mallocgc" on
+  // macOS and "runtime.mallocgc" on Linux, matching Go's own mangling.
+  D->addAttr(AsmLabelAttr::CreateImplicit(S.Context, Name, AL.getLoc()));
+}
+
+// c2go v14 attribute handlers ──────────────────────────────────────
+//
+// handleC2GoLinknameAttr: equivalent to handleGoLinknameAttr but for
+// the new c2go_linkname spelling. Same underlying mechanism (drives
+// AsmLabelAttr), but distinguishes which spelling was used so v0
+// can warn about the legacy go_linkname.
+
+static void handleC2GoLinknameAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+  StringRef Name;
+  if (!S.checkStringLiteralArgumentAttr(AL, 0, Name))
+    return;
+  if (Name.empty()) {
+    S.Diag(AL.getLoc(), diag::err_attribute_argument_is_zero)
+        << AL << AL.getRange();
+    return;
+  }
+  if (D->hasAttr<AsmLabelAttr>() || D->hasAttr<C2GoLinknameAttr>() ||
+      D->hasAttr<GoLinknameAttr>()) {
+    S.Diag(AL.getLoc(), diag::warn_attribute_ignored) << AL;
+    return;
+  }
+  D->addAttr(::new (S.Context) C2GoLinknameAttr(S.Context, AL, Name));
+  // Asm label only makes sense on value decls (functions/variables);
+  // RecordDecls use the attribute purely as a type-identity binding to
+  // a Go-side type (no IR symbol involved).
+  if (isa<ValueDecl>(D))
+    D->addAttr(AsmLabelAttr::CreateImplicit(S.Context, Name, AL.getLoc()));
+}
+
+// handleC2GoExternAttr (#269): exports a c2go-managed function/var to
+// the generated `.go`. Takes an OPTIONAL int controlling the Go name's
+// casing: 1 (default) → exported/upper-first; 0 → keep the C casing.
+// Only 0 or 1 are accepted; any other value is diagnosed.
+static void handleC2GoExternAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+  // #290: c2go_extern is both a calling-convention type attribute (handled in
+  // SemaType, sets CC_GoABI0) and a decl attribute carrying the .go export
+  // metadata. The export semantics only make sense on a function/variable
+  // declaration; on a function-pointer type / typedef the attribute is purely
+  // the CC marker (already consumed by type processing) and there is nothing to
+  // export, so silently skip. (No ErrorDiag SubjectList — see Attr.td.)
+  if (!isa<FunctionDecl>(D) && !isa<VarDecl>(D))
+    return;
+
+  uint32_t Export = 1; // default — exported/upper-first
+  if (AL.getNumArgs() >= 1) {
+    Expr *E = AL.getArgAsExpr(0);
+    if (!S.checkUInt32Argument(AL, E, Export)) {
+      AL.setInvalid();
+      return;
+    }
+    if (Export > 1) {
+      S.Diag(AL.getLoc(), diag::err_attribute_argument_out_of_range)
+          << AL << 0 << 1 << E->getSourceRange();
+      AL.setInvalid();
+      return;
+    }
+  }
+  // c2go (#317): C functions named `init`/`main` are renamed at the
+  // symbol level (so they never enter Go's language-special symbol
+  // space). They may only be exported via the capitalized form
+  // (c2go_extern / c2go_extern(1)) → an exported Go wrapper `Init`/`Main`.
+  // The lowercase form (c2go_extern(0)) would generate a lowercase
+  // `init`/`main` Go binding that collides with Go's language-level
+  // init/main and breaks the package — reject it.
+  if (Export == 0)
+    if (const auto *FD = dyn_cast<FunctionDecl>(D))
+      if (const IdentifierInfo *II = FD->getIdentifier()) {
+        StringRef N = II->getName();
+        if (N == "init" || N == "main") {
+          StringRef Exported = (N == "init") ? StringRef("Init") : "Main";
+          S.Diag(AL.getLoc(), diag::err_c2go_extern_init_main_lowercase)
+              << N << Exported;
+          AL.setInvalid();
+          return;
+        }
+      }
+  D->addAttr(::new (S.Context) C2GoExternAttr(S.Context, AL, (int)Export));
+}
+
+// handleC2GoReturnTypeAttr (v15 §P5): binds a C struct as the tuple of a
+// called Go function's multiple return values. Validates that the named
+// type is a complete struct, equals the function's declared return type,
+// and that every field is representable as an individual Go ABI0 result
+// slot. The GoABI0-vs-sret lowering decision is taken later in CodeGen
+// (CGCall) keyed off the presence of this attribute.
+static void handleC2GoReturnTypeAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+  if (!AL.hasParsedType()) {
+    S.Diag(AL.getLoc(), diag::err_attribute_wrong_number_arguments) << AL << 1;
+    return;
+  }
+
+  // The Go ABI0 return-slot lowering only exists on the two architectures
+  // c2go currently ships backends for. LangOpts.C2GoMode can be flipped on
+  // for any triple via -std=c2go23, so without an explicit triple gate the
+  // attribute would silently mis-lower the call on every other target.
+  const llvm::Triple &TT = S.Context.getTargetInfo().getTriple();
+  if (TT.getArch() != llvm::Triple::aarch64 &&
+      TT.getArch() != llvm::Triple::x86_64) {
+    S.Diag(AL.getLoc(), diag::err_c2go_return_type_unsupported_target)
+        << AL << TT.getTriple();
+    return;
+  }
+
+  TypeSourceInfo *TSI = nullptr;
+  QualType T = S.GetTypeFromParser(AL.getTypeArg(), &TSI);
+  assert(TSI && "no type source info for c2g_return_type argument");
+
+  const RecordType *RT = T->getAs<RecordType>();
+  if (!RT || !RT->getDecl()->isStruct()) {
+    S.Diag(AL.getLoc(), diag::err_c2go_return_type_not_record) << T;
+    return;
+  }
+
+  RecordDecl *RD = RT->getDecl()->getDefinition();
+  if (!RD) {
+    S.Diag(AL.getLoc(), diag::err_c2go_return_type_incomplete) << T;
+    return;
+  }
+
+  // The function's declared return type must be that same struct: the C
+  // caller writes `struct X r = Fn(...)`, so the source-level return type
+  // carries the tuple.
+  const auto *FD = cast<FunctionDecl>(D);
+  if (!S.Context.hasSameUnqualifiedType(FD->getReturnType(), T)) {
+    S.Diag(AL.getLoc(), diag::err_c2go_return_type_mismatch)
+        << T << FD->getReturnType();
+    return;
+  }
+
+  // Each field must map 1:1 to a Go return value, so it must be a single
+  // Go ABI0 result slot. The accepted kinds mirror RetCC_AArch64_GoABI0 in
+  // llvm/lib/Target/AArch64/AArch64CallingConvention.td (i1/i8/i16/i32/i64/
+  // iPtr/f32/f64 direct slot): bool / [signed|unsigned] char/short/int/long/
+  // long long / enum, pointer, float / double, and the <c2go.h> built-in
+  // aggregates (__c2go_slice / __c2go_string / __c2go_iface
+  // are themselves structs of words). Types lacking a direct slot in the
+  // backend lowering — long double / __int128 / _BitInt / _Complex /
+  // __fp16 / _Float16 / __bf16 / _Float128 / __ibm128 / _Atomic / block
+  // pointer / bitfield / nested arbitrary struct / array — are rejected
+  // here; otherwise CGCall would silently emit an ABI-mismatched call.
+  // Accept only the exact tag set defined in <c2go.h>; a `starts_with`
+  // prefix match would silently let through any user-declared
+  // `struct __c2go_foo { ... }` and we'd then mis-lower the call in CGCall.
+  auto isC2GoBuiltinAggregate = [](QualType FT) {
+    if (const RecordType *FRT = FT->getAs<RecordType>()) {
+      StringRef Name = FRT->getDecl()->getName();
+      return Name == "__c2go_slice" || Name == "__c2go_string" ||
+             Name == "__c2go_iface";
+    }
+    return false;
+  };
+  auto isSupportedScalar = [&](QualType FT) {
+    // Reject extended / non-IEEE-single-double floats and complex first.
+    if (FT->isComplexType() || FT->isAnyComplexType() ||
+        FT->isHalfType() || FT->isFloat16Type() || FT->isBFloat16Type() ||
+        FT->isMFloat8Type() || FT->isFloat128Type() || FT->isIbm128Type())
+      return false;
+    // Floats: only IEEE float (f32) and double (f64) have a Go ABI0 slot.
+    if (FT->isRealFloatingType())
+      return FT->isFloat32Type() || FT->isDoubleType();
+    // Reject _Atomic, block pointer, bit-precise integer.
+    if (FT->isAtomicType() || FT->isBlockPointerType() || FT->isBitIntType())
+      return false;
+    // Pointers (including nullptr_t) map to iPtr.
+    if (FT->isPointerType() || FT->isNullPtrType())
+      return true;
+    // Integers / enums must fit in a 64-bit slot — rejects __int128 and any
+    // future >64-bit builtin integer the target may add.
+    if (FT->isIntegralOrEnumerationType())
+      return S.Context.getTypeSize(FT) <= 64;
+    return false;
+  };
+  for (const FieldDecl *FD2 : RD->fields()) {
+    QualType FT = FD2->getType();
+    if (FD2->isBitField() ||
+        (!isSupportedScalar(FT) && !isC2GoBuiltinAggregate(FT))) {
+      S.Diag(AL.getLoc(), diag::err_c2go_return_type_unsupported_field)
+          << T << FD2 << FT;
+      return;
+    }
+  }
+
+  D->addAttr(::new (S.Context) C2GoReturnTypeAttr(S.Context, AL, TSI));
+}
+
+// handleC2GoManagedAttr (#290): c2go_managed is both a calling-convention type
+// attribute (handled in SemaType, sets CC_C2GoInternal = c2go internal abi0)
+// and a world-tracking decl attribute. As a type CC it legitimately appears on
+// function-pointer types / typedefs, so it carries no ErrorDiag SubjectList
+// (see Attr.td) — the decl-subject applicability is enforced here instead.
+// World-tracking applies to records, fields, params, functions and variables;
+// on any other decl (e.g. a function-pointer typedef) the attribute is purely
+// the CC marker (already consumed by type processing), so skip silently.
+static void handleC2GoManagedAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+  if (!isa<RecordDecl>(D) && !isa<FieldDecl>(D) && !isa<ParmVarDecl>(D) &&
+      !isa<FunctionDecl>(D) && !isa<VarDecl>(D))
+    return;
+  D->addAttr(::new (S.Context) C2GoManagedAttr(S.Context, AL));
+}
+
+// handleC2GoVariantAttr (§3.9 / T3): the convert-to-struct "variant container"
+// marker. Only meaningful on a union (it re-describes the union as a struct so
+// pointer slots can be GC-scanned precisely). Anything that is not a union ->
+// hard error, mirroring err_c2go_struct_union_type's style.
+static void handleC2GoVariantAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+  const auto *RD = dyn_cast<RecordDecl>(D);
+  if (!RD || !RD->isUnion()) {
+    S.Diag(AL.getLoc(), diag::err_c2go_variant_not_union) << AL;
+    return;
+  }
+  D->addAttr(::new (S.Context) C2GoVariantAttr(S.Context, AL));
+}
+
+// handleC2GoUnmanagedAttr: simple presence attribute. World-tracking analysis
+// consumes it later in Sema. No special validation here beyond Subject
+// filtering (Attr.td).
+//
+// (Sema may diagnose conflicting managed+unmanaged on the same Decl
+// in a follow-up pass — recorded under a TODO for Phase C.)
 
 BTFDeclTagAttr *Sema::mergeBTFDeclTagAttr(Decl *D, const BTFDeclTagAttr &AL) {
   if (hasBTFDeclTagAttr(D, AL.getBTFDeclTag()))
@@ -7281,6 +7541,30 @@ ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D, const ParsedAttr &AL,
     break;
   case ParsedAttr::AT_BTFDeclTag:
     handleBTFDeclTagAttr(S, D, AL);
+    break;
+  case ParsedAttr::AT_GoLinkname:
+    handleGoLinknameAttr(S, D, AL);
+    break;
+  case ParsedAttr::AT_C2GoStruct:
+    handleSimpleAttribute<C2GoStructAttr>(S, D, AL);
+    break;
+  case ParsedAttr::AT_C2GoVariant:
+    handleC2GoVariantAttr(S, D, AL);
+    break;
+  case ParsedAttr::AT_C2GoUnmanaged:
+    handleSimpleAttribute<C2GoUnmanagedAttr>(S, D, AL);
+    break;
+  case ParsedAttr::AT_C2GoManaged:
+    handleC2GoManagedAttr(S, D, AL);
+    break;
+  case ParsedAttr::AT_C2GoExtern:
+    handleC2GoExternAttr(S, D, AL);
+    break;
+  case ParsedAttr::AT_C2GoLinkname:
+    handleC2GoLinknameAttr(S, D, AL);
+    break;
+  case ParsedAttr::AT_C2GoReturnType:
+    handleC2GoReturnTypeAttr(S, D, AL);
     break;
   case ParsedAttr::AT_WebAssemblyExportName:
     S.Wasm().handleWebAssemblyExportNameAttr(D, AL);

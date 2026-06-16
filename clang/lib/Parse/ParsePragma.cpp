@@ -71,6 +71,20 @@ struct PragmaMSStructHandler : public PragmaHandler {
                     Token &FirstToken) override;
 };
 
+// #pragma c2go push / #pragma c2go pop
+//
+// While at least one push is on the stack, every struct or union finished
+// in this translation unit is implicitly given __attribute__((c2go_struct)).
+// Nesting works like a stack; each pop unwinds exactly one push. Only
+// active under c2go mode (-std=c2goNN or --target=...-goabi).
+struct PragmaC2GoHandler : public PragmaHandler {
+  explicit PragmaC2GoHandler(Sema &S) : PragmaHandler("c2go"), Actions(S) {}
+  void HandlePragma(Preprocessor &PP, PragmaIntroducer Introducer,
+                    Token &FirstToken) override;
+private:
+  Sema &Actions;
+};
+
 struct PragmaUnusedHandler : public PragmaHandler {
   PragmaUnusedHandler() : PragmaHandler("unused") {}
   void HandlePragma(Preprocessor &PP, PragmaIntroducer Introducer,
@@ -427,6 +441,11 @@ void Parser::initializePragmaHandlers() {
   MSStructHandler = std::make_unique<PragmaMSStructHandler>();
   PP.AddPragmaHandler(MSStructHandler.get());
 
+  if (getLangOpts().C2GoMode) {
+    C2GoHandler = std::make_unique<PragmaC2GoHandler>(Actions);
+    PP.AddPragmaHandler(C2GoHandler.get());
+  }
+
   UnusedHandler = std::make_unique<PragmaUnusedHandler>();
   PP.AddPragmaHandler(UnusedHandler.get());
 
@@ -576,6 +595,10 @@ void Parser::resetPragmaHandlers() {
   PackHandler.reset();
   PP.RemovePragmaHandler(MSStructHandler.get());
   MSStructHandler.reset();
+  if (C2GoHandler) {
+    PP.RemovePragmaHandler(C2GoHandler.get());
+    C2GoHandler.reset();
+  }
   PP.RemovePragmaHandler(UnusedHandler.get());
   UnusedHandler.reset();
   PP.RemovePragmaHandler(WeakHandler.get());
@@ -2250,8 +2273,90 @@ void PragmaPackHandler::HandlePragma(Preprocessor &PP,
                       /*IsReinject=*/false);
 }
 
-// #pragma ms_struct on
-// #pragma ms_struct off
+// #pragma c2go managed push / pop      -- managed-default region
+// #pragma c2go unmanaged push / pop    -- unmanaged-default region
+// (Legacy: `#pragma c2go push / pop` -- equivalent to managed push/pop.)
+//
+// Push/pop is stack-balanced. An unbalanced push at end of file warns.
+//
+// See docs/c2go_design.md §3.8.
+void PragmaC2GoHandler::HandlePragma(Preprocessor &PP,
+                                     PragmaIntroducer Introducer,
+                                     Token &PragmaTok) {
+  SourceLocation PragmaLoc = PragmaTok.getLocation();
+  Token Tok;
+  PP.LexUnexpandedToken(Tok);
+  const IdentifierInfo *First = Tok.getIdentifierInfo();
+  if (!First) {
+    PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_identifier) << "c2go";
+    return;
+  }
+
+  // v15 form: `c2go managed(N) push` / `c2go unmanaged push` / `c2go pop`.
+  // N is a flag bitmask (Func=1, Ptr=2, Record=4, OR-able). `unmanaged` is
+  // sugar for `managed(0)`. A bare `managed push` (no mask) is an error;
+  // so is a bare `push`. See docs/c2go_design.md "v15 转折点" P2.
+  unsigned Flags = 0;
+  bool ConsumedWorld = false;
+  if (First->isStr("unmanaged")) {
+    Flags = 0;
+    ConsumedWorld = true;
+    PP.LexUnexpandedToken(Tok);
+  } else if (First->isStr("managed")) {
+    // Require `(N)`.
+    PP.LexUnexpandedToken(Tok);
+    if (Tok.isNot(tok::l_paren)) {
+      PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_lparen) << "c2go";
+      return;
+    }
+    PP.LexUnexpandedToken(Tok);
+    if (Tok.isNot(tok::numeric_constant)) {
+      PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_integer)
+          << "flags" << "c2go";
+      return;
+    }
+    SmallString<16> IntBuf;
+    bool Invalid = false;
+    StringRef Spelling = PP.getSpelling(Tok, IntBuf, &Invalid);
+    if (Invalid || Spelling.getAsInteger(0, Flags)) {
+      PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_integer)
+          << "flags" << "c2go";
+      return;
+    }
+    PP.LexUnexpandedToken(Tok);
+    if (Tok.isNot(tok::r_paren)) {
+      PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_rparen) << "c2go";
+      return;
+    }
+    ConsumedWorld = true;
+    PP.LexUnexpandedToken(Tok);
+  }
+
+  const IdentifierInfo *Action = Tok.getIdentifierInfo();
+  if (!Action || (!Action->isStr("push") && !Action->isStr("pop"))) {
+    PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_identifier) << "c2go";
+    return;
+  }
+  bool IsPush = Action->isStr("push");
+  // v15: a push must specify a world — `managed(N)` or `unmanaged`.
+  if (IsPush && !ConsumedWorld) {
+    PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_lparen) << "c2go";
+    return;
+  }
+
+  PP.LexUnexpandedToken(Tok);
+  if (Tok.isNot(tok::eod)) {
+    PP.Diag(Tok.getLocation(), diag::warn_pragma_extra_tokens_at_eol)
+        << "c2go";
+    return;
+  }
+
+  if (IsPush)
+    Actions.ActOnPragmaC2GoPush(PragmaLoc, Flags);
+  else
+    Actions.ActOnPragmaC2GoPop(PragmaLoc);
+}
+
 void PragmaMSStructHandler::HandlePragma(Preprocessor &PP,
                                          PragmaIntroducer Introducer,
                                          Token &MSStructTok) {
