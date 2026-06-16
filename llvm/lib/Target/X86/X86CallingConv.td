@@ -511,6 +511,38 @@ def RetCC_X86 : CallingConv<[
   // Check if this is the Intel OpenCL built-ins calling convention
   CCIfCC<"CallingConv::Intel_OCL_BI", CCDelegateTo<RetCC_Intel_OCL_BI>>,
 
+  // c2go #298 / Wave X Track A: private C2GoABIInternal register-passing
+  // convention for x86-64 only (Go runtime ABIInternal mirror). Reachable
+  // only on x86-64 modules whose `c2go.goabi` + `c2go.x86-leaf-abi` gates
+  // are both ON AND a c2go pass has flipped eligible callees' CC. The
+  // table itself is hand-written in X86CallingConv.cpp (aggregate
+  // "all-or-nothing" rule is not expressible in CCIfConsecutiveRegs alone;
+  // mirror of AArch64 design). i386 falls through to the SysV path.
+  CCIfCC<"CallingConv::C2GoABIInternal",
+         CCIfSubtarget<"is64Bit()",
+                       CCCustom<"RetCC_X86_64_C2GoABIInternal_TD">>>,
+
+  // c2go #298 Wave AI Track A — GoABI0 RetCC dispatch (LIVE).
+  //
+  // Stack-only result convention; mirror of CC_AArch64_GoABI0 / RetCC_AArch64_GoABI0
+  // (AArch64CallingConvention.td:378). Every result is a MemLoc — the
+  // matching X86 LowerReturn / LowerCallResult MemLoc paths land in this
+  // same wave (X86ISelLoweringCall.cpp LowerReturn + LowerCallResult
+  // GoABI0 branches). x86-64 only; i386 falls through to SysV RetCC.
+  //
+  // Note: register-return for internal goabi0cc funcs (`c2go-reg-return`
+  // attr; AArch64 §2.0.2 / RetCC_AArch64_AAPCS fallback) is implemented
+  // out-of-band in X86ISelLoweringCall.cpp (Wave AJ.3). Those funcs do
+  // NOT dispatch through this td block — the C++ CanLowerReturn /
+  // LowerReturn / LowerCall / LowerCallResult hard-call `RetCC_X86_64_C`
+  // when they see the `c2go-reg-return` attr, bypassing this entry. The
+  // `CCIfCC<"CallingConv::GoABI0", ...>` line below therefore reaches
+  // only boundary GoABI0 callees (no `c2go-reg-return` attr — clang
+  // CGCall.cpp / CodeGenModule.cpp set the attr on internal calls only).
+  CCIfCC<"CallingConv::GoABI0",
+         CCIfSubtarget<"is64Bit()",
+                       CCCustom<"RetCC_X86_64_GoABI0_TD">>>,
+
   CCIfSubtarget<"is64Bit()", CCDelegateTo<RetCC_X86_64>>,
   CCDelegateTo<RetCC_X86_32>
 ]>;
@@ -1107,6 +1139,35 @@ def CC_X86_64 : CallingConv<[
 let Entry = 1 in
 def CC_X86 : CallingConv<[
   CCIfCC<"CallingConv::Intel_OCL_BI", CCDelegateTo<CC_Intel_OCL_BI>>,
+
+  // c2go #298 / Wave X Track A: private C2GoABIInternal register-passing
+  // convention for x86-64 only (Go runtime ABIInternal mirror). See the
+  // matching RetCC_X86 entry for the gating + scope notes.
+  CCIfCC<"CallingConv::C2GoABIInternal",
+         CCIfSubtarget<"is64Bit()",
+                       CCCustom<"CC_X86_64_C2GoABIInternal_TD">>>,
+
+  // c2go #298 Wave AI Track A — GoABI0 arg CC dispatch (LIVE).
+  //
+  // Stack-only argument convention; mirror of CC_AArch64_GoABI0
+  // (AArch64CallingConvention.td:378). Every arg is a MemLoc, no
+  // register branch. x86-64 only.
+  //
+  // NB on frame contract vs. AArch64: AArch64 reserves +8 LR slot at
+  // CCInfo entry (c2goReserveCallerLRSlot) because Go-emitted prologues
+  // store the saved LR at sp+0 on entry. x86-64 has no equivalent — the
+  // hardware `call` already pushed the return address to sp-8 (so
+  // callee's sp on entry already sits at "caller's sp - 8" with the
+  // saved RA below). X86 LowerMemArgument computes incoming-arg
+  // addresses via MFI.CreateFixedObject(LocMemOffset, ...) which the
+  // SDAG resolves to "sp + 8 + LocMemOffset" naturally (the +8 covers
+  // the RA the call pushed). So LocMemOffset 0 on x86-64 GoABI0 lines
+  // up byte-for-byte with caller_sp+8 on AArch64 GoABI0 — no separate
+  // reserve required here.
+  CCIfCC<"CallingConv::GoABI0",
+         CCIfSubtarget<"is64Bit()",
+                       CCCustom<"CC_X86_64_GoABI0_TD">>>,
+
   CCIfSubtarget<"is64Bit()", CCDelegateTo<CC_X86_64>>,
   CCDelegateTo<CC_X86_32>
 ]>;
