@@ -41,6 +41,7 @@
 #include "llvm/CodeGen/Analysis.h"
 #include "llvm/CodeGen/CallingConvLower.h"
 #include "llvm/CodeGen/ComplexDeinterleavingPass.h"
+#include "llvm/CodeGen/FunctionLoweringInfo.h"
 #include "llvm/CodeGen/GlobalISel/Utils.h"
 #include "llvm/CodeGen/ISDOpcodes.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
@@ -91,6 +92,7 @@
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include <algorithm>
 #include <bitset>
 #include <cassert>
@@ -2930,6 +2932,17 @@ bool AArch64TargetLowering::allowsMisalignedMemoryAccesses(
 FastISel *
 AArch64TargetLowering::createFastISel(FunctionLoweringInfo &funcInfo,
                                       const TargetLibraryInfo *libInfo) const {
+  // c2go Phase B/C: GoABI0's stack-only marshalling and Plan 9 frame
+  // layout are handled by SelectionDAG (LowerFormalArguments /
+  // LowerCall / LowerReturn / LowerCallResult overrides). FastISel
+  // has no awareness of GoABI0; if it ran, it would emit register-
+  // based arg/result code and standard ARM64 frame, both incompatible
+  // with the Go runtime. Decline FastISel so SelectionDAG runs. Also
+  // decline for ANY function in a c2go-mode module so non-GoABI0
+  // helpers in mixed modules get consistent codegen.
+  if (funcInfo.Fn->getCallingConv() == CallingConv::GoABI0 ||
+      funcInfo.Fn->getParent()->getModuleFlag(llvm::c2go::kGoabiModuleFlag) != nullptr)
+    return nullptr;
   return AArch64::createFastISel(funcInfo, libInfo);
 }
 
@@ -8310,6 +8323,21 @@ bool AArch64TargetLowering::isReassocProfitable(SelectionDAG &DAG, SDValue N0,
   return true;
 }
 
+/// c2go jump-table encoding override. Retained as a safety net even
+/// though c2go-mode now sets the per-function `no-jump-tables`
+/// attribute in clang (CodeGenFunction.cpp), which prevents jump
+/// tables from being created in the first place. If a future path
+/// re-enables them, this override keeps the encoding Plan-9-emittable
+/// (EK_BlockAddress — 8-byte absolute-address table entries) instead
+/// of the default PIC label-difference encoding that Plan 9 asm can't
+/// represent in DATA. Flag lives on the per-Plan9-codegen
+/// TargetMachine; set by clang's BackendUtil.
+unsigned AArch64TargetLowering::getJumpTableEncoding() const {
+  if (getTM().C2GoForceBlockAddressJumpTable)
+    return MachineJumpTableInfo::EK_BlockAddress;
+  return TargetLowering::getJumpTableEncoding();
+}
+
 /// Selects the correct CCAssignFn for a given CallingConvention value.
 CCAssignFn *AArch64TargetLowering::CCAssignFnForCall(CallingConv::ID CC,
                                                      bool IsVarArg) const {
@@ -8370,6 +8398,10 @@ CCAssignFn *AArch64TargetLowering::CCAssignFnForCall(CallingConv::ID CC,
     return CC_AArch64_Arm64EC_Thunk;
   case CallingConv::ARM64EC_Thunk_Native:
     return CC_AArch64_Arm64EC_Thunk_Native;
+  case CallingConv::GoABI0:
+    return CC_AArch64_GoABI0;
+  case CallingConv::C2GoABIInternal:
+    return CC_AArch64_C2GoABIInternal;
   }
 }
 
@@ -8384,6 +8416,12 @@ AArch64TargetLowering::CCAssignFnForReturn(CallingConv::ID CC) const {
     if (Subtarget->isWindowsArm64EC())
       return RetCC_AArch64_Arm64EC_CFGuard_Check;
     return RetCC_AArch64_AAPCS;
+  case CallingConv::GoABI0:
+    return RetCC_AArch64_GoABI0;
+  // c2go §2.0.1 leaf-opt: results use the same private register sequences as
+  // arguments (RetCC_AArch64_C2GoABIInternal). See above.
+  case CallingConv::C2GoABIInternal:
+    return RetCC_AArch64_C2GoABIInternal;
   }
 }
 
@@ -8528,6 +8566,42 @@ SDValue AArch64TargetLowering::lowerEHPadEntry(SDValue Chain, SDLoc const &DL,
   return Chain;
 }
 
+// c2go: pre-scan all IR call instructions in the function to determine
+// whether ANY of them targets an AAPCS variadic callee. See call site
+// comment in LowerFormalArguments for the why. Extracted as a helper so
+// the upstream LowerFormalArguments body stays a near-one-line c2go gate
+// (cherry-pick friendliness, finding s8).
+static void c2goScanVariadicOutgoing(const Function &F,
+                                     AArch64FunctionInfo *FuncInfo) {
+  for (const auto &BB : F) {
+    for (const auto &I : BB) {
+      const auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB)
+        continue;
+      if (const Function *Callee = CB->getCalledFunction())
+        if (Callee->isIntrinsic())
+          continue;
+      if (CB->getCallingConv() != CallingConv::GoABI0 &&
+          CB->getFunctionType()->isVarArg()) {
+        FuncInfo->setHasC2GoVariadicOutgoingCall();
+        return;
+      }
+    }
+  }
+}
+
+// c2go: reserve the bottom 8-byte LR slot in the incoming-arg block so
+// stack args start at caller_sp+8 — Go ABI0 contract for both the GoABI0
+// CC and the c2go-internal AAPCS path. See call-site comment for the
+// detailed contract. Extracted helper (finding s8).
+static void c2goReserveCallerLRSlot(CCState &CCInfo,
+                                    CallingConv::ID CallConv,
+                                    const MachineFunction &MF) {
+  if (CallConv == CallingConv::GoABI0 ||
+      MF.getFunction().getParent()->getModuleFlag(llvm::c2go::kGoabiModuleFlag) != nullptr)
+    CCInfo.AllocateStack(8, Align(8));
+}
+
 SDValue AArch64TargetLowering::LowerFormalArguments(
     SDValue Chain, CallingConv::ID CallConv, bool isVarArg,
     const SmallVectorImpl<ISD::InputArg> &Ins, const SDLoc &DL,
@@ -8541,6 +8615,16 @@ SDValue AArch64TargetLowering::LowerFormalArguments(
                     (isVarArg && Subtarget->isWindowsArm64EC());
   AArch64FunctionInfo *FuncInfo = MF.getInfo<AArch64FunctionInfo>();
 
+  // c2go (#130): pre-scan all IR call instructions in the function to
+  // determine whether ANY of them targets an AAPCS variadic callee. The
+  // flag must be final before FrameLowering queries hasReservedCallFrame
+  // (which runs after ISel), since the choice between per-callsite
+  // sub/add sp vs. fixed prologue-allocated outgoing-args region affects
+  // every call site's retval read offset, not just the variadic ones.
+  // See c2goScanVariadicOutgoing for the scan body.
+  if (MF.getFunction().getParent()->getModuleFlag(llvm::c2go::kGoabiModuleFlag) != nullptr)
+    c2goScanVariadicOutgoing(F, FuncInfo);
+
   SmallVector<ISD::OutputArg, 4> Outs;
   GetReturnInfo(CallConv, F.getReturnType(), F.getAttributes(), Outs,
                 DAG.getTargetLoweringInfo(), MF.getDataLayout());
@@ -8550,6 +8634,12 @@ SDValue AArch64TargetLowering::LowerFormalArguments(
   // Assign locations to all of the incoming arguments.
   SmallVector<CCValAssign, 16> ArgLocs;
   CCState CCInfo(CallConv, isVarArg, MF, ArgLocs, *DAG.getContext());
+
+  // c2go Phase B/C arm64: Go ABI0 reserves the bottom 8 bytes of the
+  // caller's outgoing-arg block for the caller's own saved LR — see
+  // c2goReserveCallerLRSlot for the full ABI rationale (extracted helper
+  // keeps the upstream LowerFormalArguments body cherry-pick friendly).
+  c2goReserveCallerLRSlot(CCInfo, CallConv, MF);
 
   // At this point, Ins[].VT may already be promoted to i32. To correctly
   // handle passing i8 as i8 instead of i32 on stack, we pass in both i32 and
@@ -9143,8 +9233,19 @@ SDValue AArch64TargetLowering::LowerCallResult(
     SDValue Chain, SDValue InGlue, CallingConv::ID CallConv, bool isVarArg,
     const SmallVectorImpl<CCValAssign> &RVLocs, const SDLoc &DL,
     SelectionDAG &DAG, SmallVectorImpl<SDValue> &InVals, bool isThisReturn,
-    SDValue ThisVal, bool RequiresSMChange) const {
+    SDValue ThisVal, bool RequiresSMChange,
+    const uint64_t *GoABI0CallNumBytes,
+    const SmallVectorImpl<SDValue> *PreEmittedMemVals,
+    const SmallVectorImpl<unsigned> *PreEmittedMemValRVLocIdxs) const {
   DenseMap<unsigned, SDValue> CopiedRegs;
+  // c2go (s5): build a fast index from RVLocs[] index → PreEmittedMemVals slot
+  // so the loop below can short-circuit the mem branch for those entries.
+  DenseMap<unsigned, unsigned> PreEmittedByRVLocIdx;
+  if (PreEmittedMemVals && PreEmittedMemValRVLocIdxs) {
+    assert(PreEmittedMemVals->size() == PreEmittedMemValRVLocIdxs->size());
+    for (unsigned k = 0; k < PreEmittedMemVals->size(); ++k)
+      PreEmittedByRVLocIdx[(*PreEmittedMemValRVLocIdxs)[k]] = k;
+  }
   // Copy all of the result registers out of their specified physreg.
   for (unsigned i = 0; i != RVLocs.size(); ++i) {
     CCValAssign VA = RVLocs[i];
@@ -9158,15 +9259,64 @@ SDValue AArch64TargetLowering::LowerCallResult(
       continue;
     }
 
-    // Avoid copying a physreg twice since RegAllocFast is incompetent and only
-    // allows one use of a physreg per block.
-    SDValue Val = CopiedRegs.lookup(VA.getLocReg());
-    if (!Val) {
-      Val =
-          DAG.getCopyFromReg(Chain, DL, VA.getLocReg(), VA.getLocVT(), InGlue);
-      Chain = Val.getValue(1);
-      InGlue = Val.getValue(2);
-      CopiedRegs[VA.getLocReg()] = Val;
+    SDValue Val;
+    // c2go (#130): GoABI0 results live in the caller's outgoing-arg
+    // block (after the args, per Plan 9 ABI0 stack layout). The byte
+    // address depends on whether the function uses reserved-call-frame:
+    //
+    //   reserved (default): the outgoing-arg region is part of the
+    //     function's prologue-allocated stack frame at fixed sp+0..N.
+    //     sp does not move across the call. Read at sp + LocMemOffset.
+    //
+    //   non-reserved (variadic-containing functions only): each call
+    //     site emits its own sub/add sp around the call. After
+    //     CALLSEQ_END's `add sp`, sp is restored to pre-call value;
+    //     the retval bytes physically still exist below sp at offset
+    //     (post-call sp - NumBytes + LocMemOffset). This depends on
+    //     post-pop stack data not being overwritten before the load.
+    if (VA.isMemLoc()) {
+      assert(CallConv == CallingConv::GoABI0 &&
+             "stack-located call result outside GoABI0 not supported");
+      assert(GoABI0CallNumBytes &&
+             "GoABI0 MemLoc retval missing call frame size from LowerCall");
+      // c2go (s5): if LowerCall pre-emitted this load before CALLSEQ_END,
+      // use the prepared value directly — its load chain is already wired
+      // upstream of CALLSEQ_END, so the retval bytes were captured BEFORE
+      // SP got the `add NumBytes` from CALLSEQ_END.
+      auto It = PreEmittedByRVLocIdx.find(i);
+      if (It != PreEmittedByRVLocIdx.end()) {
+        Val = (*PreEmittedMemVals)[It->second];
+      } else {
+        const TargetFrameLowering *TFL =
+            DAG.getMachineFunction().getSubtarget().getFrameLowering();
+        bool ReservedCallFrame =
+            TFL->hasReservedCallFrame(DAG.getMachineFunction());
+        int64_t SignedOff =
+            ReservedCallFrame
+                ? (int64_t)VA.getLocMemOffset()
+                : (int64_t)VA.getLocMemOffset() -
+                      (int64_t)alignTo(*GoABI0CallNumBytes,
+                                       TFL->getStackAlign());
+        SDValue SP = DAG.getCopyFromReg(Chain, DL, AArch64::SP, MVT::i64);
+        Chain = SP.getValue(1);
+        SDValue Off = DAG.getIntPtrConstant(SignedOff, DL);
+        SDValue Addr = DAG.getNode(ISD::ADD, DL, MVT::i64, SP, Off);
+        Val = DAG.getLoad(VA.getLocVT(), DL, Chain, Addr,
+                          MachinePointerInfo::getStack(DAG.getMachineFunction(),
+                                                      VA.getLocMemOffset()));
+        Chain = Val.getValue(1);
+      }
+    } else {
+      // Avoid copying a physreg twice since RegAllocFast is incompetent and only
+      // allows one use of a physreg per block.
+      Val = CopiedRegs.lookup(VA.getLocReg());
+      if (!Val) {
+        Val =
+            DAG.getCopyFromReg(Chain, DL, VA.getLocReg(), VA.getLocVT(), InGlue);
+        Chain = Val.getValue(1);
+        InGlue = Val.getValue(2);
+        CopiedRegs[VA.getLocReg()] = Val;
+      }
     }
 
     switch (VA.getLocInfo()) {
@@ -9309,6 +9459,18 @@ bool AArch64TargetLowering::isEligibleForTailCallOptimization(
     const CallLoweringInfo &CLI) const {
   CallingConv::ID CalleeCC = CLI.CallConv;
   if (!mayTailCallThisCC(CalleeCC))
+    return false;
+
+  // c2go Phase B: GoABI0 passes all args and results on the caller's
+  // stack frame. Tail-calling across the GoABI0 boundary would mix
+  // stack-result Loc kinds with register-result Loc kinds and trip
+  // CCState::resultsCompatible's llvm_unreachable. Even GoABI0→GoABI0
+  // sibcalls aren't safe — the result-stack layouts of the two frames
+  // are independent.
+  CallingConv::ID CallerCCEarly = CLI.DAG.getMachineFunction()
+                                       .getFunction()
+                                       .getCallingConv();
+  if (CalleeCC == CallingConv::GoABI0 || CallerCCEarly == CallingConv::GoABI0)
     return false;
 
   SDValue Callee = CLI.Callee;
@@ -9722,15 +9884,61 @@ AArch64TargetLowering::LowerCall(CallLoweringInfo &CLI,
         report_fatal_error("Passing SVE types to variadic functions is "
                            "currently not supported");
     }
+    // c2go (#130): HasC2GoVariadicOutgoingCall is set up-front during
+    // LowerFormalArguments via a pre-scan of all call sites in the
+    // function. Nothing to do here.
   }
+
+  // c2go Phase B/C arm64: Go ABI0 outgoing-arg block reserves its
+  // bottom 8 bytes for the caller's saved LR (Go-emitted wrappers do
+  // `MOVD.W R30, -framesize(RSP)` and then `MOVD arg, 8(RSP)`). Args
+  // therefore start at offset 8 in our outgoing-arg block.
+  //
+  // c2go (#277): the same reservation applies to the c2go-internal AAPCS
+  // convention, not just the GoABI0 boundary. Every c2go-mode function's
+  // hand-rolled go-asm prologue stores the caller's saved LR at sp+0
+  // (`STR LR,[SP,#-framesize]!`, see emitC2GoPrologue). Without the
+  // reservation, AAPCS lays the first outgoing stack arg at LocMemOffset 0,
+  // and the StackPtr+LocMemOffset store (LowerCall mem-arg path) writes it
+  // to sp+0, clobbering the saved LR (a NULL arg → RET-to-0). Reserving 8
+  // here shifts every outgoing stack arg to sp+8.., and because NumBytes =
+  // CCInfo.getStackSize() the outgoing-arg block (folded into the fixed
+  // frame via getMaxCallFrameSize) grows by the matching 8 — no separate
+  // NumBytes bump needed.
+  if (CallConv == CallingConv::GoABI0 ||
+      MF.getFunction().getParent()->getModuleFlag(llvm::c2go::kGoabiModuleFlag) != nullptr)
+    CCInfo.AllocateStack(8, Align(8));
 
   analyzeCallOperands(*this, Subtarget, CLI, CCInfo);
 
-  CCAssignFn *RetCC = CCAssignFnForReturn(CallConv);
+  // c2go §2.0.2/§2.0.3: a call to an internal function (direct internal callee
+  // OR any indirect call) reads results from registers (ABIInternal); the
+  // call-site `c2go-reg-return` attr is set by clang (CGCall) — present for
+  // internal/indirect, absent for c2go_extern/c2go_linkname boundary calls.
+  // Outgoing args still go on the stack (analyzeCallOperands above, incl. the
+  // +8 LR-slot reservation — unchanged).
+  // Read via hasCallSiteFnAttr (not CB->hasFnAttr): under the statepoint GC
+  // path (RS4GC) the IR call is wrapped in a gc.statepoint and CLI.CB is null,
+  // but the original call's `c2go-reg-return` attribute was propagated onto the
+  // statepoint and is carried in CLI.CallSiteAttrs. Without this, a register-
+  // returning internal callee would wrongly be read back from a GoABI0 stack
+  // slot it never wrote (#327).
+  bool C2GoRegReturn = CallConv == CallingConv::GoABI0 &&
+                       CLI.hasCallSiteFnAttr("c2go-reg-return");
+  CCAssignFn *RetCC =
+      C2GoRegReturn ? RetCC_AArch64_AAPCS : CCAssignFnForReturn(CallConv);
   // Assign locations to each value returned by this call.
   SmallVector<CCValAssign, 16> RVLocs;
   CCState RetCCInfo(CallConv, IsVarArg, DAG.getMachineFunction(), RVLocs,
                     *DAG.getContext());
+  // c2go Phase B: GoABI0 (boundary, stack-return) results live AFTER args in
+  // the caller's outgoing-arg frame. Pre-allocate the args block in the result
+  // CCState so subsequent CCAssignToStack allocations for results start at
+  // offset = roundup(args_size, RegSize). Go's ABI0 rounds the arg area up to
+  // RegSize(8) before laying out results. Register-return calls (internal/
+  // indirect) read X0../V0.. directly — no result-slot reservation.
+  if (CallConv == CallingConv::GoABI0 && !C2GoRegReturn)
+    RetCCInfo.AllocateStack(alignTo(CCInfo.getStackSize(), 8), Align(8));
   RetCCInfo.AnalyzeCallResult(Ins, RetCC);
 
   // Set type id for call site info.
@@ -9788,6 +9996,16 @@ AArch64TargetLowering::LowerCall(CallLoweringInfo &CLI,
 
   // Get a count of how many bytes are to be pushed on the stack.
   unsigned NumBytes = CCInfo.getStackSize();
+
+  // c2go Phase B: include result-slot space in the outgoing call
+  // frame so the callee writes back at the agreed offset and the
+  // caller can load from it after the call returns. RetCCInfo was
+  // pre-bumped by args_size, so its total stack size = args+result.
+  // c2go: only stack-returning (boundary) calls need result-slot space in the
+  // outgoing call frame. Register-return calls (internal/indirect) read
+  // X0../V0.. directly, so the outgoing frame holds args only.
+  if (CallConv == CallingConv::GoABI0 && !C2GoRegReturn)
+    NumBytes = std::max<unsigned>(NumBytes, RetCCInfo.getStackSize());
 
   if (IsSibCall) {
     // Since we're not changing the ABI to make this a tail call, the memory
@@ -10361,14 +10579,68 @@ AArch64TargetLowering::LowerCall(CallLoweringInfo &CLI,
   uint64_t CalleePopBytes =
       DoesCalleeRestoreStack(CallConv, TailCallOpt) ? alignTo(NumBytes, 16) : 0;
 
+  // c2go (finding s5): when a GoABI0 callee returns a stack-located retval AND
+  // the calling function has a non-reserved call frame (variadic-containing
+  // c2go functions: see setHasC2GoVariadicOutgoingCall), the original retval
+  // load happened AFTER CALLSEQ_END. CALLSEQ_END emits `add sp, NumBytes`,
+  // so the retval bytes physically live BELOW sp once the load runs — a race
+  // with any subsequent sub-sp / spill that wants to reuse that stack window.
+  // RA/PEI sees no alias, so codegen verifier doesn't catch it.
+  //
+  // Fix: pre-emit the mem retval loads HERE, before CALLSEQ_END. SP is still
+  // the post-arg-block-allocation value, so the slot address is plain
+  // `SP + LocMemOffset`. We chain CALLSEQ_END after the loads, so the
+  // restore-SP happens strictly after the loads.
+  SmallVector<SDValue, 4> PreCallSeqRetvals;
+  SmallVector<unsigned, 4> PreCallSeqRetvalLocs;
+  const TargetFrameLowering *TFL_S5 =
+      DAG.getMachineFunction().getSubtarget().getFrameLowering();
+  bool PreEmitMemRetvals =
+      (CallConv == CallingConv::GoABI0) &&
+      !TFL_S5->hasReservedCallFrame(DAG.getMachineFunction()) &&
+      std::any_of(RVLocs.begin(), RVLocs.end(),
+                  [](const CCValAssign &V) { return V.isMemLoc(); });
+  if (PreEmitMemRetvals) {
+    SDValue SPVal =
+        DAG.getCopyFromReg(Chain, DL, AArch64::SP, MVT::i64, InGlue);
+    SDValue PreCallSeqChain = SPVal.getValue(1);
+    for (unsigned i = 0; i != RVLocs.size(); ++i) {
+      const CCValAssign &VA = RVLocs[i];
+      if (!VA.isMemLoc())
+        continue;
+      SDValue Off = DAG.getIntPtrConstant(VA.getLocMemOffset(), DL);
+      SDValue Addr = DAG.getNode(ISD::ADD, DL, MVT::i64, SPVal, Off);
+      SDValue L = DAG.getLoad(VA.getLocVT(), DL, PreCallSeqChain, Addr,
+                              MachinePointerInfo::getStack(
+                                  DAG.getMachineFunction(),
+                                  VA.getLocMemOffset()));
+      PreCallSeqRetvals.push_back(L);
+      PreCallSeqRetvalLocs.push_back(i);
+      PreCallSeqChain = L.getValue(1);
+    }
+    // Make CALLSEQ_END strictly depend on the loads.
+    Chain = PreCallSeqChain;
+  }
+
   Chain = DAG.getCALLSEQ_END(Chain, NumBytes, CalleePopBytes, InGlue, DL);
   InGlue = Chain.getValue(1);
+
+  // c2go Phase B: stash NumBytes so LowerCallResult can compute the
+  // retval-slot address relative to the post-CALLSEQ_END SP using
+  // a negative offset. After CALLSEQ_END's `add sp, sp, NumBytes`,
+  // the retval bytes are at (sp - NumBytes + LocMemOffset). See #125.
+  // When pre-emitted above, LowerCallResult's mem branch is shorted out
+  // by the prepared values passed via PreEmittedMemVals.
+  uint64_t GoABI0CallNumBytes = NumBytes;
 
   // Handle result values, copying them out of physregs into vregs that we
   // return.
   SDValue Result = LowerCallResult(
       Chain, InGlue, CallConv, IsVarArg, RVLocs, DL, DAG, InVals, IsThisReturn,
-      IsThisReturn ? OutVals[0] : SDValue(), RequiresSMChange);
+      IsThisReturn ? OutVals[0] : SDValue(), RequiresSMChange,
+      CallConv == CallingConv::GoABI0 ? &GoABI0CallNumBytes : nullptr,
+      PreEmitMemRetvals ? &PreCallSeqRetvals : nullptr,
+      PreEmitMemRetvals ? &PreCallSeqRetvalLocs : nullptr);
 
   if (!Ins.empty())
     InGlue = Result.getValue(Result->getNumValues() - 1);
@@ -10435,7 +10707,12 @@ bool AArch64TargetLowering::CanLowerReturn(
     CallingConv::ID CallConv, MachineFunction &MF, bool isVarArg,
     const SmallVectorImpl<ISD::OutputArg> &Outs, LLVMContext &Context,
     const Type *RetTy) const {
-  CCAssignFn *RetCC = CCAssignFnForReturn(CallConv);
+  // c2go §2.0.2: internal register-return functions use the register RetCC;
+  // must match LowerReturn so sret-demotion decisions agree.
+  bool C2GoRegReturn = CallConv == CallingConv::GoABI0 &&
+                       MF.getFunction().hasFnAttribute("c2go-reg-return");
+  CCAssignFn *RetCC =
+      C2GoRegReturn ? RetCC_AArch64_AAPCS : CCAssignFnForReturn(CallConv);
   SmallVector<CCValAssign, 16> RVLocs;
   CCState CCInfo(CallConv, isVarArg, MF, RVLocs, Context);
   return CCInfo.CheckReturn(Outs, RetCC);
@@ -10450,15 +10727,67 @@ AArch64TargetLowering::LowerReturn(SDValue Chain, CallingConv::ID CallConv,
   auto &MF = DAG.getMachineFunction();
   auto *FuncInfo = MF.getInfo<AArch64FunctionInfo>();
 
-  CCAssignFn *RetCC = CCAssignFnForReturn(CallConv);
+  // c2go §2.0.2: an internal GoABI0 function (carries `c2go-reg-return`)
+  // returns results in registers (ABIInternal), so use the register RetCC and
+  // skip the GoABI0 stack-result machinery below. Boundary symbols
+  // (c2go_extern / c2go_linkname) lack the attribute and keep ABI0 stack
+  // returns. Args stay on the stack regardless (LowerFormalArguments — unchanged).
+  bool C2GoRegReturn = CallConv == CallingConv::GoABI0 &&
+                       MF.getFunction().hasFnAttribute("c2go-reg-return");
+  CCAssignFn *RetCC =
+      C2GoRegReturn ? RetCC_AArch64_AAPCS : CCAssignFnForReturn(CallConv);
   SmallVector<CCValAssign, 16> RVLocs;
   CCState CCInfo(CallConv, isVarArg, MF, RVLocs, *DAG.getContext());
+  // c2go Phase B: GoABI0 callee writes results to the caller's
+  // incoming-args frame at offset = roundup(args_size, RegSize) +
+  // ret_offset. Pre-allocate the rounded args block in the result
+  // CCState so AnalyzeReturn's CCAssignToStack offsets land after the
+  // args block, matching Go's ABI0 (the arg area is rounded up to
+  // RegSize(8) before results are placed — see abi/abiutils.go
+  // ABIAnalyzeTypes and types/size.go TFUNCARGS). This must agree with
+  // the result offset computed on the caller side in LowerCall.
+  unsigned IncomingArgsSize = 0;
+  if (CallConv == CallingConv::GoABI0 && !C2GoRegReturn) {
+    // FuncInfo->getBytesInStackArgArea() is set by LowerFormalArguments
+    // to the total size of incoming stack args (including the 8-byte LR
+    // slot). Round it up to RegSize before laying out results.
+    IncomingArgsSize = alignTo(FuncInfo->getBytesInStackArgArea(), 8);
+    CCInfo.AllocateStack(IncomingArgsSize, Align(8));
+  }
   CCInfo.AnalyzeReturn(Outs, RetCC);
 
-  // Copy the result values into the output registers.
+  // Copy the result values into the output registers (or, for GoABI0,
+  // store them into the caller's incoming-args frame at the agreed
+  // result offset).
   SDValue Glue;
   SmallVector<std::pair<unsigned, SDValue>, 4> RetVals;
   SmallSet<unsigned, 4> RegsUsed;
+
+  // c2go: for GoABI0 stack-located results (boundary functions), emit STORE
+  // instructions here and skip the rest of the per-VA register handling below.
+  // Internal register-return functions (C2GoRegReturn) fall through to the
+  // standard RegLoc loop instead.
+  if (CallConv == CallingConv::GoABI0 && !C2GoRegReturn) {
+    for (unsigned i = 0; i < RVLocs.size(); ++i) {
+      CCValAssign &VA = RVLocs[i];
+      assert(VA.isMemLoc() && "GoABI0 results must be MemLoc");
+      // CCInfo was pre-bumped by IncomingArgsSize above, so
+      // VA.getLocMemOffset() is the absolute offset of this result
+      // slot in the caller's args+results frame.
+      // resolveFrameOffsetReference (c2go branch) maps a FixedObject
+      // at offset N to SP + framesize + N, which is exactly the
+      // caller-side slot in our Plan 9 layout.
+      int FI = MF.getFrameInfo().CreateFixedObject(
+          VA.getLocVT().getStoreSize(), VA.getLocMemOffset(),
+          /*IsImmutable=*/false);
+      SDValue Addr = DAG.getFrameIndex(FI, getPointerTy(DAG.getDataLayout()));
+      SDValue Arg = OutVals[i];
+      Chain = DAG.getStore(Chain, DL, Arg, Addr,
+                           MachinePointerInfo::getFixedStack(MF, FI));
+    }
+    return DAG.getNode(AArch64ISD::RET_GLUE, DL, MVT::Other, Chain);
+  }
+
   for (unsigned i = 0, realRVLocIdx = 0; i != RVLocs.size();
        ++i, ++realRVLocIdx) {
     CCValAssign &VA = RVLocs[i];

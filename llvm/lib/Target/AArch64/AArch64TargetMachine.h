@@ -82,6 +82,37 @@ public:
   /// Returns true if the new SME ABI lowering should be used.
   bool useNewSMEABILowering() const { return UseNewSMEABILowering; }
 
+  // c2go #375 slice 1: per-TM Plan-9-codegen flags. Migrated off the base
+  // `llvm::TargetMachine` to keep the c2go-specific knobs scoped to the only
+  // backend that consumes them. Default false for all AArch64 TMs; clang's
+  // BackendUtil and the c2go-lto tool set them ONLY on the Plan 9-codegen
+  // TargetMachine (an OS-neutral ELF arm64 clone). Reached from clang via
+  // the free-function shim in `llvm/Target/C2GoBackendKnobs.h`.
+  //
+  // C2GoForceBlockAddressJumpTable: AArch64TargetLowering's
+  //   getJumpTableEncoding() reads this to force EK_BlockAddress (8-byte
+  //   absolute) instead of label-difference, and
+  //   AArch64PassConfig::addPostBBSections skips AArch64CompressJumpTables.
+  //   Plan 9 .s DATA can't represent label-difference encodings. (#120)
+  //
+  // C2GoDisableRegisterCoalescing: AArch64PassConfig ctor reads this and
+  //   disables the RegisterCoalescer. The c2go pipeline uses
+  //   CSR_AArch64_NoRegs + a go-asm-owned prologue (injected at PEI) over
+  //   large splittable frames; the coalescer (pre-RA/PEI) merges copies
+  //   inconsistently with that frame contract, miscompiling sqlite3Parser
+  //   yytos. Root cause tracked in #310.
+  //
+  // C2GoDisableGlobalMerge: AArch64PassConfig::addPreISel reads this and
+  //   skips the GlobalMergePass. GlobalMerge coalesces multiple internal
+  //   globals into a single `_MergedGlobals` aggregate, which races the
+  //   MCPlan9AsmStreamer go-owned filter: merged GVs are erased from the
+  //   Module before the streamer can classify them per-GV, so go-owned
+  //   pointer-bearing globals get folded into a NOPTR blob and the .s
+  //   ships an unsound NOPTR layout (#397).
+  bool C2GoForceBlockAddressJumpTable = false;
+  bool C2GoDisableRegisterCoalescing = false;
+  bool C2GoDisableGlobalMerge = false;
+
 private:
   bool isLittle;
   bool UseNewSMEABILowering;

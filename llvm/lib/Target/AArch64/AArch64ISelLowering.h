@@ -79,6 +79,15 @@ public:
   /// Selects the correct CCAssignFn for a given CallingConvention value.
   CCAssignFn *CCAssignFnForReturn(CallingConv::ID CC) const;
 
+  /// c2go (#136 / #139 jump-table): in c2go-mode, override the default PIC
+  /// jump-table encoding (EK_LabelDifference32 / EK_GPRel32BlockAddress)
+  /// with EK_BlockAddress so jump tables are emitted as 8-byte absolute
+  /// pointers. The Plan 9 assembler can't express label-difference
+  /// expressions in DATA directives (`bad addr size for DATA argument`),
+  /// so we force the full-address representation. Slightly larger code
+  /// size, fully compatible with Plan 9 emit.
+  unsigned getJumpTableEncoding() const override;
+
   /// Determine which of the bits specified in Mask are known to be either zero
   /// or one and return them in the KnownZero/KnownOne bitsets.
   void computeKnownBitsForTargetNode(const SDValue Op, KnownBits &Known,
@@ -603,12 +612,19 @@ private:
   SDValue LowerCall(CallLoweringInfo & /*CLI*/,
                     SmallVectorImpl<SDValue> &InVals) const override;
 
-  SDValue LowerCallResult(SDValue Chain, SDValue InGlue,
-                          CallingConv::ID CallConv, bool isVarArg,
-                          const SmallVectorImpl<CCValAssign> &RVLocs,
-                          const SDLoc &DL, SelectionDAG &DAG,
-                          SmallVectorImpl<SDValue> &InVals, bool isThisReturn,
-                          SDValue ThisVal, bool RequiresSMChange) const;
+  SDValue LowerCallResult(
+      SDValue Chain, SDValue InGlue, CallingConv::ID CallConv, bool isVarArg,
+      const SmallVectorImpl<CCValAssign> &RVLocs, const SDLoc &DL,
+      SelectionDAG &DAG, SmallVectorImpl<SDValue> &InVals, bool isThisReturn,
+      SDValue ThisVal, bool RequiresSMChange,
+      const uint64_t *GoABI0CallNumBytes = nullptr,
+      // c2go (s5): retval mem loads emitted by LowerCall BEFORE CALLSEQ_END
+      // for the GoABI0 + non-reserved-call-frame race fix. RVLocIdxs gives
+      // the RVLocs[] indices for each entry in PreEmittedMemVals so the
+      // result loop can splice them into the right InVals slot.
+      const SmallVectorImpl<SDValue> *PreEmittedMemVals = nullptr,
+      const SmallVectorImpl<unsigned> *PreEmittedMemValRVLocIdxs =
+          nullptr) const;
 
   SDValue LowerLOAD(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerSTORE(SDValue Op, SelectionDAG &DAG) const;

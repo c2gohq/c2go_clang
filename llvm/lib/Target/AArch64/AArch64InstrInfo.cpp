@@ -56,6 +56,7 @@
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include <cassert>
 #include <cstdint>
 #include <iterator>
@@ -1255,6 +1256,238 @@ bool AArch64InstrInfo::isAsCheapAsAMove(const MachineInstr &MI) const {
   case AArch64::MOVi64imm:
     return isCheapImmediate(MI, 64);
   }
+}
+
+// c2go GC Approach B (#330): does the def of \p Reg compute a POINTER?
+//
+// We walk the SSA def chain (pre-RA virtual registers) seeded from UNAMBIGUOUS
+// pointer roots and propagate ONLY through pointer-preserving operations. The
+// classification must be conservative in the SOUND direction: we may report a
+// pointer as a non-pointer (under-mark → that slot's pointer is missed — caught
+// by the #329 corruption test), but we must NEVER report a non-pointer integer
+// as a pointer, because Go's copystack `adjustpointers` (runtime/stack.go)
+// rewrites any marked word whose value falls in the relocated old-stack range,
+// silently corrupting a spilled integer.
+//
+// Pointer ROOTS (defs that materialize an address):
+//   * an instruction with a FrameIndex operand that is an ADDRESS computation
+//     (ADDXri/SUBXri %stack.N) — NOT a load/store (those touch the slot's
+//     contents, not its address);
+//   * an instruction with a GlobalAddress operand that materializes the address
+//     (ADRP / ADR / MOVaddr / ADDlow / MOVaddrEXT/JT/CP) — NOT a load-from-GOT
+//     of the pointed-to value;
+//   * a function live-in argument of pointer type — handled by the caller via
+//     the c2go arg pointer mask, so a bare arg COPY does not need to root here.
+//
+// Pointer-PRESERVING propagation:
+//   * COPY / ORRXrs-as-move from a pointer-derived reg;
+//   * base + immediate / base + register address arithmetic
+//     (ADDXri/ADDXrr/ADDXrs etc.) where the BASE operand is pointer-derived —
+//     covers &s.field (ADDXri base,#off) and &buf[k] (ADDXrr base,index);
+//   * a LOAD whose result is a pointer-typed value (the loaded value is itself a
+//     GC pointer): detected via the MachineMemOperand's pointee/IR type.
+//
+// NOT propagated (would over-mark): SUBXrr/SUBSXrr (pointer difference → int),
+// compares, multiplies, and any reg-reg op that is not address arithmetic.
+static bool c2goIsPtrDerived(Register Reg, const MachineRegisterInfo &MRI,
+                             unsigned Depth, SmallSet<Register, 16> &Seen) {
+  if (!Reg.isVirtual() || Depth > 24)
+    return false;
+  if (!Seen.insert(Reg).second)
+    // Cycle (typically a PHI self-loop). MUST return false here.
+    //
+    // #370 bisect (14 steps) 锤实:root commit ccab7bf7733e 把这里从 `false`
+    // 改成 `true`(以"避免 poison PHI AND 路径、防 #329 under-mark"为由),
+    // 实测在 SQLite -O2 e2e 触发 `bad pointer 0x1 in sqlite3_exec frame`:
+    // 纯整数 induction PHI(loop counter,自环回边)在 self-cycle 上返回 true,
+    // PHI AND-across-incomings(下方 1411-1422)非自环 incoming 也是 ptr-derived
+    // (例如初值从 frame index / global 派生的偏移)时,整个 PHI 被误判 ptr,
+    // 其 spill slot 被 over-mark → copystack adjustpointers 把 0x1/0x3/0x80
+    // 等整数当 stack 指针 → invalidptr abort。
+    //
+    // 正确语义:self-cycle 是"尚未被证明"的回边,按 conservative 不传播 ptr-ness;
+    // PHI 的 AND 在自环边上 fail 是 SOUND(纯整数循环本来就不该被标);非自环
+    // 路径若真正派生自 ptr root,多-def OR(1443-1445)或非环 incoming 仍能
+    // 让真 ptr 的 PHI 被正确识别。#329 的 derived-pointer 由 frame-index /
+    // global 根 + ADDXri/ADDXrr/ORRXri-disjoint 路径覆盖,与 self-cycle 无关。
+    return false;
+  // The spiller runs at the END of register allocation; by that point a vreg
+  // may have multiple defs (LiveRangeEdit / split). getUniqueVRegDef returns
+  // null then. For our use (classify the ORIGINAL VRM vreg's value, called
+  // from InlineSpiller::spillAll), we accept ANY def being pointer-producing
+  // — a split tree's COPY/PHI defs descend from the same SSA root, so if any
+  // chain leads back to a pointer root we are correct.
+  SmallVector<MachineInstr *, 4> Defs;
+  for (MachineInstr &D : MRI.def_instructions(Reg))
+    Defs.push_back(&D);
+  if (Defs.empty())
+    return false;
+
+  auto hasFrameIndexAddr = [](const MachineInstr &MI) {
+    for (const MachineOperand &MO : MI.operands())
+      if (MO.isFI())
+        return true;
+    return false;
+  };
+  auto hasGlobalAddr = [](const MachineInstr &MI) {
+    for (const MachineOperand &MO : MI.operands())
+      if (MO.isGlobal() || MO.isBlockAddress() || MO.isJTI() || MO.isCPI())
+        return true;
+    return false;
+  };
+
+  // Classify a single def-instruction. Returns true iff this def produces a
+  // pointer. For a multi-def (post-split) vreg we OR across all defs: if any
+  // def's chain leads back to a pointer root, the spill slot holds a pointer
+  // for at least part of the live range, and we must mark it (under-mark
+  // would miss copystack relocation). Marking a slot that ALSO happens to
+  // hold a non-pointer in some interval is safe only if the non-pointer's bit
+  // pattern is outside the moving-stack range — which Go's copystack
+  // adjustpointers checks per word (stack.go: `if old.lo <= p < old.hi`). The
+  // #329 corruption case is the OPPOSITE: under-marking a slot that DOES hold
+  // a stack pointer leaves it stale after relocation. Choosing the OR
+  // direction biases toward soundness.
+  auto classifyDef = [&](MachineInstr *Def) -> bool {
+    auto operandPtrDerived = [&](unsigned OpIdx) -> bool {
+      if (OpIdx >= Def->getNumOperands())
+        return false;
+      const MachineOperand &MO = Def->getOperand(OpIdx);
+      return MO.isReg() && MO.getReg().isVirtual() &&
+             c2goIsPtrDerived(MO.getReg(), MRI, Depth + 1, Seen);
+    };
+    switch (Def->getOpcode()) {
+  // Address materialization from a frame index → pointer ROOT.
+  case AArch64::ADDXri:
+  case AArch64::SUBXri:
+    if (hasFrameIndexAddr(*Def))
+      return true;
+    // base + immediate offset: pointer iff the base register is pointer-derived.
+    return operandPtrDerived(1);
+
+  // Global / constant-pool / jump-table address materialization → pointer ROOT.
+  case AArch64::ADRP:
+  case AArch64::ADR:
+  case AArch64::MOVaddr:
+  case AArch64::MOVaddrBA:
+  case AArch64::MOVaddrCP:
+  case AArch64::MOVaddrEXT:
+  case AArch64::MOVaddrJT:
+  case AArch64::MOVaddrTLS:
+  case AArch64::ADDlowTLS:
+    return true;
+  case AArch64::ADDXrr:
+  case AArch64::ADDXrs:
+  case AArch64::ADDXrx:
+  case AArch64::ADDXrx64:
+    // Address arithmetic base+index/base+shifted: pointer iff base (op 1) is
+    // pointer-derived. &buf[k] is ADDXrr base,index.
+    if (hasGlobalAddr(*Def))
+      return true;
+    return operandPtrDerived(1);
+
+  // Register moves preserve pointer-ness.
+  case AArch64::ORRXrs: // mov Xd, Xm  ==  orr Xd, xzr, Xm
+    // op2 is the source register when op1 is XZR (the canonical reg-move form).
+    return operandPtrDerived(2) || operandPtrDerived(1);
+  // base | imm (logical immediate) ONLY when DAGCombiner has marked the OR as
+  // address arithmetic via the `disjoint` flag — i.e. it rewrote `ADD base,
+  // imm` to `OR base, imm` because base's low bits are zero where imm sets
+  // bits (an aligned pointer + small offset). #329's `&s.b` on a 16-byte-
+  // aligned alloca takes this form. WITHOUT the disjoint flag the OR is a
+  // general bitwise op (e.g. `tag | flag_bit` on an integer), and treating it
+  // as pointer arithmetic over-marks spill slots that hold a non-pointer int
+  // — Go's invalidptr check then aborts on the int value (e.g.
+  // sqlitepkg.resolveExprStep saw `bad pointer ... 0x3` because a small-int
+  // expression node spilled to a tagged slot). Without `disjoint` we MUST
+  // under-mark to stay sound.
+  case AArch64::ORRXri:
+    if (Def->getFlag(MachineInstr::Disjoint))
+      return operandPtrDerived(1);
+    return false;
+  case AArch64::COPY:
+    return operandPtrDerived(1);
+  case AArch64::SUBREG_TO_REG:
+  case AArch64::INSERT_SUBREG:
+    return operandPtrDerived(2);
+  case AArch64::EXTRACT_SUBREG:
+    return operandPtrDerived(1);
+
+  // CSEL of two pointer-derived values is still a pointer.
+  case AArch64::CSELXr:
+    return operandPtrDerived(1) && operandPtrDerived(2);
+
+  // PHI: pointer iff EVERY incoming value is pointer-derived (sound: a mixed
+  // phi of ptr/int is not safely a pointer).
+  case TargetOpcode::PHI: {
+    bool Any = false;
+    for (unsigned I = 1, E = Def->getNumOperands(); I + 1 < E; I += 2) {
+      const MachineOperand &MO = Def->getOperand(I);
+      if (!MO.isReg() || !MO.getReg().isVirtual())
+        return false;
+      if (!c2goIsPtrDerived(MO.getReg(), MRI, Depth + 1, Seen))
+        return false;
+      Any = true;
+    }
+    return Any;
+  }
+
+  // A 64-bit LOAD: the loaded value MAY be a pointer (e.g. a pointer field
+  // read out of an aggregate) or an i64. The MIR LLT (gpr64) and the spill
+  // MachineMemOperand carry no IR pointer-ness, so we CANNOT prove pointer-ness
+  // here without risking marking a loaded integer (unsound — see header). We
+  // deliberately do NOT propagate through loads: a loaded pointer that stays
+  // live across a call is either (a) re-materialized from a frame index /
+  // global (caught above) or (b) kept in a clang `c2go.ptr.slot` alloca (caught
+  // by the lightweight stackmap path's alloca tracking). Under-marking here is
+  // SOUND; the #329 corruption test confirms the derived-pointer class (which
+  // roots at frame indices, not loads) is covered.
+
+  default:
+    return false;
+  }
+  }; // end classifyDef lambda
+
+  // Multi-def: OR across defs. A split vreg whose chain leads back to a
+  // pointer root (via at least one def) holds a pointer for that interval and
+  // its spill slot must be marked.
+  for (MachineInstr *D : Defs)
+    if (classifyDef(D))
+      return true;
+  return false;
+}
+
+bool AArch64InstrInfo::isC2GoPointerDerivedReg(
+    Register Reg, const MachineRegisterInfo &MRI) const {
+  SmallSet<Register, 16> Seen;
+  return c2goIsPtrDerived(Reg, MRI, 0, Seen);
+}
+
+// c2go GC Approach B (#330) #426: pointer-spill tagging counter. Increments
+// in storeRegToStackSlot when the spilled value is GC-pointer-derived (gated
+// on the `c2go.goabi` module flag, so non-c2go targets are byte-identical).
+// Registered under a dedicated DEBUG_TYPE ("aarch64-c2go") so it does not
+// pollute the file-wide "AArch64InstrInfo" debug bucket.
+#undef DEBUG_TYPE
+#define DEBUG_TYPE "aarch64-c2go"
+STATISTIC(NumC2GoPtrSpillSlots,
+          "c2go GC Approach B: pointer-tagged spill slots (#330)");
+#undef DEBUG_TYPE
+#define DEBUG_TYPE "AArch64InstrInfo"
+
+// c2go GC Approach B (#330) #375 slice 3 / #426: TII tag-channel overrides
+// routing target-independent StackColoring / StackSlotColoring through
+// AArch64FunctionInfo.
+StringRef
+AArch64InstrInfo::getStackSlotTypeTag(const MachineFunction &MF,
+                                      int StackSlot) const {
+  const auto *AFI = MF.getInfo<AArch64FunctionInfo>();
+  return AFI->getC2GoSpillSlotTag(StackSlot);
+}
+
+void AArch64InstrInfo::setStackSlotTypeTag(MachineFunction &MF, int StackSlot,
+                                           StringRef Tag) const {
+  auto *AFI = MF.getInfo<AArch64FunctionInfo>();
+  AFI->setC2GoSpillSlotTag(StackSlot, Tag);
 }
 
 bool AArch64InstrInfo::isFalkorShiftExtFast(const MachineInstr &MI) {
@@ -6126,6 +6359,26 @@ void AArch64InstrInfo::storeRegToStackSlot(MachineBasicBlock &MBB,
   if (PNRReg.isValid())
     MI.addDef(PNRReg, RegState::Implicit);
   MI.addMemOperand(MMO);
+
+  // c2go GC Approach B (#330) #426: classify the spilled value and, when
+  // pointer-derived, tag the spill slot on AArch64FunctionInfo so the
+  // locals pointer bitmap / per-PC stackmap marks it. Piggybacked here
+  // (was: a separate TII::recordPointerSpillSlot virtual called from
+  // InlineSpiller::spillAll). Gated on the `c2go.goabi` module flag —
+  // non-c2go translation units are byte-identical. Physical SrcRegs (CSR
+  // spills, RegAllocFast, scavenger) return false from the derivation walk
+  // because c2goIsPtrDerived early-exits on !Reg.isVirtual().
+  if (MF.getFunction().getParent()->getModuleFlag(llvm::c2go::kGoabiModuleFlag) &&
+      SrcReg.isVirtual() && isC2GoPointerDerivedReg(SrcReg, MF.getRegInfo())) {
+    auto *AFI = MF.getInfo<AArch64FunctionInfo>();
+    if (AFI->getC2GoSpillSlotTag(FI).empty()) {
+      AFI->setC2GoSpillSlotTag(FI, "ptr");
+      ++NumC2GoPtrSpillSlots;
+      LLVM_DEBUG(dbgs() << "c2go-gc-B: tagged spill slot fi=" << FI
+                        << " ptr (from " << printReg(SrcReg) << ") in "
+                        << MF.getName() << '\n');
+    }
+  }
 }
 
 static void loadRegPairFromStackSlot(const TargetRegisterInfo &TRI,

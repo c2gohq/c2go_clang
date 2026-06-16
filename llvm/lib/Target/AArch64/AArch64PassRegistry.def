@@ -1,0 +1,28 @@
+//===- AArch64PassRegistry.def - Registry of AArch64 NewPM passes -*- C++ -*-=//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file is used as the registry of AArch64-specific NewPM passes. Included
+// by `AArch64TargetMachine::registerPassBuilderCallbacks` via
+// `llvm/Passes/TargetPassRegistry.inc`, which wires every entry into the
+// PassBuilder's `registerPipelineParsingCallback` so the listed pass names are
+// resolvable via `opt -passes=...` and the future NewPM CodeGen pipeline.
+//
+// NOTE: NO INCLUDE GUARD DESIRED!
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef MODULE_PASS
+#define MODULE_PASS(NAME, CREATE_PASS)
+#endif
+// c2go #379: NewPM port of AArch64C2GoLeafABI. The legacy ModulePass is still
+// the worker on the AArch64 legacy codegen pipeline (clang + c2go-lto both go
+// through `addPassesToEmitFile`); this entry just makes the NewPM wrapper
+// reachable via `opt -passes=aarch64-c2go-leaf-abi` for LIT + future NewPM
+// CodeGenPassBuilder consumers.
+MODULE_PASS("aarch64-c2go-leaf-abi", AArch64C2GoLeafABIPass())
+#undef MODULE_PASS

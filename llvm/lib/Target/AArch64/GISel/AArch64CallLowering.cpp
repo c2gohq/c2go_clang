@@ -46,6 +46,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -408,6 +409,12 @@ bool AArch64CallLowering::lowerReturn(MachineIRBuilder &MIRBuilder,
                                       ArrayRef<Register> VRegs,
                                       FunctionLoweringInfo &FLI,
                                       Register SwiftErrorVReg) const {
+  // c2go Phase B/C: GoABI0 returns live on the caller's stack frame;
+  // handled only in SelectionDAG's LowerReturn. Bail out so the
+  // GlobalISel framework falls back to SelectionDAG.
+  if (MIRBuilder.getMF().getFunction().getCallingConv() ==
+      CallingConv::GoABI0)
+    return false;
   auto MIB = MIRBuilder.buildInstrNoInsert(AArch64::RET_ReallyLR);
   assert(((Val && !VRegs.empty()) || (!Val && VRegs.empty())) &&
          "Return value without a vreg");
@@ -702,6 +709,24 @@ bool AArch64CallLowering::lowerFormalArguments(
   // in SelectionDAG; bail out for now.
   if (F.getCallingConv() == CallingConv::ARM64EC_Thunk_Native ||
       F.getCallingConv() == CallingConv::ARM64EC_Thunk_X64)
+    return false;
+
+  // c2go Phase B/C: GoABI0 lives only in the SelectionDAG path
+  // (LowerFormalArguments / LowerCall / LowerReturn / LowerCallResult
+  // overrides + custom resolveFrameOffsetReference). GlobalISel has
+  // no GoABI0 awareness; falling back to SelectionDAG yields the
+  // correct Plan 9 frame and stack-only marshalling.
+  //
+  // c2go (#277): the SAME applies to EVERY c2go-mode function, not just
+  // GoABI0-CC boundaries. c2go's internal AAPCS calls rely on the
+  // SelectionDAG-only +8 saved-LR reservation (LowerCall /
+  // LowerFormalArguments `CCInfo.AllocateStack(8)`) so outgoing stack args
+  // land at sp+8 above the go-asm saved LR. At -O0 AArch64 defaults to
+  // GlobalISel, which has none of that — without this fallback the first
+  // outgoing stack arg is written to sp+0 and clobbers the saved LR
+  // (a NULL arg → RET-to-0). Route the whole c2go module through SelectionDAG.
+  if (F.getCallingConv() == CallingConv::GoABI0 ||
+      F.getParent()->getModuleFlag(llvm::c2go::kGoabiModuleFlag) != nullptr)
     return false;
 
   bool IsWin64 =
@@ -1325,6 +1350,17 @@ bool AArch64CallLowering::lowerCall(MachineIRBuilder &MIRBuilder,
   // in SelectionDAG; bail out for now.
   if (Info.CallConv == CallingConv::ARM64EC_Thunk_Native ||
       Info.CallConv == CallingConv::ARM64EC_Thunk_X64)
+    return false;
+
+  // c2go Phase B/C: GoABI0 call sites need SelectionDAG's stack-result
+  // path (LowerCall + LowerCallResult). Bail out so we fall back.
+  // c2go (#277): likewise EVERY c2go-mode call site — the +8 saved-LR
+  // reservation for outgoing stack args is SelectionDAG-only. See
+  // lowerFormalArguments above. (Usually the whole function already fell
+  // back there; this guards direct entry to lowerCall.)
+  if (Info.CallConv == CallingConv::GoABI0 ||
+      MIRBuilder.getMF().getFunction().getParent()->getModuleFlag(
+          llvm::c2go::kGoabiModuleFlag) != nullptr)
     return false;
 
   SmallVector<ArgInfo, 8> OutArgs;

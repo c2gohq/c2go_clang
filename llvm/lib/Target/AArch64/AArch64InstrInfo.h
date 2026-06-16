@@ -193,6 +193,16 @@ public:
 
   bool isAsCheapAsAMove(const MachineInstr &MI) const override;
 
+  // c2go GC Approach B (#330) #375 slice 3 / #426: target-independent
+  // StackColoring/StackSlotColoring consult per-slot type tags through TII.
+  // AArch64 routes both accessors through AArch64FunctionInfo. The producer
+  // side (was: recordPointerSpillSlot virtual) is now piggybacked onto
+  // storeRegToStackSlot.
+  StringRef getStackSlotTypeTag(const MachineFunction &MF,
+                                int StackSlot) const override;
+  void setStackSlotTypeTag(MachineFunction &MF, int StackSlot,
+                           StringRef Tag) const override;
+
   bool isCoalescableExtInstr(const MachineInstr &MI, Register &SrcReg,
                              Register &DstReg, unsigned &SubIdx) const override;
 
@@ -585,6 +595,13 @@ protected:
 
 private:
   unsigned getInstBundleLength(const MachineInstr &MI) const;
+
+  // c2go GC Approach B (#330) #375 slice 5 / #426: private AArch64 helper —
+  // classify a virtual register as pointer-derived for stack-slot GC marking.
+  // Sole caller is storeRegToStackSlot() (the c2go-mode pointer-spill tag
+  // producer, piggybacked onto the upstream spill emitter in #426).
+  bool isC2GoPointerDerivedReg(Register Reg,
+                               const MachineRegisterInfo &MRI) const;
 
   /// Sets the offsets on outlined instructions in \p MBB which use SP
   /// so that they will be valid post-outlining.

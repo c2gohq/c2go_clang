@@ -11,6 +11,7 @@
 
 #include "AArch64TargetMachine.h"
 #include "AArch64.h"
+#include "AArch64C2GoLeafABI.h"
 #include "AArch64MachineFunctionInfo.h"
 #include "AArch64MachineScheduler.h"
 #include "AArch64MacroFusion.h"
@@ -45,6 +46,7 @@
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Compiler.h"
+#include "llvm/Target/C2GoBackendKnobs.h"
 #include "llvm/Target/TargetLoweringObjectFile.h"
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/TargetParser/Triple.h"
@@ -141,6 +143,11 @@ static cl::opt<bool>
     BranchRelaxation("aarch64-enable-branch-relax", cl::Hidden, cl::init(true),
                      cl::desc("Relax out of range conditional branches"));
 
+// c2go (#120 / Plan 9 jump tables, #309 / RegisterCoalescer): per-TM
+// flags live on AArch64TargetMachine. Clang's BackendUtil sets them on
+// the Plan 9-codegen TargetMachine; readers reach them via getTM<...>()
+// or the TargetLowering->getTargetMachine() back-pointer.
+
 static cl::opt<bool> EnableCompressJumpTables(
     "aarch64-enable-compress-jump-tables", cl::Hidden, cl::init(true),
     cl::desc("Use smallest entry possible for jump tables"));
@@ -227,6 +234,14 @@ static cl::opt<bool>
                             cl::desc("Enable new lowering for the SME ABI"),
                             cl::init(true), cl::Hidden);
 
+// c2go #435 (c): forward-decl the AArch64 applier; the definition lives
+// further down in the file alongside the per-bool setForce* shims.
+namespace llvm {
+namespace c2go {
+void applyAArch64C2GoConfig(TargetMachine *TM, const BackendConfig &Cfg);
+} // namespace c2go
+} // namespace llvm
+
 extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void
 LLVMInitializeAArch64Target() {
   // Register the target.
@@ -235,6 +250,16 @@ LLVMInitializeAArch64Target() {
   RegisterTargetMachine<AArch64leTargetMachine> Z(getTheARM64Target());
   RegisterTargetMachine<AArch64leTargetMachine> W(getTheARM64_32Target());
   RegisterTargetMachine<AArch64leTargetMachine> V(getTheAArch64_32Target());
+
+  // c2go #435 (c): register the per-arch applier for every AArch64 flavour
+  // the .o-emit path may target. ARM64 / aarch64_be / aarch64_32 share the
+  // same AArch64TargetMachine subclass — one applier suffices.
+  llvm::c2go::registerC2GoBackendConfigHook(llvm::Triple::aarch64,
+                                            &llvm::c2go::applyAArch64C2GoConfig);
+  llvm::c2go::registerC2GoBackendConfigHook(llvm::Triple::aarch64_be,
+                                            &llvm::c2go::applyAArch64C2GoConfig);
+  llvm::c2go::registerC2GoBackendConfigHook(llvm::Triple::aarch64_32,
+                                            &llvm::c2go::applyAArch64C2GoConfig);
   auto &PR = *PassRegistry::getPassRegistry();
   initializeGlobalISel(PR);
   initializeAArch64A53Fix835769Pass(PR);
@@ -242,6 +267,7 @@ LLVMInitializeAArch64Target() {
   initializeAArch64AdvSIMDScalarPass(PR);
   initializeAArch64AsmPrinterPass(PR);
   initializeAArch64BranchTargetsPass(PR);
+  initializeAArch64C2GoPtrSlotLivenessPass(PR);
   initializeAArch64CollectLOHPass(PR);
   initializeAArch64CompressJumpTablesPass(PR);
   initializeAArch64ConditionalComparesPass(PR);
@@ -531,6 +557,16 @@ public:
     if (TM.getOptLevel() != CodeGenOptLevel::None)
       substitutePass(&PostRASchedulerID, &PostMachineSchedulerID);
     setEnableSinkAndFold(EnableSinkFold);
+    // c2go (#309): the Plan 9 codegen pipeline uses CSR_AArch64_NoRegs + a
+    // go-asm-owned prologue (injected at PEI) over large splittable frames.
+    // The RegisterCoalescer (run pre-RA/PEI) merges copies inconsistently
+    // with that frame contract, miscompiling sqlite3Parser. Disable it for
+    // c2go only, keeping greedy RA's split/spill quality. Targeted
+    // correctness gate; root cause tracked in #310. Flag lives on the
+    // Plan 9-codegen TargetMachine; the (unlinked) .o pipeline and all
+    // non-c2go compiles use a different TM with the flag unset.
+    if (TM.C2GoDisableRegisterCoalescing)
+      disablePass(&RegisterCoalescerID);
   }
 
   AArch64TargetMachine &getAArch64TargetMachine() const {
@@ -574,6 +610,13 @@ void AArch64TargetMachine::registerPassBuilderCallbacks(PassBuilder &PB) {
         [](ModulePassManager &PM, OptimizationLevel, ThinOrFullLTOPhase) {
           PM.addPass(LowerIFuncPass());
         });
+
+  // c2go #379: wire AArch64-specific NewPM passes (currently just
+  // `aarch64-c2go-leaf-abi`) into PassBuilder so they are resolvable via
+  // `opt -passes=...`. The legacy codegen pipeline still uses the legacy
+  // ModulePass injected from `AArch64PassConfig::addIRPasses` below.
+#define GET_PASS_REGISTRY "AArch64PassRegistry.def"
+#include "llvm/Passes/TargetPassRegistry.inc"
 }
 
 TargetTransformInfo
@@ -670,6 +713,19 @@ void AArch64PassConfig::addIRPasses() {
 
   if (TM->Options.JMCInstrument)
     addPass(createJMCInstrumenterPass());
+
+  // c2go #283: opportunistically flip NOSPLIT-eligible internal leaf /
+  // near-leaf functions to the private C2GoABIInternal register-passing
+  // convention. Self-gates inside runOnModule on:
+  //   1. `c2go-leaf-abiinternal` cl::opt (default true)
+  //   2. `c2go.goabi` Module flag (set by clang for -fc2go).
+  // Mirrors register-return (§2.0.2) in only ever applying at -O>=1: at -O0
+  // the call-graph / frame analysis is dominated by alloca clutter and the
+  // savings don't justify the additional path. NOSPLIT .s emission (#297)
+  // is already in place; eligibility analysis enforces the same frame-size
+  // budget the Go linker uses.
+  if (TM->getOptLevel() != CodeGenOptLevel::None)
+    addPass(createAArch64C2GoLeafABIPass());
 }
 
 // Pass Pipeline Configuration
@@ -681,9 +737,16 @@ bool AArch64PassConfig::addPreISel() {
   // FIXME: On AArch64, this depends on the type.
   // Basically, the addressable offsets are up to 4095 * Ty.getSizeInBytes().
   // and the offset has to be a multiple of the related size in bytes.
-  if ((TM->getOptLevel() != CodeGenOptLevel::None &&
-       EnableGlobalMerge == cl::BOU_UNSET) ||
-      EnableGlobalMerge == cl::BOU_TRUE) {
+  // c2go (#397): GlobalMerge folds multiple internal globals into a single
+  // `_MergedGlobals` aggregate before MCPlan9AsmStreamer's go-owned filter
+  // gets to classify them per-GV. Pointer-bearing managed globals end up in
+  // a NOPTR blob, shipping an unsound .s pointer-map. The Plan 9-codegen TM
+  // sets this flag (see `llvm::c2go::setDisableGlobalMerge`); non-c2go TMs
+  // (which never set the flag) keep the existing behaviour unchanged.
+  if (!getAArch64TargetMachine().C2GoDisableGlobalMerge &&
+      ((TM->getOptLevel() != CodeGenOptLevel::None &&
+        EnableGlobalMerge == cl::BOU_UNSET) ||
+       EnableGlobalMerge == cl::BOU_TRUE)) {
     bool OnlyOptimizeForSize =
         (TM->getOptLevel() < CodeGenOptLevel::Aggressive) &&
         (EnableGlobalMerge == cl::BOU_UNSET);
@@ -890,7 +953,16 @@ void AArch64PassConfig::addPostBBSections() {
   if (BranchRelaxation)
     addPass(&BranchRelaxationPassID);
 
-  if (TM->getOptLevel() != CodeGenOptLevel::None && EnableCompressJumpTables)
+  // c2go: skip jump-table compression. The compressed (1/2-byte
+  // label-difference) encoding can't be represented in Plan 9 .s DATA
+  // directives, which only accept fixed-size absolute pointer values.
+  // Forcing the default 4-byte LabelDifference32 entries (or
+  // EK_BlockAddress 8-byte absolute via getJumpTableEncoding override)
+  // keeps the table emittable. See AArch64TargetMachine's
+  // C2GoForceBlockAddressJumpTable field (#375 slice 1).
+  bool SkipCompress = getAArch64TargetMachine().C2GoForceBlockAddressJumpTable;
+  if (TM->getOptLevel() != CodeGenOptLevel::None && EnableCompressJumpTables
+      && !SkipCompress)
     addPass(createAArch64CompressJumpTablesPass());
 }
 
@@ -898,6 +970,22 @@ void AArch64PassConfig::addPreEmitPass2() {
   // SVE bundles move prefixes with destructive operations. BLR_RVMARKER pseudo
   // instructions are lowered to bundles as well.
   addPass(createUnpackMachineBundles(nullptr));
+  // c2go GC Approach B (#330) Milestone 5: per-PC liveness of pointer-tagged
+  // spill slots. Must run AFTER PEI (so spill MIs carry FixedStackPSV) and
+  // AFTER the outliner / BB-sections (MI pointers stable for the AsmPrinter
+  // lookup), which is precisely what addPreEmitPass2 guarantees.
+  //
+  // GATING. TargetPassConfig::addPreEmitPass2 has no Module access (LLVM's
+  // pass-pipeline construction is per-target-machine, not per-module). The
+  // pass therefore self-gates inside runOnMachineFunction on two conditions:
+  //   1. `c2go-gc-ptrslot-liveness` cl::opt (default true, override via -mllvm)
+  //   2. `c2go.goabi` Module flag (set by clang frontend / c2go-bind)
+  // For non-c2go modules the pass runOnMachineFunction returns false on the
+  // first MF and the pipeline cost is one virtual dispatch — adding an
+  // ImmutablePass wrapper to short-circuit at addPass time was evaluated and
+  // rejected as more wiring for negligible benefit. See the comment block in
+  // AArch64C2GoPtrSlotLiveness.cpp for the soundness invariant.
+  addPass(createAArch64C2GoPtrSlotLivenessPass());
 }
 
 bool AArch64PassConfig::addRegAssignAndRewriteOptimized() {
@@ -931,3 +1019,79 @@ bool AArch64TargetMachine::parseMachineFunctionInfo(
   MF.getInfo<AArch64FunctionInfo>()->initializeBaseYamlFields(YamlMFI);
   return false;
 }
+
+// ===-- c2go #375 slice 1: AArch64 backend-knob shim -----------------------==
+//
+// Lets clang/c2go-lto poke the two AArch64-private Plan-9 codegen flags
+// without including this backend's private header. The gate is a triple
+// check (LLVM is typically built -fno-rtti, so dyn_cast on a polymorphic
+// TargetMachine without classof tags is not available); on AArch64 we
+// static_cast to the concrete subclass. Non-AArch64 TMs are silently
+// ignored — neither flag has meaning outside this backend.
+//
+// See `llvm/include/llvm/Target/C2GoBackendKnobs.h` for the public ABI.
+namespace llvm {
+namespace c2go {
+
+// c2go #435: AArch64 applier — the future-port API shape. Each backend that
+// gains c2go support registers exactly one of these (and, if needed, multi-
+// arches it across related ArchTypes). The three setters below are kept as
+// stub wrappers around `applyC2GoBackendConfig` so existing clang/c2go-lto
+// call sites compile unchanged (#435 step (d)).
+//
+// Non-static so the forward declaration up at LLVMInitializeAArch64Target
+// can reference it across the in-file gap; declared at namespace scope
+// only — not exported via the C2GoBackendKnobs.h public ABI surface.
+void applyAArch64C2GoConfig(TargetMachine *TM, const BackendConfig &Cfg) {
+  if (!TM || !TM->getTargetTriple().isAArch64())
+    return;
+  auto *AArch64TM = static_cast<AArch64TargetMachine *>(TM);
+  AArch64TM->C2GoForceBlockAddressJumpTable = Cfg.ForceBlockAddressJumpTable;
+  AArch64TM->C2GoDisableRegisterCoalescing = Cfg.DisableRegisterCoalescing;
+  AArch64TM->C2GoDisableGlobalMerge = Cfg.DisableGlobalMerge;
+}
+
+// c2go #435 (d): stub wrappers — kept for ABI continuity (callers in the
+// LLVM source tree that touch one knob at a time, and any out-of-tree
+// consumer that depends on the per-bool shim). New code should prefer
+// `BackendConfig` + `applyC2GoBackendConfig` so all knobs are set in one
+// atomic write. Each stub reads the current bool to preserve, mutates the
+// one requested, and re-applies the full POD via the registry.
+//
+// The in-tree clang/BackendUtil.cpp + c2go-lto.cpp callers were migrated
+// to the POD path as part of #435 (e).
+void setForceBlockAddressJumpTable(TargetMachine *TM, bool Enable) {
+  if (!TM || !TM->getTargetTriple().isAArch64())
+    return;
+  auto *AArch64TM = static_cast<AArch64TargetMachine *>(TM);
+  BackendConfig Cfg{
+      /*ForceBlockAddressJumpTable=*/Enable,
+      /*DisableRegisterCoalescing=*/AArch64TM->C2GoDisableRegisterCoalescing,
+      /*DisableGlobalMerge=*/AArch64TM->C2GoDisableGlobalMerge};
+  applyC2GoBackendConfig(TM, Cfg);
+}
+
+void setDisableRegisterCoalescing(TargetMachine *TM, bool Enable) {
+  if (!TM || !TM->getTargetTriple().isAArch64())
+    return;
+  auto *AArch64TM = static_cast<AArch64TargetMachine *>(TM);
+  BackendConfig Cfg{
+      /*ForceBlockAddressJumpTable=*/AArch64TM->C2GoForceBlockAddressJumpTable,
+      /*DisableRegisterCoalescing=*/Enable,
+      /*DisableGlobalMerge=*/AArch64TM->C2GoDisableGlobalMerge};
+  applyC2GoBackendConfig(TM, Cfg);
+}
+
+void setDisableGlobalMerge(TargetMachine *TM, bool Enable) {
+  if (!TM || !TM->getTargetTriple().isAArch64())
+    return;
+  auto *AArch64TM = static_cast<AArch64TargetMachine *>(TM);
+  BackendConfig Cfg{
+      /*ForceBlockAddressJumpTable=*/AArch64TM->C2GoForceBlockAddressJumpTable,
+      /*DisableRegisterCoalescing=*/AArch64TM->C2GoDisableRegisterCoalescing,
+      /*DisableGlobalMerge=*/Enable};
+  applyC2GoBackendConfig(TM, Cfg);
+}
+
+} // namespace c2go
+} // namespace llvm
