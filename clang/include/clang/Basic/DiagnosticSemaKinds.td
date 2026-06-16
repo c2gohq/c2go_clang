@@ -2277,6 +2277,12 @@ def warn_c2go_managed_stack_escape : Warning<
   "object outlives the stack frame and the GC will trip on a dangling "
   "pointer if scanned post-return">,
   InGroup<C2GoManagedStackEscape>;
+def err_c2go_dynamic_stack : Error<
+  "dynamic stack allocation (variable-length array or alloca) is not "
+  "supported under c2go: Go uses fixed-size stack frames -- pcsp / GC "
+  "stackmap / unwind assume a constant frame size (fp = sp + autosize), and "
+  "goroutine stacks move by copying. Use heap allocation instead">;
+
 // c2go: __c2go_typeinfo(type) RTTI surface.
 def err_c2go_typeinfo_not_record : Error<
   "'__c2go_typeinfo' requires a record (struct/union) type; %0 is not a "

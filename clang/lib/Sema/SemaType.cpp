@@ -79,6 +79,16 @@ static bool isOmittedBlockReturnType(const Declarator &D) {
 /// doesn't apply to the given type.
 static void diagnoseBadTypeAttribute(Sema &S, const ParsedAttr &attr,
                                      QualType type) {
+  // c2go (#290): c2go_extern / c2go_managed double as calling-convention type
+  // attributes AND decl attributes. When written where there is no function
+  // type to apply the CC to (e.g. on a non-function variable / record / field),
+  // they are still valid as decl attributes and are consumed by the decl
+  // handlers (handleC2GoExternAttr / handleC2GoManagedAttr). Suppress the
+  // "only applies to function types" type-attr diagnostic for them.
+  if (attr.getKind() == ParsedAttr::AT_C2GoExtern ||
+      attr.getKind() == ParsedAttr::AT_C2GoManaged)
+    return;
+
   TypeDiagSelector WhichType;
   bool useExpansionLoc = true;
   switch (attr.getKind()) {
@@ -143,7 +153,9 @@ static void diagnoseBadTypeAttribute(Sema &S, const ParsedAttr &attr,
   case ParsedAttr::AT_M68kRTD:                                                 \
   case ParsedAttr::AT_PreserveNone:                                            \
   case ParsedAttr::AT_RISCVVectorCC:                                           \
-  case ParsedAttr::AT_RISCVVLSCC
+  case ParsedAttr::AT_RISCVVLSCC:                                              \
+  case ParsedAttr::AT_C2GoExtern:                                              \
+  case ParsedAttr::AT_C2GoManaged
 
 // Function type attributes.
 #define FUNCTION_TYPE_ATTRS_CASELIST                                           \
@@ -637,6 +649,9 @@ static void distributeFunctionTypeAttr(TypeProcessingState &state,
     }
   }
 
+  // c2go (#290): diagnoseBadTypeAttribute suppresses the "only applies to
+  // function types" warning for c2go_extern / c2go_managed (they remain valid
+  // decl attributes consumed by the decl handlers).
   diagnoseBadTypeAttribute(state.getSema(), attr, type);
 }
 
@@ -2289,6 +2304,9 @@ QualType Sema::BuildArrayType(QualType T, ArraySizeModifier ASM,
       targetDiag(Loc,
                  IsCUDADevice ? diag::err_cuda_vla : diag::err_vla_unsupported)
           << (IsCUDADevice ? llvm::to_underlying(CUDA().CurrentTarget()) : 0);
+    } else if (!getLangOpts().VLASupport) {
+      // c2go uses fixed-size Go stack frames; VLAs are disabled as a feature.
+      Diag(Loc, diag::err_vla_unsupported) << 1 << "c2go";
     } else if (sema::FunctionScopeInfo *FSI = getCurFunction()) {
       // VLAs are supported on this target, but we may need to do delayed
       // checking that the VLA is not being used within a coroutine.
@@ -6581,6 +6599,33 @@ static void HandleAddressSpaceTypeAttribute(QualType &Type,
     return;
   }
 
+  // Round 24 Blocker #2 v2 — source-order independence: if Type already
+  // carries a c2go_managed AttributedType wrapper (managed pointer, AS=1
+  // pinned), stacking a *different* address_space(N) is the same conflict
+  // HandleC2GoManagedPointerTypeAttr already diagnoses in the opposite
+  // source order. Mirror the diagnostic so both orders behave the same.
+  // (AS=1 is benign — `int * c2go_managed __attribute__((address_space(1)))`
+  // would just confirm the existing AS, so let it through.)
+  if (Attr.getKind() == ParsedAttr::AT_AddressSpace) {
+    bool TypeIsC2GoManaged = false;
+    for (const AttributedType *AT = Type->getAs<AttributedType>(); AT;
+         AT = AT->getModifiedType()->getAs<AttributedType>())
+      if (AT->getAttrKind() == attr::C2GoManaged) {
+        TypeIsC2GoManaged = true;
+        break;
+      }
+    if (TypeIsC2GoManaged && Attr.getNumArgs() == 1) {
+      Expr *ASArgExpr0 = Attr.getArgAsExpr(0);
+      LangAS ASIdxProbe;
+      if (BuildAddressSpaceIndex(S, ASIdxProbe, ASArgExpr0, Attr.getLoc()) &&
+          ASIdxProbe != getLangASFromTargetAS(1)) {
+        S.Diag(Attr.getLoc(), diag::err_attribute_address_multiple_qualifiers);
+        Attr.setInvalid();
+        return;
+      }
+    }
+  }
+
   LangAS ASIdx;
   if (Attr.getKind() == ParsedAttr::AT_AddressSpace) {
 
@@ -7188,6 +7233,80 @@ static bool HandleWebAssemblyFuncrefAttr(TypeProcessingState &State,
   return false;
 }
 
+// c2go option A (round 22): c2go_managed on a *data* pointer type. Mirrors
+// `address_space(1)` / `__wasm_funcref` idiom — wrap the pointee in target
+// address space 1 (the GC-managed-heap discriminator already used by the
+// c2go_struct pointee path in CodeGenTypes.cpp) and rebuild the pointer as an
+// AttributedType so that:
+//   1. Sema::c2goTypeIsManagedPtr finds the AttributedType wrapper and the
+//      D4 ptr→int warning fires on attr-only managed pointers (round 21 gap)
+//   2. CodeGenTypes lowers the pointer to AS(1), so CGExprScalar's existing
+//      AS(1)→int CK_PointerToIntegral path emits `ptrtoaddr` (round 18 hook)
+//   3. WF2 manifest round-trip preserves the managed-pointer flag through AST
+//
+// Returns true on success (so the caller treats the attribute as consumed).
+// Function-typed targets are left to the existing CC_C2GoInternal path in
+// handleFunctionTypeAttr; non-pointer targets fall through to existing
+// diagnostics. The struct-pointee AS(1) path in
+// CodeGenTypes.cpp::isC2GoManagedRecordPointee remains untouched.
+static bool HandleC2GoManagedPointerTypeAttr(TypeProcessingState &State,
+                                             QualType &QT, ParsedAttr &PAttr) {
+  assert(PAttr.getKind() == ParsedAttr::AT_C2GoManaged);
+  Sema &S = State.getSema();
+  if (!S.getLangOpts().C2GoMode)
+    return false;
+  if (!QT->isPointerType())
+    return false;
+  // Function pointer: leave to CC path (handleFunctionTypeAttr applies
+  // CC_C2GoInternal). The FunctionTypeUnwrapper walks PointerType→...→Fn.
+  if (QT->getPointeeType()->isFunctionType())
+    return false;
+
+  // Already wrapped? avoid duplicate AS sugar.
+  for (const AttributedType *AT = dyn_cast<AttributedType>(QT);
+       AT; AT = dyn_cast<AttributedType>(AT->getModifiedType())) {
+    if (AT->getAttrKind() == attr::C2GoManaged)
+      return true; // idempotent; treat as handled.
+  }
+
+  ASTContext &Ctx = S.Context;
+  QualType Pointee = QT->getPointeeType();
+
+  // Round 24 Blocker #2 v2 — diagnose a stacked address-space conflict
+  // BEFORE we strip+restamp. `c2go_managed` semantically pins the pointer
+  // into the managed-heap discriminator AS=1 (see CodeGenTypes'
+  // isC2GoManagedRecordPointee path). If either the pointer itself OR its
+  // pointee already carries a *different* non-Default target address
+  // space, combining the two would silently override the existing AS
+  // (`removeAddrSpaceQualType` strips and the result loses the prior AS).
+  // Reject the source program instead — mirror SemaType.cpp:6519's
+  // DiagnoseMultipleAddrSpaceAttributes pattern (the same diagnostic the
+  // ISO TR 18037 address_space attribute path uses).
+  //
+  // We check both the pointer's own AS (`int * __attribute__((address_space(2)))`,
+  // where AS(2) qualifies the pointer type) and the pointee's AS
+  // (`__attribute__((address_space(2))) int * p`, AS(2) qualifies the
+  // pointee). Either spelling, when stacked with c2go_managed, yields
+  // the same silent-clobber semantics.
+  auto IsConflictingAS = [&](LangAS AS) {
+    return AS != LangAS::Default && AS != getLangASFromTargetAS(1);
+  };
+  if (IsConflictingAS(QT.getAddressSpace()) ||
+      IsConflictingAS(Pointee.getAddressSpace())) {
+    S.Diag(PAttr.getLoc(), diag::err_attribute_address_multiple_qualifiers);
+    return false;
+  }
+
+  // Add target AS=1 to the pointee (matches the hard-coded AS=1 in
+  // CodeGenTypes::ConvertType for the c2go_struct pointee path).
+  Pointee = Ctx.getAddrSpaceQualType(Ctx.removeAddrSpaceQualType(Pointee),
+                                     getLangASFromTargetAS(1));
+  QualType NewPtr = Ctx.getPointerType(Pointee);
+  Attr *A = createSimpleAttr<C2GoManagedAttr>(Ctx, PAttr);
+  QT = State.getAttributedType(A, /*ModifiedType=*/QT, /*EquivType=*/NewPtr);
+  return true;
+}
+
 static void HandleSwiftAttr(TypeProcessingState &State, TypeAttrLocation TAL,
                             QualType &QT, ParsedAttr &PAttr) {
   if (TAL == TAL_DeclName)
@@ -7562,6 +7681,19 @@ static Attr *getCCTypeAttr(ASTContext &Ctx, ParsedAttr &Attr) {
   switch (Attr.getKind()) {
   default:
     llvm_unreachable("not a calling convention attribute");
+  case ParsedAttr::AT_C2GoExtern: {
+    // #286: type-position spelling of c2go_extern (CC_GoABI0). The ExportCase
+    // int arg only affects the Decl-attr (.go export name casing); for the
+    // type's CC it is irrelevant, so default to 1. createSimpleAttr can't be
+    // used (C2GoExternAttr has a non-default ctor with ExportCase).
+    Attr.setUsedAsTypeAttr();
+    return ::new (Ctx) C2GoExternAttr(Ctx, Attr, /*ExportCase=*/1);
+  }
+  case ParsedAttr::AT_C2GoManaged: {
+    // #290: type-position spelling of c2go_managed (CC_C2GoInternal).
+    Attr.setUsedAsTypeAttr();
+    return createSimpleAttr<C2GoManagedAttr>(Ctx, Attr);
+  }
   case ParsedAttr::AT_CDecl:
     return createSimpleAttr<CDeclAttr>(Ctx, Attr);
   case ParsedAttr::AT_FastCall:
@@ -8155,10 +8287,28 @@ static bool handleFunctionTypeAttr(TypeProcessingState &state, ParsedAttr &attr,
     return handleNonBlockingNonAllocatingTypeAttr(state, attr, type, unwrapped);
   }
 
+  // c2go option A (round 22): c2go_managed on a data-pointer type wraps the
+  // pointee in target AS=1 (managed-heap discriminator) so Sema D4 warn and
+  // CGExprScalar ptrtoaddr both pick it up. Function-pointer / function-type
+  // targets continue to the CC_C2GoInternal path below (FunctionTypeUnwrapper
+  // already walked the pointer chain, so a function pointer reports
+  // isFunctionType()==true here).
+  if (attr.getKind() == ParsedAttr::AT_C2GoManaged &&
+      !unwrapped.isFunctionType() && type->isPointerType()) {
+    if (HandleC2GoManagedPointerTypeAttr(state, type, attr))
+      return true;
+  }
+
   // Delay if the type didn't work out to a function.
   if (!unwrapped.isFunctionType()) return false;
 
   // Otherwise, a calling convention.
+  // c2go (#286/#290): c2go_extern (CC_GoABI0) and c2go_managed (CC_C2GoInternal)
+  // double as calling-convention type attributes; CheckCallingConvAttr handles
+  // them (c2go_extern's optional ExportCase int is accepted there). The
+  // C2GoExternAttr is still attached to the Decl by handleC2GoExternAttr
+  // (custom decl dispatch), so CodeGen's export logic (D->hasAttr<C2GoExternAttr>())
+  // keeps working.
   CallingConv CC;
   if (S.CheckCallingConvAttr(attr, CC, /*FunctionDecl=*/nullptr, CFT))
     return true;
