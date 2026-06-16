@@ -14,6 +14,7 @@
 #include "MCTargetDesc/X86MCTargetDesc.h"
 #include "TargetInfo/X86TargetInfo.h"
 #include "X86.h"
+#include "X86C2GoLeafABI.h"
 #include "X86MachineFunctionInfo.h"
 #include "X86MacroFusion.h"
 #include "X86Subtarget.h"
@@ -44,6 +45,7 @@
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Target/C2GoBackendKnobs.h"
 #include "llvm/Target/TargetLoweringObjectFile.h"
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/TargetParser/Triple.h"
@@ -62,10 +64,33 @@ static cl::opt<bool>
                      cl::desc("Enable the tile register allocation pass"),
                      cl::init(true), cl::Hidden);
 
+// c2go #298 / #435 (port skeleton): forward-decl the X86 applier so the
+// LLVMInitializeX86Target registration below can reference it. The body is
+// defined further down. Today every Cfg field is a no-op on X86 — the hook
+// exists so clang/c2go-lto can dispatch BackendConfig at the X86 TM without
+// the registry silently falling back to "no applier for this arch". When
+// the X86 leaf-ABI / Plan-9 emit pass lands (see
+// `project_298_x86_port_progress_2026_06_07.md`) the booleans will start
+// flipping real X86 state, mirroring `applyAArch64C2GoConfig`.
+namespace llvm {
+namespace c2go {
+void applyX86C2GoConfig(TargetMachine *TM, const BackendConfig &Cfg);
+} // namespace c2go
+} // namespace llvm
+
 extern "C" LLVM_C_ABI void LLVMInitializeX86Target() {
   // Register the target.
   RegisterTargetMachine<X86TargetMachine> X(getTheX86_32Target());
   RegisterTargetMachine<X86TargetMachine> Y(getTheX86_64Target());
+
+  // c2go #298 / #435: register the X86 applier for both 32-bit (i386) and
+  // 64-bit (x86_64) ArchTypes. Both share the same `X86TargetMachine`
+  // subclass, so one applier suffices. Re-registration is idempotent
+  // (see `C2GoBackendKnobsRegistry.cpp`).
+  llvm::c2go::registerC2GoBackendConfigHook(llvm::Triple::x86,
+                                            &llvm::c2go::applyX86C2GoConfig);
+  llvm::c2go::registerC2GoBackendConfigHook(llvm::Triple::x86_64,
+                                            &llvm::c2go::applyX86C2GoConfig);
 
   PassRegistry &PR = *PassRegistry::getPassRegistry();
   initializeX86LowerAMXIntrinsicsLegacyPassPass(PR);
@@ -108,6 +133,23 @@ extern "C" LLVM_C_ABI void LLVMInitializeX86Target() {
   initializeX86SuppressAPXForRelocationLegacyPass(PR);
   initializeX86WinEHUnwindV2Pass(PR);
   initializeX86PreLegalizerCombinerPass(PR);
+
+  // c2go #298: register the X86 leaf C2GoABIInternal pass (port of
+  // AArch64C2GoLeafABI). The legacy ModulePass is wired into
+  // `X86PassConfig::addIRPasses`; the NewPM port is reachable via
+  // `opt -passes=x86-c2go-leaf-abi`. POWERED ON: both are gated only by
+  // the `c2go.goabi` module flag (mirror of AArch64), and no-ops on
+  // modules without it. Emergency off-switch: `-c2go-disable=leaf-abi`.
+  initializeX86C2GoLeafABIPass(PR);
+
+  // c2go #298 / Wave AA Track B: register the X86 staged-meta producer
+  // (`x86-c2go-frame-meta-stager`) so the AArch64 `C2GoFrameEmitter`
+  // counterpart on X86 actually stages a baseline Plan-9 metadata aggregate
+  // onto X86MachineFunctionInfo for every Wave V-flipped strict-leaf. The
+  // legacy MachineFunctionPass is wired into
+  // `X86PassConfig::addPreEmitPass2`. Self-gated on the `c2go.goabi` module
+  // flag — non-c2go builds skip the body on the first MF.
+  initializeX86C2GoFrameMetaStagerPass(PR);
 }
 
 static std::unique_ptr<TargetLoweringObjectFile> createTLOF(const Triple &TT) {
@@ -362,7 +404,18 @@ namespace {
 class X86PassConfig : public TargetPassConfig {
 public:
   X86PassConfig(X86TargetMachine &TM, PassManagerBase &PM)
-    : TargetPassConfig(TM, PM) {}
+    : TargetPassConfig(TM, PM) {
+    // c2go #298 / Wave W Track B (#310 mirror): same correctness hazard
+    // root-caused on AArch64 (CSR_AArch64_NoRegs + go-asm-owned prologue
+    // vs RegisterCoalescer pre-RA/PEI merging copies inconsistently with
+    // the frame contract). The Wave V abitest_amd64 baseline (#485 /
+    // project_298_abitest_amd64_baseline_2026_06_07) confirmed the same
+    // shape on X86. Flag lives on the Plan 9-codegen TM only; the
+    // (unlinked) .o pipeline and all non-c2go compiles use a different TM
+    // with the flag unset.
+    if (TM.C2GoDisableRegisterCoalescing)
+      disablePass(&RegisterCoalescerID);
+  }
 
   X86TargetMachine &getX86TargetMachine() const {
     return getTM<X86TargetMachine>();
@@ -450,6 +503,17 @@ void X86PassConfig::addIRPasses() {
 
   if (TM->Options.JMCInstrument)
     addPass(createJMCInstrumenterPass());
+
+  // c2go #298: opportunistically flip NOSPLIT-eligible internal leaf /
+  // near-leaf functions to the private C2GoABIInternal register-passing
+  // convention. Mirrors the AArch64 wiring; POWERED ON and self-gates
+  // inside runOnModule on:
+  //   1. `c2go-leaf-abi` emergency-disable flag (default enabled),
+  //   2. `c2go.goabi` module flag (set by clang for -fc2go).
+  // Skipped at -O0 to mirror AArch64's "savings don't justify the path
+  // when alloca clutter dominates" reasoning.
+  if (TM->getOptLevel() != CodeGenOptLevel::None)
+    addPass(createX86C2GoLeafABIPass());
 }
 
 bool X86PassConfig::addInstSelector() {
@@ -632,6 +696,19 @@ void X86PassConfig::addPreEmitPass2() {
   // after all real instructions have been added to the epilog.
   if (TT.isOSWindows() && TT.isX86_64())
     addPass(createX86WinEHUnwindV2Pass());
+
+  // c2go #298 Wave AA Track B (X86 minimal staged-meta producer). Mirror of
+  // the AArch64 `C2GoFrameEmitter` at strict-leaf scope: stages a baseline
+  // `C2GoFunctionMetadata` (NoSplit=true, FrameSize=0, SavedLinkSize=0,
+  // FrameAlignment=0, ArgSize from the `c2go-argsize` IR fn attribute) onto
+  // X86MachineFunctionInfo for every function the Wave V leaf-ABI IR pass
+  // flipped to CallingConv::C2GoABIInternal. Without this stage,
+  // `X86AsmPrinter::emitFunctionEntryLabel`'s republish (Wave Z Track B,
+  // #376) never fires and the Plan-9 streamer falls back to the Stage-4
+  // `TEXT name(SB), NOFRAME, $0` directive instead of the intended Stage-1
+  // `TEXT name(SB), NOSPLIT|NOFRAME, $0-M`. Self-gates on the c2go.goabi
+  // Module flag inside the pass so non-c2go builds are byte-identical.
+  addPass(createX86C2GoFrameMetaStagerPass());
 }
 
 bool X86PassConfig::addPostFastRegAllocRewrite() {
@@ -659,3 +736,47 @@ bool X86PassConfig::addRegAssignAndRewriteOptimized() {
   }
   return TargetPassConfig::addRegAssignAndRewriteOptimized();
 }
+
+// ===-- c2go #298 / #435: X86 BackendConfig applier ------------------------===
+//
+// Mirrors `applyAArch64C2GoConfig` (AArch64TargetMachine.cpp): writes each
+// knob into the per-TM field that the X86 backend reads from. The three
+// consumers (Wave W Track B):
+//
+//   * ForceBlockAddressJumpTable: X86TargetLowering::getJumpTableEncoding
+//     (X86ISelLoweringCall.cpp) reads C2GoForceBlockAddressJumpTable and
+//     returns EK_BlockAddress (8-byte absolute) — Plan-9 .s DATA can
+//     represent absolute pointers but not the default PIC label-difference
+//     / GOTOFF encoding. Mirror of AArch64's #120 / #375 slice 1.
+//
+//   * DisableRegisterCoalescing: X86PassConfig ctor reads
+//     C2GoDisableRegisterCoalescing and `disablePass(&RegisterCoalescerID)`
+//     when set. Same correctness hazard root-caused on AArch64 (#310) and
+//     confirmed on X86 by the Wave V abitest_amd64 baseline (#485).
+//
+//   * DisableGlobalMerge: vacuous-by-design on X86 today (X86PassConfig has
+//     no createGlobalMergePass call site, so `_MergedGlobals` is never
+//     emitted). Wired through anyway as a forward-compatible gate so any
+//     future X86 codegen change that introduces GlobalMerge respects the
+//     #397 skip path. The accompanying LIT pins the byte-identical "no
+//     _MergedGlobals on X86" baseline so a regression is loud.
+//
+// The applier is only effective on the Plan-9-codegen TargetMachine: clang
+// BackendUtil / c2go-lto set the Cfg booleans ONLY when emitting against
+// the OS-neutral ELF amd64 c2go clone. Every non-c2go X86 compile uses a
+// separate TM where the fields stay default-false — X86 production
+// behavior is byte-identical when c2go is off.
+namespace llvm {
+namespace c2go {
+
+void applyX86C2GoConfig(TargetMachine *TM, const BackendConfig &Cfg) {
+  if (!TM || !TM->getTargetTriple().isX86())
+    return;
+  auto *X86TM = static_cast<X86TargetMachine *>(TM);
+  X86TM->C2GoForceBlockAddressJumpTable = Cfg.ForceBlockAddressJumpTable;
+  X86TM->C2GoDisableRegisterCoalescing = Cfg.DisableRegisterCoalescing;
+  X86TM->C2GoDisableGlobalMerge = Cfg.DisableGlobalMerge;
+}
+
+} // namespace c2go
+} // namespace llvm

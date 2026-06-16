@@ -353,6 +353,14 @@ FunctionPass *createX86SpeculativeLoadHardeningPass();
 FunctionPass *createX86SpeculativeExecutionSideEffectSuppression();
 FunctionPass *createX86ArgumentStackSlotPass();
 
+/// c2go #298 Wave AA Track B: X86 minimal staged-meta producer (mirrors
+/// AArch64's C2GoFrameEmitter at strict-leaf scope). Scheduled in
+/// `X86PassConfig::addPreEmitPass2`; self-gates on the `c2go.goabi` module
+/// flag + `CallingConv::C2GoABIInternal` so non-c2go builds are byte-
+/// identical.
+FunctionPass *createX86C2GoFrameMetaStagerPass();
+void initializeX86C2GoFrameMetaStagerPass(PassRegistry &);
+
 void initializeCompressEVEXLegacyPass(PassRegistry &);
 void initializeX86FixupBWInstLegacyPass(PassRegistry &);
 void initializeFixupLEAsLegacyPass(PassRegistry &);

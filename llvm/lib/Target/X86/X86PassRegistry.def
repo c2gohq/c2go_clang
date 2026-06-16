@@ -12,6 +12,17 @@
 
 // NOTE: NO INCLUDE GUARD DESIRED!
 
+#ifndef MODULE_PASS
+#define MODULE_PASS(NAME, CREATE_PASS)
+#endif
+// c2go #298 / Wave V Track A: NewPM port of X86C2GoLeafABI. The legacy
+// ModulePass is wired into X86PassConfig::addIRPasses for the production
+// codegen pipeline; this NewPM wrapper exists so the same logic is
+// reachable via `opt -passes=x86-c2go-leaf-abi` for LIT + future NewPM
+// CodeGenPassBuilder consumers (mirror of `aarch64-c2go-leaf-abi`).
+MODULE_PASS("x86-c2go-leaf-abi", X86C2GoLeafABIPass())
+#undef MODULE_PASS
+
 #ifndef FUNCTION_PASS
 #define FUNCTION_PASS(NAME, CREATE_PASS)
 #endif

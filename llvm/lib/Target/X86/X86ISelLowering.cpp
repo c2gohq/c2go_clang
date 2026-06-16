@@ -29,6 +29,7 @@
 #include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/Analysis/VectorUtils.h"
+#include "llvm/CodeGen/FunctionLoweringInfo.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
@@ -62,6 +63,7 @@
 #include "llvm/Support/KnownBits.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Target/TargetOptions.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include <algorithm>
 #include <bitset>
 #include <cctype>
@@ -2806,6 +2808,23 @@ X86TargetLowering::getPreferredVectorAction(MVT VT) const {
 FastISel *
 X86TargetLowering::createFastISel(FunctionLoweringInfo &funcInfo,
                                   const TargetLibraryInfo *libInfo) const {
+  // c2go #298 Track AP.1: GoABI0's stack-only marshalling and Plan 9 frame
+  // layout are handled by SelectionDAG (LowerFormalArguments / LowerCall /
+  // LowerReturn / LowerCallResult overrides). FastISel has no awareness of
+  // GoABI0; if it ran, it would emit register-based arg/result code and a
+  // standard x86-64 frame, both incompatible with the Go runtime. Concretely
+  // observed at -O0 on SQLite: X86FastISel::fastLowerIntrinsicCall lowers
+  // small @llvm.memset/@llvm.memcpy (incl. the C2GoSafepoint `!c2go.zeroinit`
+  // aggregate zero-inits that the kInlineByteThreshold<=64 policy left for
+  // the backend to inline) to SysV register-arg libcalls `CALL ·memset(SB)`
+  // — the Go-side stack-ABI0 wrapper then reads garbage args and sprays the
+  // goroutine stack (sqlite3_config SIGBUS). Decline FastISel so
+  // SelectionDAG runs, for ANY function in a c2go-mode module — mirrors
+  // AArch64TargetLowering::createFastISel (AArch64ISelLowering.cpp).
+  if (funcInfo.Fn->getCallingConv() == CallingConv::GoABI0 ||
+      funcInfo.Fn->getParent()->getModuleFlag(llvm::c2go::kGoabiModuleFlag) !=
+          nullptr)
+    return nullptr;
   return X86::createFastISel(funcInfo, libInfo);
 }
 

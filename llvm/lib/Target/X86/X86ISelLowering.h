@@ -1722,7 +1722,37 @@ namespace llvm {
                             const SmallVectorImpl<ISD::InputArg> &Ins,
                             const SDLoc &dl, SelectionDAG &DAG,
                             SmallVectorImpl<SDValue> &InVals,
-                            uint32_t *RegMask) const;
+                            uint32_t *RegMask,
+                            // c2go #298 Wave AI Track A — GoABI0 only:
+                            // outgoing-arg block size (aligned to 8) so
+                            // MemLoc result offsets agree with callee's
+                            // LowerReturn pre-allocation. nullptr (or 0)
+                            // for non-GoABI0 callers AND for GoABI0
+                            // reg-return calls (Wave AJ.3) which read
+                            // results from SysV regs.
+                            uint64_t GoABI0ArgsSize = 0,
+                            // c2go #298 Wave AJ.3 — GoABI0 reg-return:
+                            // the call site carries `c2go-reg-return`, so
+                            // results come back via the SysV register file
+                            // (RetCC_X86_64_C) instead of the GoABI0 stack
+                            // RetCC. Mirror of AArch64ISelLowering.cpp
+                            // C2GoRegReturn dispatch in LowerCall ↦
+                            // LowerCallResult.
+                            bool IsC2GoRegReturn = false,
+                            // c2go #298 Wave AK.3 — GoABI0 only,
+                            // non-reserved-call-frame caller fixup:
+                            // CALLSEQ_END emits `add sp, alignTo(NumBytes,
+                            // StackAlign)` which has already popped the
+                            // outgoing-arg block by the time the MemLoc
+                            // result LOAD runs. Caller passes the call's
+                            // NumBytes (post-CALLSEQ_END pop amount, pre-
+                            // alignment) so LowerCallResult can rebias the
+                            // raw `sp + LocMemOffset` read. Mirror of
+                            // AArch64ISelLowering.cpp:9237 (#130
+                            // GoABI0CallNumBytes plumbing). nullptr for
+                            // non-GoABI0 and for GoABI0 reg-return calls.
+                            const uint64_t *GoABI0CallNumBytes =
+                                nullptr) const;
     SDValue LowerMemArgument(SDValue Chain, CallingConv::ID CallConv,
                              const SmallVectorImpl<ISD::InputArg> &ArgInfo,
                              const SDLoc &dl, SelectionDAG &DAG,

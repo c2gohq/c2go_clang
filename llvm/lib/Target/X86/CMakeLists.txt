@@ -28,6 +28,8 @@ set(sources
   X86ArgumentStackSlotRebase.cpp
   X86AsmPrinter.cpp
   X86AvoidTrailingCall.cpp
+  X86C2GoFrameEmitter.cpp
+  X86C2GoLeafABI.cpp
   X86CallFrameOptimization.cpp
   X86CallingConv.cpp
   X86CmovConversion.cpp
@@ -97,6 +99,7 @@ add_llvm_target(X86CodeGen ${sources}
   LINK_COMPONENTS
   Analysis
   AsmPrinter
+  C2Go
   CFGuard
   CodeGen
   CodeGenTypes

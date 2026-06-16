@@ -45,6 +45,60 @@ static void errorUnsupported(SelectionDAG &DAG, const SDLoc &dl,
       DiagnosticInfoUnsupported(MF.getFunction(), Msg, dl.getDebugLoc()));
 }
 
+// c2go #298 Wave AK Fix 2 (BLOCKER-2 silent miscompile defense) — restore
+// Wave AI loud-fail. Wave AK.3 partial port left negative-offset arithmetic
+// in LowerCallResult but did NOT port the AArch64 s5 PreCallSeqRetvals
+// machinery (AArch64ISelLowering.cpp:10582-10623) that synthesizes the
+// result CCInfo before CALLSEQ_END so the post-pop SP rebias is provably
+// correct. Without that machinery the AK.3 simple negative offset is
+// silent miscompile on the LowerCall + LowerReturn sides — so loud-fail
+// every GoABI0 ISel that enters a non-reserved-call-frame function.
+//
+// Wave AM.2 verdict (2026-06-10): PERMANENT fail-closed — the
+// PreCallSeqRetvals port is NOT planned, because no X86 c2go producer
+// can reach the non-reserved-CF shape (assessment + evidence in
+// X86C2GoFrameEmitter.h §7 "AB.deferred HasVariadicOutgoingCall" entry):
+//   * hasVarSizedObjects — c2go Sema hard-rejects VLAs (SemaType.cpp
+//     err_vla_unsupported via VLASupport=false) and __builtin_alloca*
+//     (SemaChecking.cpp err_c2go_dynamic_stack); only hand-written IR
+//     can reach it, and then this loud-fail is the desired behaviour.
+//   * getHasPushSequences — sole setter is X86CallFrameOptimization
+//     (a post-ISel pass, so always false when this check runs) and that
+//     pass bails out in c2go-mode anyway (Wave AJ.1).
+//   * hasPreallocatedCall — sole setter is PREALLOCATED_SETUP lowering;
+//     clang never generates llvm.call.preallocated bundles.
+// The AArch64-only root cause for s5 (saved-LR-at-sp+0 contract clashing
+// with AAPCS variadic outgoing args at sp+0 → hasC2GoVariadicOutgoingCall
+// forces non-reserved-CF, AArch64FrameLowering.cpp:664-681) does not
+// exist on X86: the hardware CALL-pushed RA takes the LR slot, so X86
+// c2go has no variadic non-reserved-CF producer and no
+// HasC2GoVariadicOutgoingCall mechanism at all.
+//
+// AArch64 mirror (post-#130 plumbing) handles the non-reserved-CF case
+// without bail-out — see AArch64ISelLowering.cpp:9293-9299 for the
+// caller-side fixup and ::10582-10623 for the callee-side
+// PreCallSeqRetvals materialization. That machinery serves a producer
+// (variadic outgoing AAPCS calls) that X86 structurally lacks.
+static void reportGoABI0NonReservedCFBailout(const MachineFunction &MF,
+                                             const char *Site) {
+  const MachineFrameInfo &MFI = MF.getFrameInfo();
+  const X86MachineFunctionInfo *MFInfo = MF.getInfo<X86MachineFunctionInfo>();
+  const char *Reason = "<unknown>";
+  if (MFI.hasVarSizedObjects())
+    Reason = "hasVarSizedObjects";
+  else if (MFInfo && MFInfo->getHasPushSequences())
+    Reason = "getHasPushSequences";
+  else if (MFInfo && MFInfo->hasPreallocatedCall())
+    Reason = "hasPreallocatedCall";
+  report_fatal_error(Twine("c2go #298 Wave AK: X86 GoABI0 ") + Site +
+                     " in non-reserved-call-frame function `" +
+                     MF.getName() + "` (" + Reason +
+                     ") — permanently fail-closed (Wave AM.2): no X86 "
+                     "c2go producer reaches this shape (c2go Sema "
+                     "rejects dynamic stack allocation); see "
+                     "X86C2GoFrameEmitter.h section 7.");
+}
+
 /// Returns true if a CC can dynamically exclude a register from the list of
 /// callee-saved-registers (TargetRegistryInfo::getCalleeSavedRegs()) based on
 /// the return registers.
@@ -430,6 +484,21 @@ bool X86TargetLowering::allowsMemoryAccess(LLVMContext &Context,
 /// current function.  The returned value is a member of the
 /// MachineJumpTableInfo::JTEntryKind enum.
 unsigned X86TargetLowering::getJumpTableEncoding() const {
+  // c2go #298 / Wave W Track B (#120 mirror): force EK_BlockAddress (8-byte
+  // absolute-address table entries) when the Plan-9-codegen TM has the
+  // C2GoForceBlockAddressJumpTable knob set. The default X86 encodings
+  // below — @GOTOFF (EK_Custom32) and EK_LabelDifference64 — cannot be
+  // represented in Plan 9 .s DATA, which only accepts fixed-size absolute
+  // pointer values. As on AArch64 (AArch64ISelLowering.cpp), c2go-mode
+  // also sets the per-function `no-jump-tables` attribute in clang to
+  // suppress jump tables at the IR level — this override is the safety
+  // net so any backend that still materializes a JT stays Plan-9-emittable.
+  // Flag is default-false on every non-c2go TM, so this check is a no-op
+  // outside the Plan 9-codegen pipeline.
+  if (static_cast<const X86TargetMachine &>(getTargetMachine())
+          .C2GoForceBlockAddressJumpTable)
+    return MachineJumpTableInfo::EK_BlockAddress;
+
   // In GOT pic mode, each entry in the jump table is emitted as a @GOTOFF
   // symbol.
   if (isPositionIndependent() && Subtarget.isPICStyleGOT())
@@ -669,8 +738,32 @@ bool X86TargetLowering::CanLowerReturn(
     CallingConv::ID CallConv, MachineFunction &MF, bool isVarArg,
     const SmallVectorImpl<ISD::OutputArg> &Outs, LLVMContext &Context,
     const Type *RetTy) const {
+  // c2go #298 Wave AJ.3 (Track AJ.3) — GoABI0 reg-return fallback.
+  //
+  // Mirror of AArch64ISelLowering.cpp:10712-10715. An internal GoABI0
+  // function carrying the `c2go-reg-return` fn-attr returns its result via
+  // the SysV register file (the X86 equivalent of AArch64's AAPCS register
+  // RetCC) instead of writing to the caller's outgoing-arg block.
+  //
+  // CheckReturn here must agree with LowerReturn so sret-demotion decisions
+  // match — otherwise a register-return that doesn't fit in the SysV return
+  // regs would be demoted to sret (hidden pointer arg), but LowerReturn
+  // would still try to write to a stack slot, miscompiling the call.
+  //
+  // Implementation note: the only Entry-marked X86 return table is
+  // `RetCC_X86`, which routes `CallingConv::GoABI0` → `RetCC_X86_64_GoABI0_TD`
+  // (stack). To get SysV reg-return behaviour we run `RetCC_X86` with a
+  // CCState whose CallConv is `X86_64_SysV` — that dispatch arm delegates to
+  // `RetCC_X86_64_C` (the static table-gen entry that AArch64's
+  // `RetCC_AArch64_AAPCS` directly mirrors). Boundary GoABI0 callees skip
+  // this bypass and keep the stack-result contract via the standard
+  // GoABI0 → GoABI0_TD route.
+  bool C2GoRegReturn = CallConv == CallingConv::GoABI0 &&
+                       MF.getFunction().hasFnAttribute("c2go-reg-return");
   SmallVector<CCValAssign, 16> RVLocs;
-  CCState CCInfo(CallConv, isVarArg, MF, RVLocs, Context);
+  CallingConv::ID EffectiveCC =
+      C2GoRegReturn ? CallingConv::X86_64_SysV : CallConv;
+  CCState CCInfo(EffectiveCC, isVarArg, MF, RVLocs, Context);
   return CCInfo.CheckReturn(Outs, RetCC_X86);
 }
 
@@ -758,9 +851,101 @@ X86TargetLowering::LowerReturn(SDValue Chain, CallingConv::ID CallConv,
   if (CallConv == CallingConv::X86_INTR && !Outs.empty())
     report_fatal_error("X86 interrupts may not return any value");
 
+  // c2go #298 Wave AJ.3 — GoABI0 reg-return fallback. An internal GoABI0
+  // function carrying `c2go-reg-return` returns via the SysV register file
+  // (mirror of AArch64ISelLowering.cpp:10735-10738 / RetCC_AArch64_AAPCS
+  // path). The function continues to use GoABI0 for incoming args (stack);
+  // only the result path bypasses the GoABI0 stack contract. Boundary
+  // symbols (c2go_extern / c2go_linkname) lack the attribute and keep
+  // ABI0 stack returns.
+  //
+  // The only Entry-marked X86 return table is `RetCC_X86`. To get SysV
+  // reg-return behaviour we run `RetCC_X86` with a CCState whose CallConv is
+  // `X86_64_SysV` — that dispatch arm delegates to the static `RetCC_X86_64_C`
+  // (line 484 of X86CallingConv.td), matching AArch64's direct
+  // `RetCC_AArch64_AAPCS` reference exactly in behaviour.
+  bool C2GoRegReturn = CallConv == CallingConv::GoABI0 &&
+                       MF.getFunction().hasFnAttribute("c2go-reg-return");
+  CallingConv::ID EffectiveCC =
+      C2GoRegReturn ? CallingConv::X86_64_SysV : CallConv;
+
   SmallVector<CCValAssign, 16> RVLocs;
-  CCState CCInfo(CallConv, isVarArg, MF, RVLocs, *DAG.getContext());
+  CCState CCInfo(EffectiveCC, isVarArg, MF, RVLocs, *DAG.getContext());
+
+  // c2go #298 Wave AI Track A — GoABI0 callee writes results to the caller's
+  // incoming-args frame at offset = roundup(args_size, RegSize) + ret_offset.
+  // Pre-allocate the rounded args block in the result CCState so AnalyzeReturn's
+  // CCAssignToStack offsets land after the args block — matches Go's ABI0
+  // (arg area rounded up to RegSize(8) before results are placed).
+  //
+  // FuncInfo->getArgumentStackSize() is set by LowerFormalArguments above to
+  // the total size of incoming stack args on x86-64 (no LR slot, see CC table
+  // contract notes in X86CallingConv.h). This must agree with the result
+  // offset computed on the caller side in LowerCall.
+  //
+  // X86 differs from AArch64 here:
+  //   * AArch64 adds a +8 LR slot reserve via c2goReserveCallerLRSlot — x86's
+  //     hardware-pushed RA naturally takes the equivalent slot, so no reserve.
+  //   * AArch64 carries a `c2go-reg-return` fallback (AAPCS) for internal
+  //     goabi0cc funcs; Wave AJ.3 lands the same fallback on X86 via SysV
+  //     dispatch through `RetCC_X86` (see EffectiveCC above).
+  unsigned GoABI0IncomingArgsSize = 0;
+  if (CallConv == CallingConv::GoABI0 && !C2GoRegReturn) {
+    // c2go #298 Wave AK Fix 2 (BLOCKER-2 defense restore) — Wave AK.3
+    // dropped the LowerReturn bail-out on the theory that
+    // getFrameIndexReference would absorb the non-reserved-CF base-pointer
+    // indirection, but the result-slot FixedObject is materialized at a
+    // caller-side memory address whose offset is computed pre-CALLSEQ-END
+    // — without the AArch64-style PreCallSeqRetvals machinery the
+    // resulting address is silently wrong. Wave AM.2 (2026-06-10):
+    // PERMANENT fail-closed, no port planned — no X86 c2go producer
+    // reaches the non-reserved-CF shape (see the
+    // reportGoABI0NonReservedCFBailout helper comment above and
+    // X86C2GoFrameEmitter.h §7 for the assessment + evidence). The
+    // negative-offset arithmetic in LowerCallResult below + the
+    // GoABI0CallNumBytes plumbing on the LowerCall→LowerCallResult arrow
+    // are the AK.3 partial port; they stay in tree but are dead code
+    // while this bail-out is active.
+    //
+    // Reg-return (C2GoRegReturn) goes through the SysV reg path below and
+    // does not touch the stack result slot, so the bail-out does not apply.
+    const TargetFrameLowering *TFL = Subtarget.getFrameLowering();
+    if (!TFL->hasReservedCallFrame(MF))
+      reportGoABI0NonReservedCFBailout(MF, "LowerReturn");
+    GoABI0IncomingArgsSize = alignTo(FuncInfo->getArgumentStackSize(), 8);
+    CCInfo.AllocateStack(GoABI0IncomingArgsSize, Align(8));
+  }
   CCInfo.AnalyzeReturn(Outs, RetCC_X86);
+
+  // c2go #298 Wave AI Track A — GoABI0 stack-result store path. Every result
+  // is a MemLoc; store each into the caller's incoming-args frame at the
+  // agreed offset, then emit RET. Mirror of AArch64ISelLowering.cpp:10770-10788.
+  // Wave AJ.3: skipped for reg-return — those fall through to the standard
+  // RegLoc loop below.
+  if (CallConv == CallingConv::GoABI0 && !C2GoRegReturn) {
+    SDValue StoreChain = Chain;
+    for (unsigned i = 0; i < RVLocs.size(); ++i) {
+      CCValAssign &VA = RVLocs[i];
+      assert(VA.isMemLoc() && "GoABI0 results must be MemLoc");
+      // CCInfo was pre-bumped by GoABI0IncomingArgsSize above, so
+      // VA.getLocMemOffset() is the absolute offset (from the start of the
+      // caller's incoming-arg block on the callee side) of this result slot.
+      // CreateFixedObject + FrameIndex resolution maps this to caller-side
+      // memory naturally via X86 frame lowering's incoming-arg addressing.
+      int FI = MF.getFrameInfo().CreateFixedObject(
+          VA.getLocVT().getStoreSize(), VA.getLocMemOffset(),
+          /*IsImmutable=*/false);
+      SDValue Addr = DAG.getFrameIndex(FI, getPointerTy(DAG.getDataLayout()));
+      SDValue Arg = OutVals[i];
+      StoreChain = DAG.getStore(StoreChain, dl, Arg, Addr,
+                                MachinePointerInfo::getFixedStack(MF, FI));
+    }
+    SmallVector<SDValue, 2> RetOps;
+    RetOps.push_back(StoreChain);
+    RetOps.push_back(DAG.getTargetConstant(FuncInfo->getBytesToPopOnReturn(),
+                                           dl, MVT::i32));
+    return DAG.getNode(X86ISD::RET_GLUE, dl, MVT::Other, RetOps);
+  }
 
   SmallVector<std::pair<Register, SDValue>, 4> RetVals;
   for (unsigned I = 0, OutsIndex = 0, E = RVLocs.size(); I != E;
@@ -1111,19 +1296,109 @@ SDValue X86TargetLowering::LowerCallResult(
     SDValue Chain, SDValue InGlue, CallingConv::ID CallConv, bool isVarArg,
     const SmallVectorImpl<ISD::InputArg> &Ins, const SDLoc &dl,
     SelectionDAG &DAG, SmallVectorImpl<SDValue> &InVals,
-    uint32_t *RegMask) const {
+    uint32_t *RegMask, uint64_t GoABI0ArgsSize, bool IsC2GoRegReturn,
+    const uint64_t *GoABI0CallNumBytes) const {
 
   const TargetRegisterInfo *TRI = Subtarget.getRegisterInfo();
   // Assign locations to each value returned by this call.
   SmallVector<CCValAssign, 16> RVLocs;
-  CCState CCInfo(CallConv, isVarArg, DAG.getMachineFunction(), RVLocs,
+  MachineFunction &MF_CR = DAG.getMachineFunction();
+  // c2go #298 Wave AJ.3 — reg-return call sites go through `RetCC_X86` with a
+  // CCState whose CallConv is `X86_64_SysV` so the dispatch arm delegates to
+  // `RetCC_X86_64_C` (the static td-generated entry). Mirror of AArch64's
+  // direct `RetCC_AArch64_AAPCS` reference (AArch64ISelLowering.cpp:9928).
+  // Boundary GoABI0 keeps CallConv=GoABI0 → `RetCC_X86_64_GoABI0_TD` (stack).
+  CallingConv::ID EffectiveCC =
+      IsC2GoRegReturn ? CallingConv::X86_64_SysV : CallConv;
+  CCState CCInfo(EffectiveCC, isVarArg, MF_CR, RVLocs,
                  *DAG.getContext());
+  // c2go #298 Wave AI Track A — match the LowerCall-side pre-allocation so
+  // GoABI0 result CCAssignToStack offsets land after the args block. Must
+  // agree with the callee's LowerReturn pre-allocation. LowerCall passes
+  // GoABI0ArgsSize = alignTo(args_size, 8) for GoABI0 call sites; non-GoABI0
+  // calls leave it at 0 (no pre-allocation, no behaviour change).
+  //
+  // c2go #298 Wave AJ.3 — reg-return calls (IsC2GoRegReturn) skip both the
+  // bail-out and the args-block reservation: the result-slot LOAD branch
+  // below is never reached because every result will be a RegLoc under
+  // the SysV dispatch.
+  if (CallConv == CallingConv::GoABI0 && !IsC2GoRegReturn) {
+    // c2go #298 Wave AK Fix 2 (BLOCKER-2 defense restore) — caller-side
+    // result-slot LOAD path below addresses `sp + (LocMemOffset -
+    // alignTo(NumBytes, StackAlign))` post-CALLSEQ_END, which AArch64
+    // computes correctly only because its PreCallSeqRetvals machinery
+    // synthesizes the result CCInfo before CALLSEQ emission. Wave AK.3
+    // ported the negative-offset arithmetic *without* that supporting
+    // machinery — silent miscompile risk, hence the loud-fail. Wave AM.2
+    // (2026-06-10): PERMANENT fail-closed, no port planned — no X86 c2go
+    // producer reaches the non-reserved-CF shape (see the
+    // reportGoABI0NonReservedCFBailout helper comment and
+    // X86C2GoFrameEmitter.h §7). The negative-offset arithmetic below
+    // stays in tree but is dead code while this bail-out is active.
+    const TargetFrameLowering *TFL = Subtarget.getFrameLowering();
+    if (!TFL->hasReservedCallFrame(MF_CR))
+      reportGoABI0NonReservedCFBailout(MF_CR, "LowerCallResult");
+    if (GoABI0ArgsSize > 0)
+      CCInfo.AllocateStack(GoABI0ArgsSize, Align(8));
+  }
   CCInfo.AnalyzeCallResult(Ins, RetCC_X86);
 
   // Copy all of the result registers out of their specified physreg.
   for (unsigned I = 0, InsIndex = 0, E = RVLocs.size(); I != E;
        ++I, ++InsIndex) {
     CCValAssign &VA = RVLocs[I];
+
+    // c2go #298 Wave AI Track A — GoABI0 stack-located result load.
+    // Read from the caller's outgoing-arg frame at the agreed offset.
+    // Mirror of AArch64ISelLowering.cpp:9277-9308.
+    //
+    // c2go #298 Wave AK.3 — non-reserved-CF retval fixup. When the caller
+    // has !hasReservedCallFrame (hasVarSizedObjects / push sequences /
+    // preallocated calls), CALLSEQ_END emits `add sp, alignTo(NumBytes,
+    // StackAlign)` (eliminateCallFramePseudoInstr at X86FrameLowering.cpp
+    // line 3831), so the outgoing-arg block has been popped by the time
+    // this LOAD runs. The retval bytes physically still exist below the
+    // post-pop SP — read them at SP - alignTo(NumBytes, StackAlign) +
+    // LocMemOffset. Reserved-CF (the default) keeps SP stable across the
+    // call; the LOAD addresses raw `sp + LocMemOffset`. Mirror of
+    // AArch64ISelLowering.cpp:9290-9306 + #130 GoABI0CallNumBytes
+    // plumbing.
+    if (VA.isMemLoc()) {
+      assert(CallConv == CallingConv::GoABI0 &&
+             "stack-located call result outside GoABI0 not supported");
+      assert(GoABI0CallNumBytes &&
+             "GoABI0 MemLoc retval missing call frame size from LowerCall");
+      // VA.getLocMemOffset() was computed by LowerCall above with a
+      // pre-allocated args block of size alignTo(args_size, 8), so this
+      // offset is the absolute byte offset within the outgoing-arg frame
+      // (args region + result region). Read directly from sp+LocMemOffset
+      // (NOT via FrameIndex — FixedObject resolution would shift the
+      // offset by the caller's stack-size/RA bias, but the result lives in
+      // the outgoing-arg block which the caller addresses raw via sp).
+      // Pattern matches LowerMemOpCallTo's stack-arg STORE on the same
+      // outgoing-arg region.
+      const TargetFrameLowering *TFL_CR = Subtarget.getFrameLowering();
+      bool ReservedCallFrame = TFL_CR->hasReservedCallFrame(MF_CR);
+      int64_t SignedOff =
+          ReservedCallFrame
+              ? (int64_t)VA.getLocMemOffset()
+              : (int64_t)VA.getLocMemOffset() -
+                    (int64_t)alignTo(*GoABI0CallNumBytes,
+                                     TFL_CR->getStackAlign());
+      auto PtrVT = getPointerTy(DAG.getDataLayout());
+      const X86RegisterInfo *RegInfoCR = Subtarget.getRegisterInfo();
+      SDValue SP =
+          DAG.getCopyFromReg(Chain, dl, RegInfoCR->getStackRegister(), PtrVT);
+      SDValue Off = DAG.getIntPtrConstant(SignedOff, dl);
+      SDValue Addr = DAG.getNode(ISD::ADD, dl, PtrVT, SP, Off);
+      SDValue L = DAG.getLoad(
+          VA.getLocVT(), dl, SP.getValue(1), Addr,
+          MachinePointerInfo::getStack(MF_CR, VA.getLocMemOffset()));
+      Chain = L.getValue(1);
+      InVals.push_back(L);
+      continue;
+    }
+
     EVT CopyVT = VA.getLocVT();
 
     // In some calling conventions we need to remove the used registers
@@ -2119,6 +2394,63 @@ X86TargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
     CCInfo.AnalyzeArgumentsSecondPass(Outs, CC_X86);
   }
 
+  // c2go #298 Wave AI Track A — GoABI0 call-site result-slot reservation.
+  // The callee writes results to the caller's outgoing-arg frame at offset =
+  // roundup(args_size, RegSize) + ret_offset. Pre-allocate the rounded args
+  // block in a separate result-CCState so AnalyzeCallResult lays out result
+  // slot offsets after the args block — agreement with the callee-side
+  // LowerReturn pre-allocation above. NumBytes (the outgoing call frame size
+  // we pass to CALLSEQ_START/END) is then bumped to args + results so the
+  // X86 PrologEpilogInserter / FrameLowering reserves enough space.
+  //
+  // x86-64 reserved-call-frame is the default (X86FrameLowering's
+  // hasReservedCallFrame returns true for normal functions); sp doesn't move
+  // across the call, and the result-slot read in LowerCallResult is at
+  // plain `sp + LocMemOffset` (where LocMemOffset already includes the
+  // args-block bump). No equivalent of AArch64's #130 GoABI0CallNumBytes
+  // non-reserved-CF retval fixup is needed in this wave — c2go-mode X86
+  // modules go through the standard reserved-CF path.
+  //
+  // c2go #298 Wave AJ.3 — GoABI0 reg-return fallback at the call site.
+  // Mirror of AArch64ISelLowering.cpp:9926-9941. A call site marked
+  // `c2go-reg-return` (set by clang CGCall for internal/indirect calls) has
+  // the callee return via the SysV register file; the outgoing-arg block
+  // therefore holds args ONLY, no result-slot reservation, and LowerCallResult
+  // takes its standard RegLoc path (signalled to it via IsC2GoRegReturn).
+  //
+  // CallSiteAttrs (hasCallSiteFnAttr) is read instead of CB->hasFnAttr to
+  // survive RS4GC: the original call's attrs are stashed on CLI.CallSiteAttrs
+  // before the gc.statepoint rewrite zeroes CLI.CB. AArch64 LowerCall does
+  // the same; mirror exactly.
+  bool C2GoRegReturn = CallConv == CallingConv::GoABI0 &&
+                       CLI.hasCallSiteFnAttr("c2go-reg-return");
+  SmallVector<CCValAssign, 16> RetRVLocs;
+  unsigned GoABI0ArgsSize = 0;
+  if (CallConv == CallingConv::GoABI0 && !C2GoRegReturn) {
+    // c2go #298 Wave AK Fix 2 (BLOCKER-2 defense restore) — caller-side
+    // result-slot reservation + NumBytes bump below rely on the
+    // reserved-CF model (SP stable across the call, outgoing-arg block at
+    // SP+0). Any of hasVarSizedObjects / getHasPushSequences /
+    // hasPreallocatedCall forces non-reserved-CF
+    // (X86FrameLowering.cpp:65), invalidating the raw `sp + LocMemOffset`
+    // retval read in LowerCallResult even with the AK.3 negative-offset
+    // rebias (which needs PreCallSeqRetvals to be correct). Wave AM.2
+    // (2026-06-10): PERMANENT fail-closed, no port planned — no X86 c2go
+    // producer reaches the non-reserved-CF shape (see the
+    // reportGoABI0NonReservedCFBailout helper comment and
+    // X86C2GoFrameEmitter.h §7).
+    //
+    // Reg-return (C2GoRegReturn) reads results from SysV regs, not from
+    // sp+LocMemOffset, so the bail-out does not apply to that path.
+    const TargetFrameLowering *TFL = Subtarget.getFrameLowering();
+    if (!TFL->hasReservedCallFrame(MF))
+      reportGoABI0NonReservedCFBailout(MF, "LowerCall");
+    CCState RetCCInfo(CallConv, isVarArg, MF, RetRVLocs, *DAG.getContext());
+    GoABI0ArgsSize = alignTo(CCInfo.getStackSize(), 8);
+    RetCCInfo.AllocateStack(GoABI0ArgsSize, Align(8));
+    RetCCInfo.AnalyzeCallResult(Ins, RetCC_X86);
+  }
+
   bool IsMustTail = CLI.CB && CLI.CB->isMustTailCall();
   if (Subtarget.isPICStyleGOT() && !ShouldGuaranteeTCO && !IsMustTail) {
     // If we are using a GOT, disable tail calls to external symbols with
@@ -2166,6 +2498,23 @@ X86TargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
     NumBytes = 0;
   else if (ShouldGuaranteeTCO && canGuaranteeTCO(CallConv))
     NumBytes = GetAlignedArgumentStackSize(NumBytes, DAG);
+
+  // c2go #298 Wave AI Track A — include result-slot space in the outgoing
+  // call frame so the callee writes back at the agreed offset and the caller
+  // can load from it after the call returns. RetCCInfo was pre-bumped by
+  // GoABI0ArgsSize above, so its total stack size = args + results. Mirror
+  // of AArch64ISelLowering.cpp:10007-10008.
+  // Wave AJ.3: reg-return calls (C2GoRegReturn) read results from SysV regs;
+  // outgoing frame holds args only — no result-slot bump.
+  if (CallConv == CallingConv::GoABI0 && !IsSibcall && !C2GoRegReturn) {
+    // Re-run the RetCCInfo size query through getAlignedCallFrameSize-style
+    // alignment via the analyzer's getStackSize — already aligned to 8 by
+    // GoABI0 slot rules (4/8/16-byte slots → 8-byte boundaries after roundup).
+    CCState ProbeCCInfo(CallConv, isVarArg, MF, RetRVLocs, *DAG.getContext());
+    ProbeCCInfo.AllocateStack(GoABI0ArgsSize, Align(8));
+    ProbeCCInfo.AnalyzeCallResult(Ins, RetCC_X86);
+    NumBytes = std::max<unsigned>(NumBytes, ProbeCCInfo.getStackSize());
+  }
 
   // A sibcall is ABI-compatible and does not need to adjust the stack pointer.
   int FPDiff = 0;
@@ -2749,8 +3098,29 @@ X86TargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
 
   // Handle result values, copying them out of physregs into vregs that we
   // return.
+  // c2go #298 Wave AI Track A — GoABI0 calls pass the aligned args size so
+  // LowerCallResult can pre-allocate the args block before AnalyzeCallResult.
+  // Wave AJ.3: a c2go-reg-return call site (GoABI0 + `c2go-reg-return` attr)
+  // reads results from SysV regs; signal that to LowerCallResult by forcing
+  // GoABI0ArgsSize=0 so the stack-result branch is skipped and the standard
+  // RegLoc path (with SysV `RetCC_X86_64_C`) handles the result copy.
+  //
+  // c2go #298 Wave AK.3 — stash NumBytes so LowerCallResult can rebias the
+  // retval-slot address relative to the post-CALLSEQ_END SP using a
+  // negative offset when the caller is !hasReservedCallFrame. After
+  // CALLSEQ_END's `add sp, alignTo(NumBytes, StackAlign)`, the retval bytes
+  // are at (sp - alignTo(NumBytes, StackAlign) + LocMemOffset). Mirror of
+  // AArch64ISelLowering.cpp:10634 (#130 GoABI0CallNumBytes plumbing).
+  uint64_t GoABI0CallNumBytes = NumBytes;
   return LowerCallResult(Chain, InGlue, CallConv, isVarArg, Ins, dl, DAG,
-                         InVals, RegMask);
+                         InVals, RegMask,
+                         (CallConv == CallingConv::GoABI0 && !C2GoRegReturn)
+                             ? GoABI0ArgsSize
+                             : 0,
+                         C2GoRegReturn,
+                         (CallConv == CallingConv::GoABI0 && !C2GoRegReturn)
+                             ? &GoABI0CallNumBytes
+                             : nullptr);
 }
 
 //===----------------------------------------------------------------------===//

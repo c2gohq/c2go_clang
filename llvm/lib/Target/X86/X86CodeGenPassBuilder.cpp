@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "X86.h"
+#include "X86C2GoLeafABI.h"
 #include "X86ISelDAGToDAG.h"
 #include "X86TargetMachine.h"
 
