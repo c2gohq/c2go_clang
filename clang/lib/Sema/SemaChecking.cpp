@@ -2844,6 +2844,12 @@ Sema::CheckBuiltinFunctionCall(FunctionDecl *FDecl, unsigned BuiltinID,
     [[fallthrough]];
   case Builtin::BI__builtin_alloca:
   case Builtin::BI__builtin_alloca_uninitialized:
+    // c2go uses fixed-size Go stack frames; dynamic stack allocation is
+    // disabled as a feature (same switch that disables VLAs).
+    if (!getLangOpts().VLASupport) {
+      Diag(TheCall->getBeginLoc(), diag::err_c2go_dynamic_stack);
+      return ExprError();
+    }
     Diag(TheCall->getBeginLoc(), diag::warn_alloca)
         << TheCall->getDirectCallee();
     if (getLangOpts().OpenCL) {
@@ -10936,6 +10942,17 @@ Sema::CheckReturnValExpr(Expr *RetValExp, QualType lhsType,
   // here prevent the user from using a PPC MMA type as trailing return type.
   if (Context.getTargetInfo().getTriple().isPPC64())
     PPC().CheckPPCMMAType(RetValExp->getType(), ReturnLoc);
+
+  // c2go v15 §3.5 D2: returning a c2go_managed pointer through an unmanaged
+  // return type drops the AS1 discriminator; the caller will not track the
+  // pointer across safepoints. The escape hatch is an explicit
+  // `(__attribute__((c2go_managed)) T *)` cast in the caller.
+  if (getLangOpts().C2GoMode && RetValExp && c2goTypeDropsManaged(lhsType)) {
+    QualType RetTy = RetValExp->IgnoreParenImpCasts()->getType();
+    if (c2goTypeIsManagedPtr(RetTy) &&
+        !c2goExprIsExplicitManagedCast(RetValExp))
+      Diag(ReturnLoc, diag::err_c2go_managed_to_unmanaged_return) << lhsType;
+  }
 }
 
 void Sema::CheckFloatComparison(SourceLocation Loc, const Expr *LHS,

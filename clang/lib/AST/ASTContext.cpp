@@ -13125,6 +13125,19 @@ CallingConv ASTContext::getDefaultCallingConvention(bool IsVariadic,
   if (IsCXXMethod)
     return ABI->getDefaultMethodCallConv(IsVariadic);
 
+  // c2go (#290): in c2go mode an unannotated function is "internal abi0"
+  // (docs/c2go_design.md §2.0.3). Spell that as CC_C2GoInternal so it is the
+  // SAME calling convention a function carries when written with the explicit
+  // c2go_managed attribute — making `managed_fp = &plain` type-compatible while
+  // keeping c2go_extern (CC_GoABI0) a distinct, incompatible type. This is a
+  // pure front-end type-system distinction: CodeGen lowers every c2go function
+  // via CallingConv::GoABI0 regardless (CodeGenModule::useC2GoGoABI0CallingConv).
+  // Boundary symbols (c2go_extern / c2go_linkname) get CC_GoABI0 from the
+  // attribute before this default applies. Variadic functions are left on the
+  // platform default to avoid perturbing the void** vararg pack path.
+  if (LangOpts.C2GoMode && !IsVariadic)
+    return CC_C2GoInternal;
+
   switch (LangOpts.getDefaultCallingConv()) {
   case LangOptions::DCC_None:
     break;

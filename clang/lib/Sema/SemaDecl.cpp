@@ -14,6 +14,7 @@
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/ASTLambda.h"
+#include "clang/AST/C2GoUtil.h"
 #include "clang/AST/CXXInheritance.h"
 #include "clang/AST/CharUnits.h"
 #include "clang/AST/Decl.h"
@@ -3295,6 +3296,40 @@ void Sema::mergeDeclAttributes(NamedDecl *New, Decl *Old,
     }
   }
 
+  // c2go (#279): managed-ness must be consistent across the redeclaration
+  // chain. A forward declaration / typedef / definition of the same object
+  // cannot disagree on whether it is c2go_managed or c2go_unmanaged — the two
+  // markings select opposite GC worlds (Go-heap-scanned vs raw), so a silent
+  // mismatch would corrupt the stackmap/typeinfo the Go side derives. Detect
+  // the case where merging Old and New would put contradictory markings on
+  // the same declaration and emit a hard error pointing at the prior decl.
+  if (getLangOpts().C2GoMode) {
+    auto effManaged = [](const Decl *D, bool &Managed, bool &Unmanaged,
+                         const Attr *&A) {
+      if (const auto *M = D->getAttr<C2GoManagedAttr>()) {
+        Managed = true;
+        A = M;
+      }
+      if (const auto *U = D->getAttr<C2GoUnmanagedAttr>()) {
+        Unmanaged = true;
+        A = U;
+      }
+    };
+    bool OldManaged = false, OldUnmanaged = false;
+    bool NewManaged = false, NewUnmanaged = false;
+    const Attr *OldA = nullptr, *NewA = nullptr;
+    effManaged(Old, OldManaged, OldUnmanaged, OldA);
+    effManaged(New, NewManaged, NewUnmanaged, NewA);
+    // Conflict iff one side is managed and the other unmanaged. (A decl that
+    // carries BOTH at once is caught when the second attribute is applied.)
+    bool Conflict = (OldManaged && NewUnmanaged) || (OldUnmanaged && NewManaged);
+    if (Conflict && NewA && OldA) {
+      Diag(NewA->getLocation(), diag::err_attributes_are_not_compatible)
+          << NewA << OldA << /*HasAttributeKeyword (=> " attributes")=*/0;
+      Diag(OldA->getLocation(), diag::note_conflicting_attribute);
+    }
+  }
+
   // This redeclaration adds a section attribute.
   if (New->hasAttr<SectionAttr>() && !Old->hasAttr<SectionAttr>()) {
     if (auto *VD = dyn_cast<VarDecl>(New)) {
@@ -3409,6 +3444,27 @@ static void propagateAttributes(ParmVarDecl *To, const ParmVarDecl *From,
 static void mergeParamDeclAttributes(ParmVarDecl *newDecl,
                                      const ParmVarDecl *oldDecl,
                                      Sema &S) {
+  // c2go (#279): a parameter's managed-ness must agree across the function's
+  // redeclarations. Differing c2go_managed / c2go_unmanaged on the same
+  // parameter across two prototypes would have the caller and callee disagree
+  // on whether the pointer argument is GC-tracked. Diagnose before the generic
+  // attribute propagation below merges the two.
+  if (S.getLangOpts().C2GoMode) {
+    bool NewManaged = newDecl->hasAttr<C2GoManagedAttr>();
+    bool NewUnmanaged = newDecl->hasAttr<C2GoUnmanagedAttr>();
+    bool OldManaged = oldDecl->hasAttr<C2GoManagedAttr>();
+    bool OldUnmanaged = oldDecl->hasAttr<C2GoUnmanagedAttr>();
+    if ((NewManaged && OldUnmanaged) || (NewUnmanaged && OldManaged)) {
+      const Attr *NewA = NewManaged ? (const Attr *)newDecl->getAttr<C2GoManagedAttr>()
+                                    : (const Attr *)newDecl->getAttr<C2GoUnmanagedAttr>();
+      const Attr *OldA = OldManaged ? (const Attr *)oldDecl->getAttr<C2GoManagedAttr>()
+                                    : (const Attr *)oldDecl->getAttr<C2GoUnmanagedAttr>();
+      S.Diag(NewA->getLocation(), diag::err_attributes_are_not_compatible)
+          << NewA << OldA << /*HasAttributeKeyword (=> " attributes")=*/0;
+      S.Diag(OldA->getLocation(), diag::note_conflicting_attribute);
+    }
+  }
+
   // C++11 [dcl.attr.depend]p2:
   //   The first declaration of a function shall specify the
   //   carries_dependency attribute for its declarator-id if any declaration
@@ -6687,6 +6743,38 @@ NamedDecl *Sema::HandleDeclarator(Scope *S, Declarator &D,
   if (OpenMP().isInOpenMPDeclareTargetContext())
     OpenMP().checkDeclIsAllowedInOpenMPTarget(nullptr, New);
 
+  // c2go v15: inside a `#pragma c2go managed(N) push` region, stamp the
+  // region's default pointer world (Ptr bit → managed, else unmanaged) onto
+  // unannotated pointer-shaped *parameter* and *variable* declarations.
+  // Explicit per-decl annotation still wins.
+  //
+  // NOTE: we do NOT stamp the FunctionDecl itself for its return type. The
+  // "c2go_unmanaged on a function == unmanaged return" semantics is
+  // deprecated; the FunctionDecl-level attr denotes the *function* world
+  // (e.g. the manifest "managed" flag, CodeGenAction). Stamping it from the
+  // return type would mis-mark an internal function that merely returns an
+  // unmanaged pointer. (The function world is decided by #290's default CC +
+  // c2go_extern/c2go_managed attributes; the pragma's func bit is inert, #268.)
+  if (getLangOpts().C2GoMode && !C2GoStack.empty()) {
+    const auto &Top = C2GoStack.back();
+    auto stampPtrWorld = [&](Decl *D, QualType QT) {
+      if (!QT->isPointerType())
+        return;
+      if (D->hasAttr<C2GoManagedAttr>() || D->hasAttr<C2GoUnmanagedAttr>())
+        return;
+      if (Top.ptrManaged())
+        D->addAttr(C2GoManagedAttr::CreateImplicit(Context, Top.Loc));
+      else
+        D->addAttr(C2GoUnmanagedAttr::CreateImplicit(Context, Top.Loc));
+    };
+    if (auto *FD = dyn_cast<FunctionDecl>(New)) {
+      for (auto *PVD : FD->parameters())
+        stampPtrWorld(PVD, PVD->getType());
+    } else if (auto *VD = dyn_cast<VarDecl>(New)) {
+      stampPtrWorld(VD, VD->getType());
+    }
+  }
+
   return New;
 }
 
@@ -7768,6 +7856,22 @@ NamedDecl *Sema::ActOnVariableDeclarator(
     return nullptr;
   }
 
+  // c2go #425: reject user-written identifiers starting with
+  // `__c2go_typeinfo_`. Sema synthesizes this VarDecl implicitly inside
+  // ActOnC2GoTypeInfo to carry the RTTI descriptor's AsmLabel +
+  // C2GoTypeInfoAttr; a user-written declaration with the same prefix
+  // would shadow that lookup and either steal the AsmLabel or leave the
+  // descriptor without its carrier attr. Skip the implicit Sema-created
+  // VarDecl itself (D.isImplicit() never holds for parser-produced
+  // Declarators, but the previous-lookup chain may reuse our implicit
+  // entry as a prior decl, which is fine and must not be rejected).
+  if (LangOpts.C2GoMode && II &&
+      II->getName().starts_with("__c2go_typeinfo_")) {
+    Diag(D.getIdentifierLoc(), diag::err_c2go_typeinfo_reserved_identifier)
+        << II;
+    D.setInvalidType();
+    return nullptr;
+  }
 
   DeclSpec::SCS SCSpec = D.getDeclSpec().getStorageClassSpec();
   StorageClass SC = StorageClassSpecToVarDeclStorageClass(D.getDeclSpec());
@@ -18814,6 +18918,358 @@ CreateNewDecl:
   }
 }
 
+// Returns the RecordDecl of a CGO struct reached through pointers or
+// directly through value-typed fields. Drills through arrays. Returns
+// nullptr if the type does not transitively touch any CGO struct.
+static RecordDecl *pointsToOrEmbedsC2GoStruct(QualType T, bool &IsEmbedded) {
+  if (T.isNull())
+    return nullptr;
+  if (T->getAsArrayTypeUnsafe())
+    return pointsToOrEmbedsC2GoStruct(
+        QualType(T->getBaseElementTypeUnsafe(), 0), IsEmbedded);
+  if (T->isPointerType()) {
+    QualType Pointee = T->getPointeeType();
+    if (const RecordType *RT = Pointee->getAs<RecordType>())
+      if (RecordDecl *Inner = RT->getDecl())
+        if (Inner->hasAttr<C2GoStructAttr>()) {
+          IsEmbedded = false;
+          return Inner;
+        }
+    return nullptr;
+  }
+  if (const RecordType *RT = T->getAs<RecordType>())
+    if (RecordDecl *Inner = RT->getDecl())
+      if (Inner->hasAttr<C2GoStructAttr>()) {
+        IsEmbedded = true;
+        return Inner;
+      }
+  return nullptr;
+}
+
+// c2go v15 §3.1 / §9.2 / §3.4 (task T6): does QualType T contain a *scannable*
+// data pointer — any pointer field that is NOT a function pointer — directly
+// or through an embedded record / array? Function pointers are always no-scan
+// (§3.4) so they never count. Both managed and unmanaged data pointers are
+// force-scanned by the Go GC (over-retain `unsafe.Pointer`), so either makes
+// the containing record's pointer word part of the GC-scanned layout. Mirrors
+// the scan decision in CGC2GoTypeInfo's bitmap walkers (function-pointer
+// no-scan filter), but at the type level for layout policing.
+static bool typeContainsScannablePointer(
+    QualType T, llvm::SmallPtrSetImpl<const RecordDecl *> &Visited) {
+  if (T.isNull())
+    return false;
+  // Peel array layers (a `void *p[8]` slot is still a pointer field).
+  while (const ArrayType *AT = T->getAsArrayTypeUnsafe())
+    T = AT->getElementType();
+  if (T.isNull())
+    return false;
+  if (T->isPointerType())
+    return !T->isFunctionPointerType();
+  if (const RecordType *RT = T->getAs<RecordType>()) {
+    const RecordDecl *RD = RT->getDecl();
+    RD = RD ? RD->getDefinition() : nullptr;
+    if (!RD || !Visited.insert(RD).second)
+      return false;
+    for (const FieldDecl *F : RD->fields())
+      if (typeContainsScannablePointer(F->getType(), Visited))
+        return true;
+  }
+  return false;
+}
+
+static bool recordContainsScannablePointer(const RecordDecl *RD) {
+  if (!RD)
+    return false;
+  RD = RD->getDefinition();
+  if (!RD)
+    return false;
+  llvm::SmallPtrSet<const RecordDecl *, 8> Visited;
+  Visited.insert(RD);
+  for (const FieldDecl *F : RD->fields())
+    if (typeContainsScannablePointer(F->getType(), Visited))
+      return true;
+  return false;
+}
+
+// `#pragma c2go managed(N) push` / `#pragma c2go pop` implementation (v15).
+//
+// The flag bitmask N (Ptr=2, Record=4) controls which worlds default to
+// managed inside the region: Record runs struct/union inference, Ptr makes
+// unannotated pointers managed. The func bit (1) is deprecated/inert (#268):
+// the function world is decided by #290 (default CC + c2go_extern/c2go_managed
+// attributes), so `managed(1)` parses but is a no-op region.
+// Nesting is supported; pop only unwinds one level. A bare `#pragma c2go pop`
+// outside of any push is a recoverable warning.
+void Sema::ActOnPragmaC2GoPush(SourceLocation PragmaLoc, unsigned Flags) {
+  C2GoStack.push_back({PragmaLoc, Flags});
+}
+
+void Sema::ActOnPragmaC2GoPop(SourceLocation PragmaLoc) {
+  if (C2GoStack.empty()) {
+    Diag(PragmaLoc, diag::warn_pragma_pop_failed) << "c2go" << "no matching push";
+    return;
+  }
+  C2GoStack.pop_back();
+}
+
+void Sema::AddPragmaC2GoAttribute(RecordDecl *RD) {
+  if (!RD || C2GoStack.empty())
+    return;
+  const auto &Top = C2GoStack.back();
+
+  // v15: the Record bit gates struct/union inference. Without it, records in
+  // this region are plain C (no C2GoStructAttr, no Go-side typeinfo).
+  if (!Top.recordAnalyze())
+    return;
+
+  // Step 1 — stamp each unannotated pointer field with the region's default
+  // pointer world (Ptr bit: managed; else unmanaged), preserving explicit
+  // per-field annotations. This makes the field world explicit *before* the
+  // managed-struct inference below reads it.
+  for (FieldDecl *F : RD->fields()) {
+    if (!F->getType()->isPointerType())
+      continue;
+    if (F->hasAttr<C2GoManagedAttr>() || F->hasAttr<C2GoUnmanagedAttr>())
+      continue;
+    if (Top.ptrManaged())
+      F->addAttr(C2GoManagedAttr::CreateImplicit(Context, Top.Loc));
+    else
+      F->addAttr(C2GoUnmanagedAttr::CreateImplicit(Context, Top.Loc));
+  }
+
+  // Step 2 — conservative inference (docs/c2go_design.md v15 P2): mark the
+  // record a managed struct (C2GoStructAttr → Go struct + typeinfo) iff it
+  // has a managed-ptr field. Positive signals:
+  //   (i)   a field explicitly/stamped C2GoManaged pointer,
+  //   (ii)  a field pointing to an already-managed struct (transitive),
+  //   (iii) the record itself explicitly ((c2go_managed)),
+  //   (iv)  an unannotated pointer field under the Ptr bit (stamped managed
+  //         in Step 1, so it shows up as (i)).
+  // A record with zero pointers or only unmanaged pointers stays unmanaged
+  // (POD) — never auto-promoted. A record the user explicitly marked
+  // __attribute__((c2go_unmanaged)) is also never auto-promoted — the
+  // explicit marker wins (§3.3 step 1 > step 2); if such a record carries a
+  // managed-ptr field, analyzeC2GoStruct flags it as D6 (T5) instead of
+  // silently turning it into a managed struct.
+  if (!RD->hasAttr<C2GoStructAttr>() && !RD->hasAttr<C2GoUnmanagedAttr>()) {
+    if (RD->hasAttr<C2GoManagedAttr>() ||
+        c2go::recordContainsManagedPointer(RD))
+      RD->addAttr(C2GoStructAttr::CreateImplicit(Context, Top.Loc));
+  }
+}
+
+// c2go identification is opt-in. A struct or union only participates in
+// the goabi pipeline when the user explicitly marks it -- either with
+// __attribute__((c2go_struct)) on the declaration or by being inside a
+// `#pragma c2go push` region (which attaches the same attribute
+// implicitly). This function exists to validate that marker and to police
+// "hybrid" plain records that touch a c2go record -- those are usually
+// bugs.
+//
+// Returns true when RD itself carries the attribute (so the caller knows
+// to run validateC2GoStructFeatures); returns false otherwise, possibly
+// after emitting a diagnostic about an unmarked hybrid.
+bool Sema::analyzeC2GoStruct(RecordDecl *RD) {
+  if (!RD)
+    return false;
+
+  // c2go v15 §3.3 step 3 / §3.5.1 D6 (task T5): a record explicitly marked
+  // __attribute__((c2go_unmanaged)) must not carry a managed-pointer field
+  // (directly or through an embedded record). An unmanaged record gets no Go
+  // typeinfo / gcdata, so a managed pointer it holds would be invisible to
+  // the GC. recordContainsManagedPointer uses the same managed-ptr predicate
+  // (c2go_managed attr / round-22 attr sugar / pointer-to-c2go_struct; a bare
+  // unannotated pointer defaults to unmanaged) that drives D1/D5, so a struct
+  // whose only pointers are plain `T *` stays legal. The check runs before
+  // the c2go_struct gate (the record is unmanaged, so it never carries
+  // C2GoStructAttr) and is independent of any pragma region.
+  if (RD->hasAttr<C2GoUnmanagedAttr>() &&
+      c2go::recordContainsManagedPointer(RD)) {
+    Diag(RD->getLocation(), diag::err_c2go_unmanaged_record_has_managed_field)
+        << RD;
+  }
+
+  // c2go v15 §3.5 D5: a union that overlays a managed pointer alternative
+  // with an unmanaged alternative (another pointer of unmanaged type, or a
+  // non-pointer scalar/array) cannot be safely scanned by the GC — the
+  // storage is opaque and there is no per-PC tag for which alternative is
+  // live. Warn so the user either (a) splits the union, (b) annotates the
+  // non-managed field(s) with c2go_unmanaged so they are not part of the
+  // "mixed" hybrid the GC sees, or (c) pins the managed pointee with
+  // runtime.KeepAlive across any safepoint. We classify pointer fields via
+  // c2goTypeIsManagedPtr (same predicate that drives D1/D2/D3); any
+  // non-pointer field counts as unmanaged storage. The check runs before
+  // the c2go_struct gate because plain unions that happen to embed a
+  // c2go_managed pointer alternative are the most common offender.
+  // §3.9 / T3: a `c2go_variant` union is opted in to convert-to-struct, where
+  // pointer slots and the scalar blob occupy *separate* bytes and are scanned
+  // precisely — there is no overlay, so the managed/unmanaged-mix warning and
+  // the "pointer-to-c2go_struct inside a non-c2go_struct" warning below do not
+  // apply (the converted struct gives the pointee a precisely-scanned slot).
+  const bool IsVariantUnion = RD->isUnion() && RD->hasAttr<C2GoVariantAttr>();
+
+  // §3.9 / T3b (soundness fail-closed): computeC2GoVariantLayout descends into
+  // each alternative's NATURAL layout (nested structs and arrays), records
+  // which pointer-sized words hold a scannable DATA pointer, and overlays
+  // alternatives by signature. A nested struct / array (including
+  // array-of-pointer and struct-with-pointer) is therefore precisely scannable
+  // now and is ACCEPTED. Only genuinely unrepresentable shapes remain
+  // fail-closed: a nested *union* that puns a scan pointer with a scalar at the
+  // same word (an ambiguous byte), a pointer at a non-pointer-aligned (packed)
+  // offset, or a flexible/VLA member. The layout flags those via
+  // \c Representable=false / \c BlockerFieldName; reject them here so a managed
+  // pointee can never be silently dropped from the GC scan (use-after-free).
+  if (IsVariantUnion) {
+    auto VL = c2go::computeC2GoVariantLayout(RD, Context);
+    if (VL.Valid && !VL.Representable) {
+      // Map the blocker field name back to a FieldDecl for a precise location.
+      const FieldDecl *Blocker = nullptr;
+      for (const FieldDecl *F : RD->fields())
+        if (F->getNameAsString() == VL.BlockerFieldName) {
+          Blocker = F;
+          break;
+        }
+      SourceLocation Loc = Blocker ? Blocker->getLocation() : RD->getLocation();
+      Diag(Loc, diag::err_c2go_variant_nested_scan_ptr)
+          << RD
+          << (Blocker ? Blocker->getDeclName()
+                      : DeclarationName());
+    }
+  }
+
+  if (RD->isUnion() && !IsVariantUnion) {
+    bool HasManaged = false, HasUnmanaged = false;
+    for (FieldDecl *F : RD->fields()) {
+      QualType FT = F->getType();
+      if (FT->isPointerType()) {
+        if (c2goTypeIsManagedPtr(FT))
+          HasManaged = true;
+        else
+          HasUnmanaged = true;
+      } else {
+        // Non-pointer alternatives (scalars, arrays, nested non-managed
+        // records) all count as unmanaged storage overlapping the slot.
+        HasUnmanaged = true;
+      }
+      if (HasManaged && HasUnmanaged)
+        break;
+    }
+    if (HasManaged && HasUnmanaged)
+      Diag(RD->getLocation(), diag::warn_c2go_managed_union_overlay) << RD;
+  }
+
+  if (!RD->hasAttr<C2GoStructAttr>()) {
+    // §3.9 / T3: a variant union's pointer alternatives get a precisely-scanned
+    // converted-struct slot, so the "pointer-to-c2go_struct inside a plain
+    // record" warning is wrong for it — skip the per-field diagnostics.
+    if (IsVariantUnion)
+      return false;
+    // Diagnose hybrid plain-C records (struct or union) that touch a
+    // c2go-marked record. Same policy for both kinds of container:
+    // embedding-by-value is a hard error, pointer-to is a warning.
+    for (FieldDecl *F : RD->fields()) {
+      bool IsEmbedded = false;
+      if (RecordDecl *Inner =
+              pointsToOrEmbedsC2GoStruct(F->getType(), IsEmbedded)) {
+        if (IsEmbedded) {
+          Diag(F->getLocation(), diag::err_c2go_struct_embedded_in_plain)
+              << Inner->getDeclName() << RD->getDeclName();
+        } else if (!c2go::isInsideC2GoVariantUnion(RD)) {
+          // §3.9 / T3b — when RD is a nested-struct alternative of a
+          // `c2go_variant` union, the convert-to-struct layout scans this
+          // pointer word precisely (the gcbitmap bit is set), so the
+          // "not scanned by the Go GC" warning is a false positive here.
+          // Genuine top-level plain records (RD not inside any variant union)
+          // still warn.
+          Diag(F->getLocation(), diag::warn_c2go_struct_ptr_in_plain)
+              << Inner->getDeclName() << RD->getDeclName();
+        }
+      }
+    }
+    return false;
+  }
+
+  // c2go_struct is allowed on both struct AND union. A c2go union opts the
+  // shared memory slot into the Go heap; the GC treats it as one
+  // pointer-sized scan slot unless the user marks the union (or any of its
+  // members) with c2go_unmanaged. The runtime variant tag is invisible to
+  // the GC, so use this only when every variant is safe to scan
+  // conservatively or all variants are pointers of compatible width.
+  return true;
+}
+
+/// Validate CGO struct features and emit diagnostics for unsupported constructs
+void Sema::validateC2GoStructFeatures(RecordDecl *RD) {
+  if (!RD)
+    return;
+
+  // Two layout-policing regimes:
+  //   * Managed c2go struct (C2GoStructAttr): #210 demoted packed/aligned to
+  //     a *warning* — CGC2GoTypeInfo emits a precise per-type gcdata bitmap
+  //     from the (packed-aware) ASTRecordLayout, and c2gobind pads to match.
+  //   * Unmanaged struct that nevertheless holds a scannable data pointer
+  //     (task T6, §3.1 / §9.2): no gcdata exists; the Go GC force-scans the
+  //     pointer word conservatively and can only find it at a naturally
+  //     aligned word boundary. Packing / custom alignment shifts it off the
+  //     word grid → the GC misses a live pointer → use-after-free. This is a
+  //     hard *error*. Unions are excluded (no static pointer slot to align).
+  if (!RD->hasAttr<C2GoStructAttr>()) {
+    if (!RD->isUnion() && recordContainsScannablePointer(RD)) {
+      if (RD->hasAttr<PackedAttr>() || RD->hasAttr<MaxFieldAlignmentAttr>())
+        Diag(RD->getLocation(), diag::err_c2go_unmanaged_struct_packed)
+            << RD->getDeclName();
+      if (RD->hasAttr<AlignedAttr>())
+        Diag(RD->getLocation(), diag::err_c2go_unmanaged_struct_aligned)
+            << RD->getDeclName();
+      for (auto *Field : RD->fields()) {
+        if (auto *A = Field->getAttr<AlignedAttr>())
+          Diag(A->getLocation(),
+               diag::err_c2go_unmanaged_struct_field_aligned)
+              << RD->getDeclName() << Field->getDeclName();
+      }
+    }
+    return;
+  }
+
+  // Validate memory-layout constraints: the record must use the default
+  // (natural) struct layout. Any attribute capable of changing the layout
+  // forces the type away from Go's struct representation. We emit a regular
+  // diagnostic; the record stays valid in the AST so downstream code is not
+  // surprised by a half-built declaration (setInvalidDecl is illegal on a
+  // completed TagDecl).
+
+  // #210: packed / max_field_alignment / aligned. Previously these
+  // were hard errors because the c2gobind backend emits Go struct
+  // fields directly and Go's natural layout couldn't match the
+  // alignment-shifted C layout. We now demote to a warning under
+  // c2go-mode: clang's CGC2GoTypeInfo emits a precise GC bitmap from
+  // the ASTRecordLayout (which DOES honour packed/aligned), and
+  // c2gobind v0.3+ can emit `[N]byte` padding fields to match the
+  // physical layout. Users who hit the warning should either ensure
+  // their c2gobind is recent enough or @c2go_unmanaged the type so
+  // it stays opaque to the Go side. Real fields with packed/aligned
+  // still need c2gobind to emit the right Go-side type — this is
+  // tracked separately as a follow-up; the warning unblocks the
+  // common-case `__attribute__((packed))` interop.
+  if (RD->hasAttr<PackedAttr>()) {
+    Diag(RD->getLocation(), diag::warn_c2go_struct_packed) << RD->getDeclName();
+  }
+  if (RD->hasAttr<MaxFieldAlignmentAttr>()) {
+    Diag(RD->getLocation(), diag::warn_c2go_struct_packed) << RD->getDeclName();
+  }
+  if (RD->hasAttr<AlignedAttr>()) {
+    Diag(RD->getLocation(), diag::warn_c2go_struct_aligned) << RD->getDeclName();
+  }
+  for (auto *Field : RD->fields()) {
+    if (Field->hasAttr<AlignedAttr>()) {
+      AlignedAttr *AlignedAttribute = Field->getAttr<AlignedAttr>();
+      Diag(AlignedAttribute->getLocation(),
+           diag::warn_c2go_struct_field_aligned)
+          << RD->getDeclName() << Field->getDeclName();
+    }
+  }
+}
+
 void Sema::ActOnTagStartDefinition(Scope *S, Decl *TagD) {
   AdjustDeclIfTemplate(TagD);
   TagDecl *Tag = cast<TagDecl>(TagD);
@@ -18925,6 +19381,47 @@ void Sema::ActOnTagFinishDefinition(Scope *S, Decl *TagD,
   if (getCurLexicalContext()->isObjCContainer() &&
       Tag->getDeclContext()->isFileContext())
     Tag->setTopLevelDeclInObjCContainer();
+
+  // In c2go mode, the record may carry an explicit c2go_struct attribute --
+  // either spelled directly on the declaration, or attached implicitly by
+  // an active `#pragma c2go push` region. Verify the marker is legal and,
+  // if so, validate the layout constraints (no packed / non-default
+  // alignment). Unmarked records are plain C and need no further work.
+  if (getLangOpts().C2GoMode) {
+    if (RecordDecl *RD = dyn_cast<RecordDecl>(Tag)) {
+      // c2go #408 — stamp C2GoStructAttr onto this completed definition
+      // (and the canonical RD) if any earlier-or-later forward redecl in
+      // the redecl chain carries it. mergeDeclAttributes only propagates
+      // forward (PrevDecl→New); a definition-first / attr-on-later-fwd-
+      // redecl ordering otherwise leaves both the definition and the
+      // canonical RD without the attribute, silently dropping the record
+      // out of every CodeGen `RD->getDefinition()->hasAttr<C2GoStructAttr>()`
+      // gate. Sync via redecls() so the lookup order does not matter.
+      if (!RD->hasAttr<C2GoStructAttr>()) {
+        for (Decl *R : RD->redecls()) {
+          if (auto *A = R->getAttr<C2GoStructAttr>()) {
+            RD->addAttr(C2GoStructAttr::CreateImplicit(Context,
+                                                       A->getLocation()));
+            break;
+          }
+        }
+      }
+      if (auto *Canon = dyn_cast_or_null<RecordDecl>(RD->getCanonicalDecl()))
+        if (Canon != RD && !Canon->hasAttr<C2GoStructAttr>())
+          if (auto *A = RD->getAttr<C2GoStructAttr>())
+            Canon->addAttr(
+                C2GoStructAttr::CreateImplicit(Context, A->getLocation()));
+      AddPragmaC2GoAttribute(RD);
+      // analyzeC2GoStruct policies hybrid records / unions and returns true
+      // for managed c2go structs. validateC2GoStructFeatures runs in both
+      // cases: managed structs get the #210 packed/aligned *warnings*, while
+      // unmanaged structs that still hold a scannable pointer get the T6
+      // packed/aligned *errors* (the conservative force-scan needs natural
+      // alignment; an unmanaged record has no precise gcdata to compensate).
+      analyzeC2GoStruct(RD);
+      validateC2GoStructFeatures(RD);
+    }
+  }
 
   // Notify the consumer that we've defined a tag.
   if (!Tag->isInvalidDecl())

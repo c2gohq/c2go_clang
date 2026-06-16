@@ -33,6 +33,7 @@ add_clang_library(clangAST
   ASTTypeTraits.cpp
   AttrDocTable.cpp
   AttrImpl.cpp
+  C2GoUtil.cpp
   Availability.cpp
   Comment.cpp
   CommentBriefParser.cpp

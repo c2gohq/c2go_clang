@@ -3639,6 +3639,8 @@ StringRef FunctionType::getNameForCallConv(CallingConv CC) {
   CC_VLS_CASE(65536)
 #undef CC_VLS_CASE
     // clang-format on
+  case CC_GoABI0: return "goabi0";
+  case CC_C2GoInternal: return "c2go_internal";
   }
 
   llvm_unreachable("Invalid calling convention.");
@@ -4427,6 +4429,8 @@ bool AttributedType::isCallingConv() const {
   case attr::PreserveNone:
   case attr::RISCVVectorCC:
   case attr::RISCVVLSCC:
+  case attr::C2GoExtern: // #286: c2go_extern doubles as a CC type attr (CC_GoABI0)
+  case attr::C2GoManaged: // #290: c2go_managed doubles as a CC type attr (CC_C2GoInternal)
     return true;
   }
   llvm_unreachable("invalid attr kind");

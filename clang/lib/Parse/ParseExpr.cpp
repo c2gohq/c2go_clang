@@ -1069,6 +1069,7 @@ Parser::ParseCastExpression(CastParseKind ParseKind, bool isAddressOfOperand,
     break;
   case tok::kw___builtin_va_arg:
   case tok::kw___builtin_offsetof:
+  case tok::kw___c2go_typeinfo:
   case tok::kw___builtin_choose_expr:
   case tok::kw___builtin_astype: // primary-expression: [OCL] as_type()
   case tok::kw___builtin_convertvector:
@@ -2350,6 +2351,24 @@ ExprResult Parser::ParseBuiltinPrimaryExpression() {
       Res = ExprError();
     else
       Res = Actions.ActOnVAArg(StartLoc, Expr.get(), Ty.get(), ConsumeParen());
+    break;
+  }
+  case tok::kw___c2go_typeinfo: {
+    // c2go: __c2go_typeinfo(type-name) — single type-id operand, yields the
+    // Go-runtime `*_type` RTTI pointer for the managed record type.
+    SourceLocation TypeLoc = Tok.getLocation();
+    TypeResult Ty = ParseTypeName();
+    if (Ty.isInvalid()) {
+      SkipUntil(tok::r_paren, StopAtSemi);
+      return ExprError();
+    }
+    if (Tok.isNot(tok::r_paren)) {
+      Diag(Tok, diag::err_expected) << tok::r_paren;
+      SkipUntil(tok::r_paren, StopAtSemi);
+      return ExprError();
+    }
+    Res = Actions.ActOnC2GoTypeInfo(getCurScope(), StartLoc, TypeLoc, Ty.get(),
+                                    ConsumeParen());
     break;
   }
   case tok::kw___builtin_offsetof: {

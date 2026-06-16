@@ -3506,6 +3506,8 @@ StringRef CXXNameMangler::getCallingConvQualifierName(CallingConv CC) {
     CC_VLS_CASE(32768)
     CC_VLS_CASE(65536)
 #undef CC_VLS_CASE
+  case CC_GoABI0:
+  case CC_C2GoInternal:
     // FIXME: we should be mangling all of the above.
     return "";
 

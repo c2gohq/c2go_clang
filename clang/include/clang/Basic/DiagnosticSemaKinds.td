@@ -2217,6 +2217,39 @@ def select_special_member_kind : TextSubstitution<
 def note_member_declared_at : Note<"member is declared here">;
 def note_ivar_decl : Note<"instance variable is declared here">;
 def note_bitfield_decl : Note<"bit-field is declared here">;
+// c2go: __c2go_typeinfo(type) RTTI surface.
+def err_c2go_typeinfo_not_record : Error<
+  "'__c2go_typeinfo' requires a record (struct/union) type; %0 is not a "
+  "record">;
+def err_c2go_typeinfo_anonymous : Error<
+  "'__c2go_typeinfo' requires a named record type; the Go-side "
+  "'_typeinfo_<Name>' descriptor has no stable name for this type">;
+def err_c2go_typeinfo_reserved_identifier : Error<
+  "identifier %0 is reserved for the c2go '__c2go_typeinfo' descriptor; "
+  "user-declared identifiers starting with '__c2go_typeinfo_' collide with "
+  "the implicit RTTI carrier synthesized by Sema and are rejected">;
+
+// c2go v15 §P5: C calling into Go.
+def err_c2go_return_type_not_record : Error<
+  "'c2go_returntype' requires a struct type naming the Go function's return "
+  "tuple; %0 is not a struct">;
+def err_c2go_return_type_incomplete : Error<
+  "'c2go_returntype' struct %0 is incomplete; its definition must be visible "
+  "to lay out the Go ABI0 result slots">;
+def err_c2go_return_type_mismatch : Error<
+  "'c2go_returntype' struct %0 does not match the function's declared return "
+  "type %1; the declared return type must be the same struct">;
+def err_c2go_return_type_unsupported_field : Error<
+  "%0 field %1 has type %2 which is not a Go ABI0 return slot "
+  "(use 'bool', signed/unsigned char/short/int/long/long long, "
+  "enum, pointer, 'float'/'double', or a c2go built-in aggregate "
+  "(__c2go_slice/__c2go_string/__c2go_iface))">;
+def err_c2go_return_type_unsupported_target : Error<
+  "%0 is only supported on aarch64 and x86_64 (current target: %1)">;
+def err_c2go_extern_init_main_lowercase : Error<
+  "'c2go_extern(0)' cannot export a C function named %0: a lowercase Go "
+  "binding would collide with Go's language-level %0; use 'c2go_extern' or "
+  "'c2go_extern(1)' to export it as the exported wrapper '%1' instead">;
 def note_implicit_param_decl : Note<"%0 is an implicit parameter">;
 def note_member_synthesized_at : Note<
   "in %select{implicit|defaulted}0 %sub{select_special_member_kind}1 for %2 "

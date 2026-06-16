@@ -431,6 +431,21 @@ def err_open_hotpatch_file_failed
 
 def err_codegen_unsupported : Error<"cannot compile this %0 yet">;
 
+// c2go #403 — fires from CGExpr.cpp EmitGlobalVarDeclLValue when an implicit
+// VarDecl whose AsmLabel begins with `c2go.typeinfo.` is seen without the
+// matching `C2GoTypeInfoAttr` carrier. Sema's ActOnC2GoTypeInfo
+// (SemaExpr.cpp) adds both attributes atomically (see Attr.td:1395 —
+// `C2GoTypeInfo` is `InternalOnly`/`Spellings=[]`/`SemaHandler=0`), so this
+// only fires if a compiler-internal invariant is violated (e.g. a PCH or
+// module serializer drops the carrier across round-trip). Debug builds
+// catch the same condition via assert in CGExpr.cpp; this diagnostic is
+// the release-build counterpart and prevents a dangling
+// `c2go.typeinfo.<Name>` extern from reaching the linker.
+def err_c2go_typeinfo_attr_missing : Error<
+    "c2go.typeinfo.* AsmLabel without C2GoTypeInfoAttr carrier "
+    "(compiler-internal invariant violated; PCH/module serialization may "
+    "have dropped the attribute)">;
+
 def warn_trivial_auto_var_limit
     : Warning<"-ftrivial-auto-var-init-stop-after=%0 has been enabled to limit "
               "the number of times ftrivial-auto-var-init=%1 gets applied">,

@@ -9769,6 +9769,17 @@ Expected<Attr *> ASTImporter::Import(const Attr *FromAttr) {
                   From->args_size());
     break;
   }
+  case attr::C2GoTypeInfo: {
+    // c2go #392 — the default `cloneAttr` path would copy the FROM-context
+    // RecordDecl* pointer verbatim into the TO context, which is unsafe
+    // across ASTContexts (CTU / cross-TU AST merge). Translate the Decl*
+    // through the importer so the resulting attribute references a TO-context
+    // RecordDecl. PCH / module serialization is handled by tablegen-generated
+    // ASTReader/Writer paths and does not go through this importer.
+    const auto *From = cast<C2GoTypeInfoAttr>(FromAttr);
+    AI.importAttr(From, AI.importArg(From->getRecord()).value());
+    break;
+  }
   default: {
     // The default branch works for attributes that have no arguments to import.
     // FIXME: Handle every attribute type that has arguments of type to import

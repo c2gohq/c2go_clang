@@ -1179,6 +1179,15 @@ void TypePrinter::printFunctionAfter(const FunctionType::ExtInfo &Info,
       CC_VLS_CASE(32768)
       CC_VLS_CASE(65536)
 #undef CC_VLS_CASE
+    case CC_GoABI0:
+      OS << " /*c2go: goabi0*/";
+      break;
+    case CC_C2GoInternal:
+      // #290: CC_C2GoInternal is the implicit c2go-mode default calling
+      // convention (every unannotated c2go function carries it). Print nothing,
+      // mirroring CC_C, so desugared type spellings / -ast-dump / diagnostics
+      // stay identical to pre-#290 output (c2gobind consumes these).
+      break;
     }
   }
 
