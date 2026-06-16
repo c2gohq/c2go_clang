@@ -16,6 +16,7 @@
 #include "clang/Basic/TargetOptions.h"
 #include "clang/Frontend/Utils.h"
 #include "clang/Lex/HeaderSearchOptions.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Analysis/GlobalsModRef.h"
@@ -27,6 +28,7 @@
 #include "llvm/Bitcode/BitcodeWriterPass.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/Config/llvm-config.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Frontend/Driver/CodeGenOptions.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfo.h"
@@ -38,6 +40,7 @@
 #include "llvm/IR/Verifier.h"
 #include "llvm/IRPrinter/IRPrintingPasses.h"
 #include "llvm/LTO/LTOBackend.h"
+#include "llvm/MC/MCPlan9AsmStreamer.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Object/OffloadBinary.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -45,6 +48,7 @@
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/ProfileData/InstrProfCorrelator.h"
 #include "llvm/Support/BuryPointer.h"
+#include "llvm/Support/C2GoEmergencyFlag.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/IOSandbox.h"
@@ -56,10 +60,15 @@
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Target/C2GoBackendKnobs.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/TargetParser/SubtargetFeature.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/C2Go/C2GoEscapeCheck.h"
+#include "llvm/Transforms/C2Go/C2GoMemcpyTyping.h"
+#include "llvm/Transforms/C2Go/C2GoPipeline.h"
+#include "llvm/Transforms/C2Go/C2GoSafepoint.h"
 #include "llvm/Transforms/HipStdPar/HipStdPar.h"
 #include "llvm/Transforms/IPO/EmbedBitcodePass.h"
 #include "llvm/Transforms/IPO/InferFunctionAttrs.h"
@@ -106,6 +115,76 @@ namespace llvm {
 static cl::opt<bool> ClSanitizeOnOptimizerEarlyEP(
     "sanitizer-early-opt-ep", cl::Optional,
     cl::desc("Insert sanitizers on OptimizerEarlyEP."));
+
+// #326: select the c2go GC stackmap strategy at -O2+. DEFAULT = ON (true): the
+// SOUND RewriteStatepointsForGC statepoint path (C2GoGCSetupPass -> RS4GC ->
+// C2GoFoldAllocaRelocatesPass) is the DEFAULT -O2 GC path. It covers the
+// register-resident / anonymous-spill pointer roots that the lightweight
+// alloca-only map misses once regalloc runs, making the -O2 locals bitmap
+// COMPLETE.
+//
+// The flag is now an OVERRIDE / escape hatch, not an opt-in:
+//   * default (unset)        -> statepoint path at -O2+ (lightweight at -O0/-O1)
+//   * -c2go-statepoint-gc=0  -> force the lightweight alloca-only path even at
+//                               -O2 (debugging escape hatch; the known
+//                               incomplete -O2 root coverage applies)
+//   * -c2go-statepoint-gc=1  -> explicit on (same as default)
+//
+// The "#315 frame/result contract" block is RESOLVED: the four-way GoABI0
+// stack-return x statepoint frame contract was confirmed sound. The earlier
+// miscompile was over-marking by RS4GC's relocates, fixed by
+// C2GoFoldAllocaRelocatesPass (folds relocate-of-alloca back to the alloca so
+// live stack aggregates surface as Direct stackmap locations). Verified robust:
+// 7 SQL workload modes (each >=200x) + #314 union-int probe (300x) + vararg
+// probe (800x), all GOGC=1 GODEBUG=invalidptr=1, 0 crashes.
+// #330 (Approach B) + #331 (GPT review F1-F5): now COMPLETE and DEFAULT-ON.
+// Approach B (M1-M5) overlays on RS4GC (they coexist, not replace): RS4GC
+// drives statepoint placement + LowerSTATEPOINT bitmap emission; B fills
+// the bitmap completeness that RS4GC's rematerialize-derived-from-base
+// strategy misses (the #329 derived/interior-pointer gap). The lightweight
+// -O0/-O1 path also benefits from B's M5 OR-in (F2 fix at LowerSTACKMAP).
+//
+// Five-piece machinery (all default-on, all behind escape-hatch flags):
+//   M1: AArch64InstrInfo::isC2GoPointerDerivedReg — SSA def-chain classifier
+//   M2: InlineSpiller::spillAll -> setC2GoSpillSlotTag(FI,"ptr")
+//       (F1: StackSlotColoring fresh-color path propagates tag)
+//   M3: LowerSTATEPOINT + LowerSTACKMAP (F2) OR per-call live ptr slots
+//   M5: AArch64C2GoPtrSlotLiveness.cpp (442 LOC, addPreEmitPass2):
+//       forward must-reach store ∩ backward use-reach = LIVE per-PC.
+//       Mirrors Go cmd/compile/internal/liveness/plive.go. F4: same-MI MMOs
+//       grouped by FI, store-kill before load-set per FI (operand-order
+//       independent).
+//   F5: RewriteStatepointsForGC.cpp:519 alloca-base case gated on
+//       F->getGC() == "c2go-gc" (no upstream pollution).
+//
+// Key ABI enabler: CSR_AArch64_NoRegs (all caller-saved) at ALL -O levels →
+// every pointer live across a call is already spilled to a stack slot
+// (no callee-saved registers means regalloc MUST spill across calls).
+// That makes stack-slot-only marking (no register maps) complete, matching
+// Go's plive.go model. c2go funcs are FuncFlagAsm → never async-preempted →
+// only call safepoints matter.
+//
+// Verified: SQLite 6 modes x 150 iters GOGC=1 result-correctness checked,
+// 900/900 clean TWICE (pre- and post- F1-F5). All historical crash classes
+// gone: #314 (yy_reduce 0x9), #316 (NOSPLIT pollution), #329 (derived-
+// pointer dangling). m5demo2.s direct evidence: same sp+24 slot ptr-LIVE
+// PC uses bitmap 1, DEAD PC uses bitmap 0 (per-PC accurate).
+//
+// Escape hatches (for diagnostics; defaults are correct):
+//   * -c2go-statepoint-gc=0   -> revert to lightweight pipeline (sound at
+//                                -O0/-O1; -O2 lightweight has a separate
+//                                non-GC codegen miscompile and is unsound
+//                                for register-resident roots, but the
+//                                escape hatch is useful for isolating GC
+//                                vs non-GC bugs)
+// As of #377, the four mature default-ON c2go cl::opts (statepoint-gc,
+// ptrslot-liveness, spill-tags, leaf-abi) are collapsed into the single
+// `-c2go-disable=<csv>` emergency switch defined in
+// llvm/Support/C2GoEmergencyFlag.{h,cpp}. The disable tokens are:
+//   * -c2go-disable=statepoint-gc    (was -c2go-statepoint-gc=0)
+//   * -c2go-disable=ptrslot-liveness (was -c2go-gc-ptrslot-liveness=0)
+//   * -c2go-disable=spill-tags       (was -c2go-gc-spill-tags=0)
+//   * -c2go-disable=leaf-abi         (was -c2go-leaf-abiinternal=0)
 
 // Experiment to mark cold functions as optsize/minsize/optnone.
 // TODO: remove once this is exposed as a proper driver flag.
@@ -188,6 +267,15 @@ class EmitAssemblyHelper {
   void RunCodegenPipeline(BackendAction Action,
                           std::unique_ptr<raw_pwrite_stream> &OS,
                           std::unique_ptr<llvm::ToolOutputFile> &DwoOS);
+
+  /// c2go Phase E v0+1 step 4: after the primary .o codegen pipeline,
+  /// run a SECOND codegen pass on a cloned IR module with
+  /// OutputAsmVariant=2 so AArch64Plan9InstPrinter +
+  /// MCPlan9AsmStreamer write a Plan 9 .s file to
+  /// LangOpts.C2GoEmitPlan9AsmPath. Cloning is required because
+  /// codegen passes consume MachineFunctions and cannot be re-run
+  /// on the same Module.
+  void RunC2GoPlan9Pipeline();
 
   /// Check whether we should emit a module summary for regular LTO.
   /// The module summary should be emitted by default for regular LTO
@@ -838,6 +926,82 @@ void addLowerAllowCheckPass(const CodeGenOptions &CodeGenOpts,
   }
 }
 
+// c2go (Plan 9 .s emit): pipeline-start passes registered via
+// PB.registerPipelineStartEPCallback when LangOpts.C2GoMode is on.
+// Splits out the body of the original lambda for readability.
+//
+// Locks in frontend-attached !c2go.elem.type metadata BEFORE the default
+// optimization pipeline can strip / merge / forward typed @llvm.memcpy
+// calls (MemCpyOpt forwarding, DSE consolidations, mem2reg, SROA,
+// instcombine, LoopIdiom). Without this, surviving memcpys would lose
+// `!c2go.elem.type` metadata → silently drop the write barrier →
+// corrupt the GC heap.
+//
+// Pair runs (MemcpyTyping → Safepoint) in that order. The Safepoint
+// pass (lightweight stackmap path) only runs when the statepoint path
+// won't fire later at OptimizerLast — see #326/#327: statepoint is
+// gated to -O2+, so -O0/-O1 still need the lightweight pass here.
+static void addC2GoEarlyPasses(llvm::ModulePassManager &MPM,
+                               llvm::OptimizationLevel Level,
+                               bool UseStatepoint) {
+  MPM.addPass(C2GoMemcpyTypingPass());
+  if (!UseStatepoint)
+    MPM.addPass(C2GoSafepointPass());
+}
+
+// c2go (Plan 9 .s emit): optimizer-last passes registered via
+// PB.registerOptimizerLastEPCallback when LangOpts.C2GoMode is on.
+// Splits out the body of the original lambda for readability.
+//
+// Catches @llvm.memcpy/memmove intrinsics newly generated by
+// LoopIdiomRecognize (loop-pattern → memcpy) and MemCpyOptimizer
+// (store-merge / forwarding) that propagated `!c2go.field.type` onto a
+// new intrinsic as `!c2go.elem.type`; routes them to
+// runtime.typedmemmove for write-barrier correctness.
+//
+// Then runs the post-pipeline GC pass:
+//   * UseStatepoint == true  : C2GoGCSetupPass + RewriteStatepointsForGC
+//                              + C2GoFoldAllocaRelocatesPass (the SOUND
+//                              -O2+ statepoint pipeline; #326 Stage III)
+//   * UseStatepoint == false : C2GoSafepointPass (lightweight; #307
+//                              second run after inlining)
+//
+// Followed by a SECOND C2GoMemcpyTypingPass to type any raw
+// `@llvm.memset/memcpy/memmove` that survives to here (avoids the
+// AAPCS-libcall lowering that mismatches the GoABI0 c2go-libc shim →
+// SIGBUS), and finally C2GoEscapeCheckPass (#289 client B,
+// `-c2go-escape-check` cl::opt gated; default-OFF no-op).
+static void addC2GoLatePasses(llvm::ModulePassManager &MPM,
+                              llvm::OptimizationLevel Level,
+                              bool UseStatepoint) {
+  // Round 24 / GPT round 5 sequence:
+  //   1. MemcpyTyping   — lock in `!c2go.elem.type` routing on raw
+  //                       memcpy/memmove BEFORE the GC pipeline (the
+  //                       resulting `runtime.typedmemmove` is gc-leaf).
+  //   2. Poll group     — inject cooperative Gosched() polls BEFORE the
+  //                       GC pipeline so RS4GC wraps each new poll call
+  //                       in a gc.statepoint (the new call counts as a
+  //                       real safepoint for liveness — the whole point
+  //                       of injection; matches §4.10.6).
+  //   3. GC group       — RS4GC (or lightweight C2GoSafepointPass).
+  //   4. Leaf group     — MemcpyTyping + WriteBarriers AFTER the GC
+  //                       pipeline. Both emit only `gc-leaf-function`
+  //                       callees (`runtime.typedmemmove`,
+  //                       `_c2go_writePtr`), so they do not need a
+  //                       follow-up RS4GC. Running them AFTER the GC
+  //                       pipeline matches c2go-lto Layer 3 replay (post-
+  //                       inliner, post-RS4GC) byte-for-byte, fixing the
+  //                       round 23 regression in which Layer 3 added
+  //                       WriteBarriers but Layer 1 had already consumed
+  //                       its pass slot pre-RS4GC. See round 24 prompt.
+  //   5. EscapeCheck    — #289 client B (default-OFF no-op).
+  MPM.addPass(C2GoMemcpyTypingPass());
+  addC2GoLatePollPasses(MPM);
+  addC2GoLateGCPasses(MPM, UseStatepoint);
+  addC2GoLateLeafPasses(MPM);
+  MPM.addPass(C2GoEscapeCheckPass());
+}
+
 void EmitAssemblyHelper::RunOptimizationPipeline(
     BackendAction Action, std::unique_ptr<raw_pwrite_stream> &OS,
     std::unique_ptr<llvm::ToolOutputFile> &ThinLinkOS, BackendConsumer *BC) {
@@ -1002,6 +1166,11 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
   // preset TLI.
   std::unique_ptr<TargetLibraryInfoImpl> TLII(
       llvm::driver::createTLII(TargetTriple, CodeGenOpts.getVecLib()));
+  // #229 — bzero substitution is handled by C2GoMemcpyTyping pass
+  // which rewrites @llvm.memset → c2go_libc.Memset before SelectionDAG
+  // (where the bzero subst happens) sees the intrinsic. TLI-level
+  // setUnavailable doesn't help because the memset→bzero rewrite is
+  // in SelectionDAG (codegen), not in optimisation transforms.
   FAM.registerPass([&] { return TargetLibraryAnalysis(*TLII); });
 
   // Register all the basic analyses with the managers.
@@ -1127,6 +1296,68 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
         MPM.addPass(ModuleMemProfilerPass());
       });
     }
+
+    // c2go-mode: lock in frontend-attached !c2go.elem.type metadata
+    // BEFORE the default optimization pipeline gets a chance to
+    // strip / merge / forward typed @llvm.memcpy calls. Without this
+    // pre-pipeline pass, MemCpyOpt forwarding (memcpy(t,s,n);
+    // memcpy(d,t,n) → memcpy(d,s,n)) and DSE consolidations may
+    // lose `!c2go.elem.type` metadata on the surviving memcpy, which
+    // would silently drop the write barrier and corrupt the GC heap.
+    //
+    // v15 §P4 RETIRED `C2GoMallocReplacementPass`: malloc/calloc/realloc/
+    // free no longer get rewritten to runtime.mallocgc by name — they lower
+    // to ordinary libc calls, and GC allocation is now explicit via
+    // c2go_gc_malloc (see clang/lib/Headers/c2go.h). The typeinfo globals
+    // (@c2go.typeinfo.<X>) MemcpyTyping looks up are emitted by clang's
+    // CodeGenModule at AST-record-lowering time (§A2), so they are already
+    // in the module at pre-pass time without the pass running. (The pass
+    // also used to materialise typeinfo for literal/anonymous structs; those
+    // now fall back to the @llvm.memcpy intrinsic path in MemcpyTyping.)
+    //
+    // Registered at the PipelineStart extension point so the pair runs
+    // at the very start of the optimization pipeline — before
+    // buildModuleSimplificationPipeline (MemCpyOpt / DSE / SROA /
+    // mem2reg / instcombine / LoopIdiom) can strip metadata or erase
+    // managed allocas. The order within the callback (MemcpyTyping →
+    // Safepoint) is preserved.
+    if (LangOpts.C2GoMode)
+      PB.registerPipelineStartEPCallback(
+          [](ModulePassManager &MPM, OptimizationLevel Level) {
+            bool UseStatepoint =
+                !llvm::c2go::isC2GoDisabled("statepoint-gc") &&
+                Level.getSpeedupLevel() >= 2;
+            addC2GoEarlyPasses(MPM, Level, UseStatepoint);
+          });
+
+    // c2go-mode: second MemcpyTyping run AFTER the default pipeline to
+    // catch new @llvm.memcpy/memmove intrinsics generated by
+    // LoopIdiomRecognize (loop-pattern → memcpy) and MemCpyOptimizer
+    // (store-merge / forwarding). Those passes are patched to
+    // PROPAGATE `!c2go.field.type` from participating load/store onto
+    // the new intrinsic as `!c2go.elem.type`, so this post-pass picks
+    // them up and routes to runtime.typedmemmove for write-barrier
+    // correctness on the new calls too.
+    //
+    // Typeinfo globals are emitted by clang's CodeGenModule (§A2) and
+    // remain in place; no malloc pass re-run is needed (§P4 retired it).
+    //
+    // Registered at the OptimizerLast extension point: LoopIdiom and
+    // MemCpyOpt live inside the core optimization pipeline, which runs
+    // well before this EP fires, so the newly-generated intrinsics are
+    // already present. Nothing between OptimizerLast and the end of the
+    // pipeline (GlobalDCE / ConstantMerge / MergeFunctions /
+    // RelLookupTableConverter / HotColdSplit) emits new memcpy
+    // intrinsics, so OptimizerLast captures them all.
+    if (LangOpts.C2GoMode)
+      PB.registerOptimizerLastEPCallback(
+          [](ModulePassManager &MPM, OptimizationLevel Level,
+             ThinOrFullLTOPhase) {
+            bool UseStatepoint =
+                !llvm::c2go::isC2GoDisabled("statepoint-gc") &&
+                Level.getSpeedupLevel() >= 2;
+            addC2GoLatePasses(MPM, Level, UseStatepoint);
+          });
 
     if (CodeGenOpts.FatLTO) {
       MPM.addPass(PB.buildFatLTODefaultPipeline(
@@ -1296,6 +1527,143 @@ void EmitAssemblyHelper::RunCodegenPipeline(
   }
 }
 
+// c2go (LLVM-22 cleanup): jump-table encoding override and
+// RegisterCoalescer disable now live on AArch64TargetMachine as
+// instance fields (set on the Plan 9-codegen TM only, below). The
+// previous thread_local globals in llvm::c2go_internal have been
+// removed; the .o codegen TM (this->TM) leaves both fields default
+// (false), so non-c2go builds and the .o pipeline are unaffected.
+
+void EmitAssemblyHelper::RunC2GoPlan9Pipeline() {
+  StringRef Plan9Path = CI.getLangOpts().C2GoEmitPlan9AsmPath;
+  // c2go #320 / #376: NOSPLIT-eligibility decisions used to live in a
+  // process-global thread_local set; clearing them between the .o pass and
+  // the Plan 9 .s pass was necessary because the .s pass uses a neutral
+  // ELF triple (and potentially different codegen flags) and the resulting
+  // frame sizes may differ. As of #376 the metadata lives on the
+  // MCPlan9AsmStreamer instance and a fresh streamer is constructed by the
+  // emitBackendOutput call below — its C2GoFnMeta map is naturally empty,
+  // so no explicit reset is needed. Bodyless c2go_extern boundary metadata
+  // (framesize/argsize) flows via the pending-boundary queue drained by
+  // the new streamer's constructor; AArch64FrameLowering re-publishes
+  // framed-function metadata as each MF is emitted in the .s pass.
+
+  // Open the .s output stream.
+  std::error_code EC;
+  auto OutFile = std::make_unique<llvm::raw_fd_ostream>(
+      Plan9Path, EC, llvm::sys::fs::OF_TextWithCRLF);
+  if (EC) {
+    Diags.Report(diag::err_fe_unable_to_open_output)
+        << Plan9Path << EC.message();
+    return;
+  }
+
+  // c2go #239: the `Plan9PackageName` thread_local was previously set
+  // here for the Plan 9 InstPrinter to rewrite typeinfo MOVD refs to
+  // `$type·<pkg>·<X>(SB)`. Both the global and its (now-orphaned)
+  // assignment were removed; the InstPrinter no longer reads a package
+  // name, and any future reintroduction should live on
+  // `MCPlan9AsmStreamer` as an instance member (the printer can reach
+  // it via the streamer pointer the symbolic-print path uses).
+
+  // Clone the IR module — codegen passes consume MachineFunctions
+  // and we already ran codegen for the .o output.
+  std::unique_ptr<llvm::Module> Cloned = llvm::CloneModule(*TheModule);
+
+  // c2go: the Plan 9 (.s) output must be SYSTEM-INDEPENDENT. Codegen with a
+  // canonical OS-neutral arm64 ELF triple so the AsmPrinter's
+  // Mach-O/COFF/ELF object-format branches take the minimal path and the .s
+  // is identical regardless of build host. The front end stays host-aware
+  // (#ifdef, struct layout). Host-OS-flavored IR the front end emits that a
+  // neutral-ELF backend cannot lower (notably the Darwin `va_arg` ISD node —
+  // assert "automatic va_arg only works on Darwin") must be eliminated AT THE
+  // FRONT END by giving c2go its OWN host-independent ABI lowering (task
+  // #260: emit explicit AAPCS-style va_arg, not the Darwin node) — NOT by
+  // retargeting this pass back to the host (that would make the .s host-
+  // flavored, defeating system-independence, and reintroduce host object
+  // directives). The cloned module keeps the host DataLayout (struct/field
+  // layout = the system-aware part decided by the front end).
+  llvm::Triple NeutralTT = TargetTriple;
+  NeutralTT.setVendor(llvm::Triple::UnknownVendor);
+  NeutralTT.setOS(llvm::Triple::UnknownOS);
+  NeutralTT.setEnvironment(llvm::Triple::UnknownEnvironment);
+  NeutralTT.setObjectFormat(llvm::Triple::ELF);
+
+  std::string Error;
+  const llvm::Target *NeutralTarget =
+      TargetRegistry::lookupTarget(NeutralTT, Error);
+  if (!NeutralTarget) {
+    Diags.Report(diag::err_fe_unable_to_create_target) << Error;
+    return;
+  }
+
+  llvm::TargetOptions NeutralOptions;
+  if (!initTargetOptions(CI, Diags, NeutralOptions))
+    return;
+  NeutralOptions.MCOptions.OutputAsmVariant = 2; // drive MCPlan9AsmStreamer
+
+  std::optional<CodeGenOptLevel> OptLevelOrNone =
+      CodeGenOpt::getLevel(CodeGenOpts.OptimizationLevel);
+  std::string FeaturesStr =
+      llvm::join(TargetOpts.Features.begin(), TargetOpts.Features.end(), ",");
+  std::unique_ptr<llvm::TargetMachine> NeutralTM(
+      NeutralTarget->createTargetMachine(
+          NeutralTT, TargetOpts.CPU, FeaturesStr, NeutralOptions,
+          CodeGenOpts.RelocationModel, getCodeModel(CodeGenOpts),
+          OptLevelOrNone.value_or(CodeGenOptLevel::Default)));
+  if (!NeutralTM) {
+    Diags.Report(diag::err_fe_unable_to_create_target) << "c2go Plan 9 codegen";
+    return;
+  }
+  // Retarget the clone to the neutral triple + its DataLayout (the
+  // MachineFunction layer asserts module-DL/TM compatibility). Safe on arm64:
+  // host (Mach-O) vs neutral (ELF) DataLayouts differ only in symbol mangling
+  // (c2go does its own Plan 9 mangling) and i8/i16 PREFERRED alignment —
+  // struct member ABI offsets use ABI alignment, identical in both.
+  Cloned->setTargetTriple(NeutralTT);
+  Cloned->setDataLayout(NeutralTM->createDataLayout());
+
+  legacy::PassManager Plan9Passes;
+  Plan9Passes.add(createTargetTransformInfoWrapperPass(
+      NeutralTM->getTargetIRAnalysis()));
+
+  // c2go #309 / #120 / #397: set the three Plan-9-codegen knobs on this
+  // local NeutralTM in one atomic write via the #435 POD shim. Each bool
+  // motivates a different invariant:
+  //   * DisableRegisterCoalescing (#309/#310): AArch64PassConfig reads
+  //     this in its ctor and calls disablePass(&RegisterCoalescerID).
+  //     The coalescer is unsound against c2go's CSR_AArch64_NoRegs +
+  //     go-asm prologue frame contract (miscompiles sqlite3Parser yytos).
+  //   * ForceBlockAddressJumpTable (#120): EK_BlockAddress jump-table
+  //     encoding + AArch64CompressJumpTables skip. Plan 9 .s DATA cannot
+  //     represent label-diff encodings. The primary .o codegen TM
+  //     (this->TM) keeps the default because c2go-mode also sets the
+  //     per-function `no-jump-tables` attr.
+  //   * DisableGlobalMerge (#397): GlobalMerge erases per-GV identities
+  //     into a `_MergedGlobals` aggregate before MCPlan9AsmStreamer's
+  //     go-owned filter classifies them per-GV; managed pointer-bearing
+  //     internals get folded into a NOPTR blob and the .s ships an
+  //     unsound NOPTR layout.
+  // Scoped to this NeutralTM only (a local unique_ptr that goes out of
+  // scope at function exit) — the .o pipeline and non-c2go compiles see
+  // the defaults.
+  {
+    llvm::c2go::BackendConfig C2GoCfg;
+    C2GoCfg.ForceBlockAddressJumpTable = true;
+    C2GoCfg.DisableRegisterCoalescing = true;
+    C2GoCfg.DisableGlobalMerge = true;
+    llvm::c2go::applyC2GoBackendConfig(NeutralTM.get(), C2GoCfg);
+  }
+
+  if (NeutralTM->addPassesToEmitFile(Plan9Passes, *OutFile, /*DwoOut=*/nullptr,
+                                     llvm::CodeGenFileType::AssemblyFile,
+                                     /*DisableVerify=*/!CodeGenOpts.VerifyModule)) {
+    Diags.Report(diag::err_fe_unable_to_interface_with_target);
+    return;
+  }
+  Plan9Passes.run(*Cloned);
+}
+
 void EmitAssemblyHelper::emitAssembly(BackendAction Action,
                                       std::unique_ptr<raw_pwrite_stream> OS,
                                       BackendConsumer *BC) {
@@ -1309,12 +1677,30 @@ void EmitAssemblyHelper::emitAssembly(BackendAction Action,
   if (TM)
     TheModule->setDataLayout(TM->createDataLayout());
 
+  // c2go (#120): the EK_BlockAddress jump-table encoding override is set
+  // on the Plan-9 NeutralTM only (see RunC2GoPlan9Pipeline below). c2go-mode
+  // also sets per-function `no-jump-tables` (CompilerInvocation), so the
+  // primary .o codegen can't emit jump tables in the first place; the
+  // override is a safety net for the Plan-9 emit pass only.
+
   // Before executing passes, print the final values of the LLVM options.
   cl::PrintOptionValues();
 
   std::unique_ptr<llvm::ToolOutputFile> ThinLinkOS, DwoOS;
   RunOptimizationPipeline(Action, OS, ThinLinkOS, BC);
   RunCodegenPipeline(Action, OS, DwoOS);
+
+  // c2go Phase E v0+1 step 4: after the primary codegen pipeline
+  // finishes (e.g. .o emission), if -fc2go-emit-plan9-asm is set,
+  // run a SECOND codegen pass on a cloned module that uses
+  // OutputAsmVariant=2 to drive AArch64Plan9InstPrinter through
+  // MCPlan9AsmStreamer, writing a Plan 9 syntax .s file alongside
+  // the .o.
+  if (TM && Action == Backend_EmitObj &&
+      CI.getLangOpts().C2GoMode &&
+      !CI.getLangOpts().C2GoEmitPlan9AsmPath.empty()) {
+    RunC2GoPlan9Pipeline();
+  }
 
   if (ThinLinkOS)
     ThinLinkOS->keep();

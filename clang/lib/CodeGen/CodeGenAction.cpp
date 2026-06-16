@@ -8,14 +8,24 @@
 
 #include "clang/CodeGen/CodeGenAction.h"
 #include "BackendConsumer.h"
+#include "CGC2GoManifestHelpers.h"
 #include "CGCall.h"
+#include "llvm/MC/MCPlan9AsmStreamer.h"
 #include "CodeGenModule.h"
 #include "CoverageMappingGen.h"
 #include "MacroPPCallbacks.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/Attr.h"
+#include "clang/AST/C2GoUtil.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclGroup.h"
+#include "clang/AST/RecordLayout.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/JSON.h"
 #include "clang/Basic/DiagnosticFrontend.h"
 #include "clang/Basic/FileManager.h"
 #include "clang/Basic/LangStandard.h"
@@ -29,13 +39,13 @@
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Serialization/ASTWriter.h"
 #include "llvm/ADT/Hashing.h"
-#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/CodeGen/MachineOptimizationRemarkEmitter.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/DiagnosticPrinter.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LLVMRemarkStreamer.h"
@@ -50,6 +60,9 @@
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/ToolOutputFile.h"
+#include "llvm/Transforms/C2Go/C2GoExportName.h"
+#include "llvm/Transforms/C2Go/C2GoGCMaskUtils.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include "llvm/Transforms/IPO/Internalize.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 
@@ -228,6 +241,697 @@ bool BackendConsumer::LinkInModules(llvm::Module *M) {
   return false; // success
 }
 
+// c2go WF2 (#319): the three Go-side spelling helpers (mapC2GoType /
+// buildC2GoGoSig / computeC2GoArgSize) used to live as static helpers in this
+// file's anonymous namespace, only callable from buildC2GoManifest. WF2 needs
+// CodeGenModule::SetLLVMFunctionAttributes to call the same logic so it can
+// stamp go_sig / argsize / go_type as IR attributes that survive into bitcode.
+// The implementations now live in CGC2GoManifestHelpers.{h,cpp}; we keep
+// thin file-local wrappers under the original names so the (many) call sites
+// in buildC2GoManifest don't need touching.
+static std::string c2goMapType(QualType QT, const ASTContext &Ctx,
+                               bool IsUnmanaged = false) {
+  return clang::c2go::mapC2GoType(QT, Ctx, IsUnmanaged);
+}
+
+static std::string c2goBuildGoSig(const FunctionDecl *FD,
+                                  const ASTContext &Ctx) {
+  return clang::c2go::buildC2GoGoSig(FD, Ctx);
+}
+
+static uint64_t c2goComputeArgSize(const FunctionDecl *FD,
+                                   const ASTContext &Ctx) {
+  return clang::c2go::computeC2GoArgSize(FD, Ctx);
+}
+
+// c2go #444 — three Go-export-name spelling helpers
+// (c2goCapitalizeUnderscore / c2goExportGoName / c2goInitMainRenamedSymbol)
+// live in the shared header `llvm/Transforms/C2Go/C2GoExportName.h`, which
+// keeps the WF1 manifest path here, the WF2 fallback path in
+// `llvm/tools/c2go-lto/c2go-lto.cpp`, and the #317 init/main rename
+// emitter in `CodeGenModule.cpp` byte-for-byte in lock-step.
+using llvm::c2go::c2goCapitalizeUnderscore;
+using llvm::c2go::c2goExportGoName;
+using llvm::c2go::c2goInitMainRenamedSymbol;
+
+// c2go §B4 phase 2: collect per-global GC pointer-mask bitmaps emitted
+// by CodeGenModule::emitC2GoGlobalGCMask into a manifest array so
+// c2gobind can stitch them into a synthetic moduledata at runtime
+// init (phase 3 wiring). The IR carries each mask as an internal
+// `@c2go.global.gcmask.<varname>` global of i8 array type; we just
+// re-serialise the constant bytes here.
+//
+// `M` may be nullptr (e.g. when the manifest is built before IR gen
+// completes for some unusual entry point); in that case we silently
+// emit an empty module_gcmask section. The phase-1 IR emission stays
+// the source of truth — phase 2 only surfaces the metadata.
+//
+// #401(b) aux audit cleanup: the body lives in the shared helper
+// `llvm::c2go::collectGCMaskVarsFromModule`
+// (llvm/Transforms/C2Go/C2GoGCMaskUtils.{h,cpp}); the WF2 mirror in
+// llvm/tools/c2go-lto/c2go-lto.cpp delegates to the same helper.
+static llvm::json::Array
+collectC2GoModuleGCMaskVars(const llvm::Module *M) {
+  if (!M)
+    return {};
+  return llvm::c2go::collectGCMaskVarsFromModule(*M);
+}
+
+// c2go: build the sidecar manifest JSON described in c2go_design.md
+// v14 §4.7, consumed by c2gobind to produce Go declarations AND by
+// the in-clang Plan 9 .s emitter (BackendUtil::RunC2GoPlan9Pipeline
+// + MCPlan9AsmStreamer). Always returns the constructed JSON
+// object; the caller decides whether to write it to disk.
+static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
+                                            const LangOptions &LangOpts,
+                                            DiagnosticsEngine &Diags,
+                                            llvm::Module *Mod) {
+  llvm::json::Object Root;
+  Root["pkgpath"] = LangOpts.C2GoPackagePath.empty()
+                       ? "main"
+                       : LangOpts.C2GoPackagePath;
+
+  // Parse "<lo>-<hi>" from -fc2go-target-go-version (default "1.22-1.25").
+  StringRef VerRange = LangOpts.C2GoTargetGoVersion;
+  if (VerRange.empty()) VerRange = "1.22-1.25";
+  auto Dash = VerRange.find('-');
+  StringRef Lo = Dash == StringRef::npos ? VerRange : VerRange.substr(0, Dash);
+  StringRef Hi = Dash == StringRef::npos ? VerRange : VerRange.substr(Dash + 1);
+  Root["min_go_version"] = ("go" + Lo).str();
+  Root["max_go_version"] = ("go" + Hi).str();
+
+  llvm::json::Array Symbols;
+  llvm::json::Array Types;
+
+  // Deduplicate by canonical declaration so a prototype + definition
+  // pair doesn't produce two manifest entries.
+  llvm::DenseSet<const Decl *> Emitted;
+
+  // c2go §A5: queue of c2go-tracked RecordDecls awaiting manifest
+  // emission. Seeded from the TU's top-level decls; the record-emit
+  // path appends any nested anonymous c2go records it finds in fields
+  // so consumers see the synthetic-name types `c2goMapType` references.
+  llvm::SmallVector<const RecordDecl *, 16> RecordWorklist;
+
+  for (const Decl *D : Ctx.getTranslationUnitDecl()->decls()) {
+    if (const auto *FD = dyn_cast<FunctionDecl>(D)) {
+      // Only emit user's c2go_extern symbols. c2go_linkname decls
+      // (e.g. <stdlib.h>'s cmalloc/atoi/...) bind to symbols that
+      // live in c2go-libc; the Go side does not need redeclarations.
+      if (!FD->hasAttr<C2GoExternAttr>())
+        continue;
+      const Decl *Canonical = FD->getCanonicalDecl();
+      if (!Emitted.insert(Canonical).second)
+        continue;
+      // c2go §E1: a c2go_extern function declaration with no body in
+      // any TU declaration chain means "this symbol is implemented by
+      // an external system library (e.g. libsystem_kernel `read`,
+      // libcurl `curl_easy_init`)". The call-site IR still uses GoABI0
+      // because c2gobind generates an ABI0-entry Go wrapper that walks
+      // its frame, packs args into `uintptr` and dispatches through
+      // `c2go-libc/external` (purego SyscallN + dlsym). Mark with a
+      // distinct `kind` so c2gobind picks the wrapper-emit path
+      // instead of treating the symbol as a Plan 9 .s export.
+      const FunctionDecl *DefFD = nullptr;
+      bool HasBody = FD->hasBody(DefFD);
+      llvm::json::Object Sym;
+      std::string CName = FD->getNameAsString();
+      Sym["name"] = CName;
+      Sym["kind"] = HasBody ? "func" : "unmanaged_extern";
+      Sym["go_sig"] = c2goBuildGoSig(FD, Ctx);
+      // c2go (#269): the generated Go function name, casing controlled
+      // by c2go_extern's optional int (1=exported/upper-first default,
+      // 0=keep C casing). When the Go name's case differs from the C
+      // symbol, c2gobind must emit `//go:linkname go_name <pkg>.<cName>`
+      // to bind them.
+      // c2go (#317): C `init`/`main` are renamed at the symbol-emission
+      // level (CodeGenModule::c2goInitMainRename). The manifest's
+      // asm_symbol must reflect the renamed bare symbol so c2gobind's
+      // //go:linkname target (`<pkg>.c2go_cinit` / `c2go_cmain`) lines
+      // up with the actually-emitted Plan 9 symbol. The Go binding name
+      // is fixed to `Init`/`Main` (a normal exported func, UNRELATED to
+      // Go's language-level init/main). Sema guarantees init/main only
+      // reach here with Export==1 (c2go_extern / c2go_extern(1)); the
+      // capitalized form for `init`/`main` happens to be `Init`/`Main`.
+      StringRef RenamedSym = c2goInitMainRenamedSymbol(CName);
+      {
+        int Export = FD->getAttr<C2GoExternAttr>()->getExportCase();
+        std::string GoName = c2goExportGoName(CName, Export);
+        Sym["go_name"] = GoName;
+        // The on-symbol name to link against: the renamed bare symbol for
+        // init/main, else the C name.
+        StringRef LinkBase = RenamedSym.empty() ? StringRef(CName) : RenamedSym;
+        if (GoName != LinkBase)
+          Sym["needs_linkname"] = true;
+        // c2go (#317): mark the program-entry main so c2gobind emits the
+        // `func main()` wrapper (only when generating `package main`).
+        // `init` is NOT an entry; c2gobind must never synthesise a
+        // `func init()` for it.
+        if (CName == "main") {
+          Sym["c_entry"] = true;
+          // Entry signature variant, so the wrapper marshals argc/argv/
+          // envp correctly. Distinguish by parameter count (the c2go ABI
+          // only allows int/char**/char** here).
+          unsigned NParams = FD->getNumParams();
+          if (NParams == 0)
+            Sym["entry_sig"] = "void";
+          else if (NParams == 2)
+            Sym["entry_sig"] = "argc_argv";
+          else if (NParams == 3)
+            Sym["entry_sig"] = "argc_argv_envp";
+          else
+            Sym["entry_sig"] = "unknown";
+        }
+      }
+      Sym["managed"] = !FD->hasAttr<C2GoUnmanagedAttr>();
+      Sym["abi"] = "abi0";
+      Sym["asm_symbol"] =
+          "\xc2\xb7" + (RenamedSym.empty() ? FD->getNameAsString()
+                                           : RenamedSym.str()); // U+00B7
+      // ABI0 frame size — Go assembler validates `$0-<argsize>`. This
+      // is the precise count from AST type sizes; c2go-plan9asm uses
+      // it directly instead of parsing the sig string.
+      Sym["argsize"] = (int64_t)c2goComputeArgSize(FD, Ctx);
+      // c2go §E phase 2: surface variadic / float-arg / aggregate-by-
+      // value bits so c2gobind can pick the right wrapper template for
+      // unmanaged_extern targets. Variadic is implemented (printf-style
+      // dispatch via SyscallN); the other two are recorded so c2gobind
+      // can emit a structured panic stub instead of producing broken
+      // wrappers. Booleans are written only when true to keep the
+      // sidecar JSON diff small for the common scalar/pointer case.
+      if (FD->isVariadic())
+        Sym["is_variadic"] = true;
+      {
+        // Detect floating-point and aggregate-by-value slots. Anything
+        // that the Itanium / AAPCS ABI would route through FP / SIMD
+        // registers (float, double, long double, _Complex, _Float16,
+        // vectors) needs out-of-band handling because SyscallN treats
+        // every uintptr slot as an integer-class register. Aggregate-
+        // by-value (struct / union by value) is rejected outright: the
+        // ABI decomposes the value into multiple register / stack
+        // slots in a target-specific way, which c2gobind cannot
+        // synthesise from the manifest alone.
+        bool HasFloat = false;
+        bool HasAggregate = false;
+        auto Check = [&](QualType QT) {
+          QT = QT.getCanonicalType();
+          if (QT->isVoidType()) return;
+          if (QT->isFloatingType() || QT->isAnyComplexType() ||
+              QT->isVectorType())
+            HasFloat = true;
+          if (QT->isRecordType())
+            HasAggregate = true;
+        };
+        for (auto *PVD : FD->parameters())
+          Check(PVD->getType());
+        Check(FD->getReturnType());
+        if (HasFloat)
+          Sym["has_float"] = true;
+        if (HasAggregate)
+          Sym["has_aggregate"] = true;
+      }
+      (void)DefFD;
+      // c2go WF2 (#367 Bug A): mirror the just-built JSON symbols[]
+      // entry into a `c2go.func.<CName>` NamedMD so c2go-lto can rebuild
+      // the same 14 fields from combined bitcode byte-identically — the
+      // per-function string attrs alone only cover c-name / go-sig /
+      // unmanaged-return (3 of 14 fields), which is why prior reader
+      // output silently dropped go_name / asm_symbol / argsize etc.
+      if (Mod)
+        clang::c2go::emitC2GoFuncManifest(*Mod, CName, Sym);
+      Symbols.push_back(std::move(Sym));
+    } else if (const auto *VD = dyn_cast<VarDecl>(D)) {
+      if (!VD->hasAttr<C2GoExternAttr>())
+        continue;
+      const Decl *Canonical = VD->getCanonicalDecl();
+      if (!Emitted.insert(Canonical).second)
+        continue;
+      bool Unmanaged = VD->hasAttr<C2GoUnmanagedAttr>();
+      llvm::json::Object Sym;
+      Sym["name"] = VD->getNameAsString();
+      Sym["kind"] = "var";
+      Sym["go_type"] = c2goMapType(VD->getType(), Ctx, Unmanaged);
+      Sym["managed"] = !Unmanaged;
+      Sym["abi"] = "abi0";
+      Sym["asm_symbol"] = "\xc2\xb7" + VD->getNameAsString();
+      Symbols.push_back(std::move(Sym));
+    } else if (const auto *RD = dyn_cast<RecordDecl>(D)) {
+      // c2go §A5: defer record emission to the worklist below so the
+      // emit path can recurse into nested anonymous c2go records (the
+      // §A3-promoted ones that don't appear at TU level) and produce
+      // matching manifest entries for them.
+      if (!RD->hasAttr<C2GoStructAttr>())
+        continue;
+      const RecordDecl *Def = RD->getDefinition();
+      if (!Def)
+        continue;
+      RecordWorklist.push_back(Def);
+    }
+  }
+
+  // #227: scan the emitted LLVM Module for `@c2go.typeinfo.<X>` globals
+  // (emitted by CGC2GoTypeInfo) and ensure each X has a corresponding
+  // RecordDecl in the worklist. Without this, anonymous records that
+  // clang synthesised on-the-fly (e.g. through composite-literal codegen)
+  // may have a typeinfo global but no manifest entry — c2gobind would
+  // see a dangling `_typeinfo_<X>` reference. Resolve by looking up the
+  // synthetic record by name in the AST's anonymous-record registry.
+  if (Mod) {
+    for (const llvm::GlobalVariable &GV : Mod->globals()) {
+      StringRef Name = GV.getName();
+      if (!Name.consume_front(llvm::c2go::kTypeinfoGVPrefix))
+        continue;
+      // Find a RecordDecl by stable name. c2go.anon.<hash> records are
+      // synthesised; their stable name is keyed on spelling location.
+      // The simplest re-resolution path is to walk the TU again and
+      // match getStableRecordName(RD) == Name. This is O(N²) worst-case
+      // but only runs once at end-of-codegen for the small set of
+      // c2go-tracked records.
+      bool Found = false;
+      std::function<bool(const DeclContext *)> Walk =
+          [&](const DeclContext *DC) -> bool {
+        for (const Decl *D : DC->decls()) {
+          if (const auto *RD = dyn_cast<RecordDecl>(D)) {
+            const RecordDecl *Def = RD->getDefinition();
+            if (Def && Def->hasAttr<C2GoStructAttr>()) {
+              std::string SN = c2go::getStableRecordName(Def, Ctx);
+              if (SN == Name) {
+                if (!Emitted.count(Def->getCanonicalDecl()))
+                  RecordWorklist.push_back(Def);
+                return true;
+              }
+            }
+          }
+          if (const auto *NDC = dyn_cast<DeclContext>(D))
+            if (Walk(NDC))
+              return true;
+        }
+        return false;
+      };
+      Found = Walk(Ctx.getTranslationUnitDecl());
+      (void)Found; // diagnostic emit deferred; c2gobind nil-fallback handles it
+    }
+  }
+
+  // c2go §A5: drain the record worklist. Each emit may append to the
+  // worklist (nested anonymous c2go records), so use index iteration.
+  for (size_t WI = 0; WI < RecordWorklist.size(); ++WI) {
+    const RecordDecl *RD = RecordWorklist[WI];
+    {
+      const Decl *Canonical = RD->getCanonicalDecl();
+      if (!Emitted.insert(Canonical).second)
+        continue;
+
+      // Resolve a usable Go type name. c2go §A3: anonymous records that
+      // survived AddPragmaC2GoAttribute carry a managed pointer (Sema
+      // already filtered out the pure-scalar tables), so we *do* need a
+      // stable name for them — for the typeinfo global, the elem-type
+      // metadata, and the Go-binding emission. `getStableRecordName`
+      // returns:
+      //   * the record's own name when present,
+      //   * the typedef name (`typedef struct { ... } T;`) otherwise,
+      //   * else a synthesized `c2go.anon.<hash>` keyed on the spelling
+      //     location, identical across TUs that include the same header.
+      std::string TypeName = c2go::getStableRecordName(RD, Ctx);
+      if (TypeName.empty())
+        continue; // defensive — should not happen post-§A3
+
+      std::string GoDef;
+      // c2go §A5: per-record manifest metadata to surface alongside
+      // GoDef so c2gobind can pick a generation strategy without
+      // re-parsing the GoDef body. Defaults match the "C-owner,
+      // non-anonymous, not-a-union" common case; the branches below
+      // override the fields they care about.
+      c2go::C2GoUnionClassification UnionClass;
+      bool IsUnion = RD->isUnion();
+      // §3.9 / T3 — a `c2go_variant` union is converted to a struct whose
+      // slots are partitioned by GC class (pointer slots first as
+      // `unsafe.Pointer`, then one trailing no-scan `[N]uint8` blob). This
+      // makes the pointer slots precisely scannable and bypasses the Scheme2
+      // hard error below (which the un-opted-in punning union still gets).
+      bool IsVariant = IsUnion && c2go::isC2GoVariantUnion(RD);
+      if (IsVariant) {
+        auto VL = c2go::computeC2GoVariantLayout(RD, Ctx);
+        GoDef = "struct {\n";
+        if (VL.AlignBytes >= 8)
+          GoDef += "\t_align [0]uint64\n";
+        else if (VL.AlignBytes >= 4)
+          GoDef += "\t_align [0]uint32\n";
+        else if (VL.AlignBytes >= 2)
+          GoDef += "\t_align [0]uint16\n";
+        unsigned PtrNo = 0;
+        for (const auto &Slot : VL.Slots) {
+          if (Slot.Kind == c2go::C2GoVariantSlot::Kind::Ptr)
+            GoDef += "\t_p" + std::to_string(PtrNo++) +
+                     " unsafe.Pointer // c2go_variant ptr slot\n";
+          else
+            GoDef += "\t_blob [" + std::to_string(Slot.SizeBytes) +
+                     "]uint8 // c2go_variant scalar/funcptr slot\n";
+        }
+        GoDef += "}";
+      } else if (IsUnion) {
+        // c2go §A4 / §3.9: pick a representation scheme automatically.
+        //
+        //   * Scheme1 — every scanned-pointer alternative lives at the
+        //     same byte offset N and no scalar alternative overlaps
+        //     that offset. Emit opaque storage; CGC2GoTypeInfo sets one
+        //     bit at offset N in the GC bitmap so Go's GC scans the
+        //     pointer slot precisely. No diagnostic — the union is
+        //     exactly representable.
+        //
+        //   * Scheme2 — a scanned pointer type-puns a scalar, or scan
+        //     pointers live at multiple offsets. A single static bitmap
+        //     cannot encode this → HARD ERROR (see below). The old
+        //     "any-subtype box" fallback is deleted.
+        //
+        //   * NotApplicable — no scanned-pointer alternative at all.
+        //     The union is a plain opaque slab from the GC's point of
+        //     view; nothing to encode.
+        UnionClass = c2go::classifyC2GoUnion(RD, Ctx);
+        auto &Class = UnionClass;
+        if (Class.Scheme == c2go::C2GoUnionScheme::Scheme2) {
+          // 2026-06-16 (§3.9): a union that type-puns a SCANNED pointer
+          // slot with a scalar (or places scan pointers at >1 offset)
+          // cannot be represented as a static GC bitmap. Under the new
+          // force-scan model the pointer slot WOULD be scanned, so a
+          // scalar alias at the same bytes feeds garbage to Go's GC and
+          // trips `invalidptr`. This is a HARD ERROR (the old "scheme2 →
+          // Go-any box" fallback is deleted). The fix is one of: split
+          // the alternatives so the pointer lives in its own pure slot,
+          // change the punned pointer member to `uintptr_t` (no-scan), or
+          // opt the union in to `__attribute__((c2go_variant))` (T3
+          // convert-to-struct — separate feature).
+          Diags.Report(RD->getLocation(),
+                       Diags.getCustomDiagID(
+                           DiagnosticsEngine::Error,
+                           "c2go: union %0 type-puns a scanned pointer slot "
+                           "(%1, blocker=%2); a static GC bitmap cannot "
+                           "encode it. Give the pointer its own pure slot, "
+                           "change the punned member to uintptr_t, or mark "
+                           "the union __attribute__((c2go_variant))"))
+              << TypeName << Class.BlockerReason << Class.BlockerFieldName;
+          continue;
+        }
+        // Scheme1 / NotApplicable: the union's typeinfo bitmap will
+        // encode the precise pointer slot (Scheme1) or be empty
+        // (NotApplicable). Scheme2 already errored out above.
+        const ASTRecordLayout &Layout = Ctx.getASTRecordLayout(RD);
+        uint64_t SizeBytes = Layout.getSize().getQuantity();
+        uint64_t AlignBytes = Layout.getAlignment().getQuantity();
+        // Use exact byte storage so size matches C; rely on a trailing
+        // alignment hint via [N]uintN where N matches the C alignment.
+        // For simplicity emit "[size]byte" — Go arrays of byte have
+        // alignment 1, so callers may need to add their own
+        // explicit-alignment field. For records whose C alignment is
+        // > 1 we prepend an alignment marker field.
+        GoDef = "struct {\n";
+        if (AlignBytes >= 8) {
+          GoDef += "\t_align [0]uint64\n";
+        } else if (AlignBytes >= 4) {
+          GoDef += "\t_align [0]uint32\n";
+        } else if (AlignBytes >= 2) {
+          GoDef += "\t_align [0]uint16\n";
+        }
+        GoDef += "\t_storage [" + std::to_string(SizeBytes) +
+                 "]byte // C union\n}";
+      } else {
+        // Build a real Go struct definition by walking fields. v0 maps
+        // primitive types and pointers; complex cases (arrays beyond
+        // simple element types, bitfields, flex-array members) fall
+        // through to "uintptr" placeholders — c2gobind cannot refine
+        // them without further sidecar metadata.
+        GoDef = "struct {\n";
+        for (const FieldDecl *F : RD->fields()) {
+          std::string FName = F->getNameAsString();
+          if (FName.empty()) FName = "_";
+          QualType FT = F->getType().getCanonicalType();
+          if (F->isBitField()) {
+            Diags.Report(F->getLocation(),
+                         Diags.getCustomDiagID(
+                             DiagnosticsEngine::Warning,
+                             "c2go: bitfield %0 in c2go_struct %1 is "
+                             "exported as an opaque uintptr — the Go "
+                             "side cannot access it correctly"))
+                << FName << TypeName;
+          } else if (FT->isIncompleteArrayType()) {
+            // Flexible array member (`T arr[];`). v0 maps to uintptr
+            // placeholder; Go side cannot reach the trailing storage.
+            // Use a separate allocation + pointer field instead.
+            Diags.Report(F->getLocation(),
+                         Diags.getCustomDiagID(
+                             DiagnosticsEngine::Warning,
+                             "c2go: flexible-array member %0 in "
+                             "c2go_struct %1 is exported as opaque "
+                             "uintptr — the trailing storage is not "
+                             "visible to Go; restructure as an "
+                             "explicit pointer + length pair"))
+                << FName << TypeName;
+          } else if (FT->isFunctionPointerType()) {
+            // Function pointer field. v0 cannot translate the
+            // callee's signature to a Go func type without further
+            // metadata; emit a uintptr placeholder.
+            Diags.Report(F->getLocation(),
+                         Diags.getCustomDiagID(
+                             DiagnosticsEngine::Warning,
+                             "c2go: function-pointer field %0 in "
+                             "c2go_struct %1 is exported as opaque "
+                             "uintptr — Go side cannot call through "
+                             "it directly; wrap the call in a c2go_"
+                             "extern shim"))
+                << FName << TypeName;
+          }
+          bool FieldUnmanaged = F->hasAttr<C2GoUnmanagedAttr>() ||
+                                RD->hasAttr<C2GoUnmanagedAttr>();
+          std::string T = c2goMapType(F->getType(), Ctx, FieldUnmanaged);
+          GoDef += "\t" + FName + " " + T + "\n";
+
+          // c2go §A5: surface any nested c2go-tracked record reachable
+          // through this field (either directly, or via a pointer) so
+          // the worklist visits it. Without this, an anonymous nested
+          // struct that §A3 promoted to c2go-tracked would be referenced
+          // in GoDef by its synthetic `c2go.anon.<hash>` name but never
+          // appear as its own manifest entry — c2gobind would see a
+          // dangling type reference.
+          QualType FieldType = F->getType().getCanonicalType();
+          while (FieldType->isPointerType())
+            FieldType = FieldType->getPointeeType().getCanonicalType();
+          if (const RecordType *NRT = FieldType->getAs<RecordType>()) {
+            if (RecordDecl *Nested = NRT->getDecl()) {
+              // §3.9 / T3: a `c2go_variant` union field references a converted
+              // struct named after the union (e.g. `v V`). Surface it as its
+              // own manifest entry too, otherwise c2gobind sees a dangling
+              // `V` type reference.
+              if (Nested->hasAttr<C2GoStructAttr>() ||
+                  c2go::isC2GoVariantUnion(Nested)) {
+                if (const RecordDecl *NDef = Nested->getDefinition()) {
+                  if (!Emitted.count(NDef->getCanonicalDecl()))
+                    RecordWorklist.push_back(NDef);
+                }
+              }
+            }
+          }
+        }
+        GoDef += "}";
+      }
+
+      // c2go WF2 (#319 C4a): stamp the serialized Go struct text onto the
+      // module as `c2go.struct.<X>.godef` so c2go-lto can recover the
+      // `types[].go_def` field directly from combined bitcode without
+      // re-running this AST walk. CodeGenModule::Release emitted the
+      // sibling `.meta` (managed/scheme/ptr_offset/linkname) earlier; the
+      // two NamedMDs together fully describe the record's manifest entry.
+      if (Mod && !GoDef.empty()) {
+        clang::c2go::emitC2GoStructGoDef(*const_cast<llvm::Module *>(Mod), RD,
+                                         Ctx, GoDef);
+      }
+
+      llvm::json::Object Ty;
+      Ty["name"] = TypeName;
+      Ty["go_def"] = GoDef;
+      Ty["managed_record"] = !RD->hasAttr<C2GoUnmanagedAttr>();
+
+      // c2go §A5 — manifest protocol extension. These fields are
+      // additive: legacy c2gobind versions ignoring unknown JSON keys
+      // continue to behave as before; c2gobind v0.2+ uses them to
+      // decide:
+      //   * Whether to emit a Go-side `type X struct {...}` (C-owner)
+      //     or skip and import the Go-owner declaration verbatim
+      //     (e.g. `c2go_libc.FILE`).
+      //   * Whether the record's manifest name is a synthesized
+      //     `c2go.anon.<hash>` (§A3) so the binding can pick an
+      //     emission style that doesn't collide with user-typed names.
+      //   * The union representation scheme picked by §A4 so the
+      //     binding can emit a precise GC bitmap hint (scheme1) or
+      //     defer to opaque storage (not_applicable / scheme2).
+
+      // (1) linkage owner: defaults to C-owner. A c2go_linkname on the
+      // record means the canonical Go-side declaration lives in
+      // another Go package; c2gobind must NOT redeclare it.
+      if (const auto *LN = RD->getAttr<C2GoLinknameAttr>()) {
+        Ty["linkage_owner"] = "go";
+        Ty["linkname"] = LN->getName().str();
+      } else {
+        Ty["linkage_owner"] = "c";
+      }
+
+      // (2) anonymous synthetic name: only set when the record has no
+      // source identifier of its own (true anonymous, no surrounding
+      // typedef-name either). §A3's getStableRecordName returned a
+      // synthesized `c2go.anon.<hash>` which is already the value of
+      // `name`; we mirror it here so the consumer doesn't need to
+      // pattern-match the prefix.
+      if (!RD->getIdentifier() && !RD->getTypedefNameForAnonDecl())
+        Ty["anon_synthetic_name"] = TypeName;
+
+      // (3) union scheme classification (§A4). Non-unions: omit the
+      // field entirely so JSON stays tight; c2gobind treats
+      // missing-key as "not_applicable / not a union".
+      if (IsVariant) {
+        // §3.9 / T3 — convert-to-struct: GoDef already carries the precise
+        // partitioned struct; c2gobind just emits it verbatim. The bitmap is
+        // exact (pointer slots scan, blob no-scan) so no scheme hint is needed
+        // beyond the explicit "variant" marker.
+        Ty["union_scheme"] = "variant";
+      } else if (IsUnion) {
+        const char *SchemeStr = "not_applicable";
+        switch (UnionClass.Scheme) {
+        case c2go::C2GoUnionScheme::Scheme1:
+          SchemeStr = "scheme1";
+          break;
+        case c2go::C2GoUnionScheme::Scheme2:
+          SchemeStr = "scheme2";
+          break;
+        case c2go::C2GoUnionScheme::NotApplicable:
+          SchemeStr = "not_applicable";
+          break;
+        }
+        Ty["union_scheme"] = SchemeStr;
+        if (UnionClass.Scheme == c2go::C2GoUnionScheme::Scheme1)
+          Ty["union_ptr_offset"] = (int64_t)UnionClass.PointerOffsetBytes;
+        // Scheme2 errored out earlier; only Scheme1 / NotApplicable
+        // reach here, so there are no per-alternative subtypes to emit.
+      }
+
+      Types.push_back(std::move(Ty));
+    }
+  }
+
+  // Phase H3: emit deterministically so c2go-ar / c2gobind can merge
+  // sidecars by literal compare. Sort symbols and types by their
+  // "name" field; the JSON key order inside each entry is already
+  // determined by json::Object's stable iteration.
+  auto byName = [](const llvm::json::Value &A, const llvm::json::Value &B) {
+    const auto *AO = A.getAsObject();
+    const auto *BO = B.getAsObject();
+    StringRef AN = AO ? AO->getString("name").value_or("") : "";
+    StringRef BN = BO ? BO->getString("name").value_or("") : "";
+    return AN < BN;
+  };
+  llvm::sort(Symbols, byName);
+  llvm::sort(Types, byName);
+
+  // Path-(b) linkname bridges: scan c2go_linkname attributes whose
+  // target Go symbol path contains characters Plan 9 assembler can't
+  // represent (primarily `-`). For these, the .s emit produces a
+  // sanitised current-pkg local symbol; c2gobind reads the bridges
+  // here and emits `//go:linkname <local> <raw>` declarations in
+  // the consumer Go package, so the Go linker can resolve the raw
+  // cross-pkg target via Go's linkname mechanism.
+  //
+  // Targets with no `-` go through path (a) — .s emits the raw path
+  // directly with Unicode substitutes (·/∕), no Go-side bridge
+  // needed — so they don't appear here.
+  auto sanitiseToIdent = [](std::string S) {
+    for (char &C : S) {
+      if ((C >= 'A' && C <= 'Z') || (C >= 'a' && C <= 'z') ||
+          (C >= '0' && C <= '9') || C == '_')
+        continue;
+      C = '_';
+    }
+    return S;
+  };
+
+  llvm::json::Array Linknames;
+  llvm::DenseSet<const Decl *> LinknameEmitted;
+  for (const Decl *D : Ctx.getTranslationUnitDecl()->decls()) {
+    const auto *LA = D->getAttr<C2GoLinknameAttr>();
+    if (!LA) continue;
+    StringRef Target = LA->getName();
+    // #274: route to path (b) (//go:linkname bridge in generated .go) when the
+    // raw Go target contains ANY character the Plan 9 assembler can't carry in
+    // a `·name(SB)` symbol — i.e. anything outside [A-Za-z0-9_/.] (the dotted
+    // package-path form transforms `/`→`∕`, `.`→`·`, but cannot represent
+    // `-` (hyphenated paths) or method symbols' `(`,`*`,`)`). Path (a) burns
+    // the symbol directly into the .s, so only fully-transformable targets may
+    // take it; everything else needs the clean-alias bridge.
+    auto plan9Direct = [](StringRef T) {
+      for (char C : T)
+        if (!(std::isalnum((unsigned char)C) || C == '_' || C == '/' ||
+              C == '.'))
+          return false;
+      return true;
+    };
+    if (plan9Direct(Target)) continue; // path (a), nothing to bridge
+    const Decl *Canonical = D->getCanonicalDecl();
+    if (!LinknameEmitted.insert(Canonical).second) continue;
+
+    llvm::json::Object Bridge;
+    if (const auto *FD = dyn_cast<FunctionDecl>(D)) {
+      Bridge["name"] = FD->getNameAsString();
+      Bridge["kind"] = "func";
+      Bridge["go_sig"] = c2goBuildGoSig(FD, Ctx);
+    } else if (const auto *VD = dyn_cast<VarDecl>(D)) {
+      bool Unmanaged = VD->hasAttr<C2GoUnmanagedAttr>();
+      Bridge["name"] = VD->getNameAsString();
+      Bridge["kind"] = "var";
+      Bridge["go_type"] = c2goMapType(VD->getType(), Ctx, Unmanaged);
+    } else {
+      continue;
+    }
+    Bridge["linkname"] = Target.str();
+    Bridge["asm_symbol"] = "\xc2\xb7" + sanitiseToIdent(Target.str());
+    Linknames.push_back(std::move(Bridge));
+  }
+  llvm::sort(Linknames, byName);
+
+  Root["symbols"] = std::move(Symbols);
+  Root["types"] = std::move(Types);
+  Root["linknames"] = std::move(Linknames);
+
+  // c2go §B4 phase 2: surface the per-global GC pointer-mask bitmaps
+  // emitted by CodeGenModule::emitC2GoGlobalGCMask. c2gobind reads this
+  // section to build a Go-side data table that phase 3 will register as
+  // a synthetic moduledata entry on `runtime.activeModules()`. Always
+  // emit the section (even when empty) so consumers can distinguish
+  // "no managed globals in this TU" from "older clang that doesn't
+  // know about §B4".
+  {
+    llvm::json::Object ModGC;
+    ModGC["vars"] = collectC2GoModuleGCMaskVars(Mod);
+    Root["module_gcmask"] = std::move(ModGC);
+  }
+  return Root;
+}
+
+// writeC2GoManifest serializes the prebuilt manifest to `OutPath`.
+static void writeC2GoManifest(const llvm::json::Object &Root,
+                              StringRef OutPath, DiagnosticsEngine &Diags) {
+  std::error_code EC;
+  llvm::raw_fd_ostream OS(OutPath, EC);
+  if (EC) {
+    Diags.Report(diag::err_fe_error_opening) << OutPath << EC.message();
+    return;
+  }
+  // formatv requires a non-const Value, so copy. Watch out for:
+  //   * `Value V(Object(Root))` — most-vexing-parse, becomes a fn decl.
+  //   * `Value V{Object(Root)}` — matches Value's initializer-list
+  //     constructor, producing a JSON ARRAY containing one element.
+  // Solution: name the temporary explicitly.
+  llvm::json::Object Copy(Root);
+  llvm::json::Value V(std::move(Copy));
+  OS << llvm::formatv("{0:2}", V) << "\n";
+}
+
 void BackendConsumer::HandleTranslationUnit(ASTContext &C) {
   {
     llvm::TimeTraceScope TimeScope("Frontend");
@@ -239,6 +943,24 @@ void BackendConsumer::HandleTranslationUnit(ASTContext &C) {
 
     if (TimerIsEnabled && !--LLVMIRGenerationRefCount)
       LLVMIRGeneration.yieldTo(CI.getFrontendTimer());
+  }
+
+  // c2go: build the sidecar manifest JSON while the AST is still live
+  // (ClearASTBeforeBackend wipes it below). Keep the object alive so
+  // the Plan 9 emit pass at the end of HandleTranslationUnit can use
+  // it.
+  llvm::json::Object C2GoManifest;
+  bool C2GoManifestBuilt = false;
+  if (CI.getLangOpts().C2GoMode) {
+    // §B4 phase 2: pass the LLVM module so buildC2GoManifest can
+    // scoop up the `@c2go.global.gcmask.<var>` bitmaps emitted by
+    // CodeGenModule::emitC2GoGlobalGCMask into the manifest's
+    // `module_gcmask` section.
+    C2GoManifest = buildC2GoManifest(C, CI.getLangOpts(), Diags, getModule());
+    C2GoManifestBuilt = true;
+    if (!CI.getLangOpts().C2GoEmitManifestPath.empty())
+      writeC2GoManifest(C2GoManifest,
+                        CI.getLangOpts().C2GoEmitManifestPath, Diags);
   }
 
   // Silently ignore if we weren't initialized for some reason.
@@ -306,6 +1028,65 @@ void BackendConsumer::HandleTranslationUnit(ASTContext &C) {
   }
 
   EmbedBitcode(getModule(), CodeGenOpts, llvm::MemoryBufferRef());
+
+  // c2go Phase E v0+1 step 4 (#95), #376: enqueue boundary-symbol metadata
+  // (kind=func) onto MCPlan9AsmStreamer's thread_local pending queue. The
+  // streamer constructor (inside emitBackendOutput below) drains the queue
+  // into its per-instance C2GoFnMeta. emitLabel can then emit the correct
+  // `TEXT … $0-argsize` directive for each c2go_extern. We always set
+  // framesize=0 (NOFRAME — the c2go arm64 prologue manages its own frame
+  // explicitly). RAII drain via scope_exit so a thrown emitBackendOutput
+  // doesn't leak metadata into the next call.
+  auto ClearMetadataGuard = llvm::make_scope_exit([&] {
+    if (C2GoManifestBuilt &&
+        !CI.getLangOpts().C2GoEmitPlan9AsmPath.empty()) {
+      (void)llvm::MCPlan9AsmStreamer::drainPendingC2GoBoundaries();
+      // c2go #387: defensive drain in case emitBackendOutput threw
+      // before constructing the streamer.
+      (void)llvm::MCPlan9AsmStreamer::drainPendingC2GoGoOwnedGlobals();
+    }
+  });
+  if (C2GoManifestBuilt &&
+      !CI.getLangOpts().C2GoEmitPlan9AsmPath.empty()) {
+    // Drain any stale entries first (defensive — should be empty here).
+    (void)llvm::MCPlan9AsmStreamer::drainPendingC2GoBoundaries();
+    (void)llvm::MCPlan9AsmStreamer::drainPendingC2GoGoOwnedGlobals();
+    if (const llvm::json::Array *Symbols =
+            C2GoManifest.getArray("symbols")) {
+      for (const llvm::json::Value &SV : *Symbols) {
+        const llvm::json::Object *S = SV.getAsObject();
+        if (!S) continue;
+        std::optional<llvm::StringRef> Kind = S->getString("kind");
+        if (!Kind || *Kind != "func") continue;
+        std::optional<llvm::StringRef> Name = S->getString("name");
+        if (!Name) continue;
+        int64_t ArgSize = S->getInteger("argsize").value_or(0);
+        llvm::C2GoFunctionMetadata M;
+        M.Name = std::string(*Name);
+        M.FrameSize = 0;
+        M.ArgSize = (int)ArgSize;
+        llvm::MCPlan9AsmStreamer::enqueueC2GoBoundary(std::move(M));
+      }
+    }
+    // c2go #387 §B4 phase 6 sub-step 1: enqueue every Go-owned global
+    // name from the manifest's module_gcmask section so the streamer
+    // skips its GLOBL trailer. Names emitted at sub-step 1 are bare C
+    // identifiers (e.g. "gRing"); the streamer matches them against
+    // the bare suffix of the rendered Plan 9 symbol ("·gRing").
+    if (const llvm::json::Object *MG = C2GoManifest.getObject("module_gcmask")) {
+      if (const llvm::json::Array *Vars = MG->getArray("vars")) {
+        for (const llvm::json::Value &VV : *Vars) {
+          const llvm::json::Object *V = VV.getAsObject();
+          if (!V) continue;
+          std::optional<bool> GoOwned = V->getBoolean("go_owned");
+          if (!GoOwned || !*GoOwned) continue;
+          std::optional<llvm::StringRef> NameSR = V->getString("name");
+          if (!NameSR) continue;
+          llvm::MCPlan9AsmStreamer::enqueueC2GoGoOwnedGlobal(*NameSR);
+        }
+      }
+    }
+  }
 
   emitBackendOutput(CI, CI.getCodeGenOpts(),
                     C.getTargetInfo().getDataLayoutString(), getModule(),

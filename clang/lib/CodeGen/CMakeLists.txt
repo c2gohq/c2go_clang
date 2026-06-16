@@ -3,6 +3,7 @@ set(LLVM_LINK_COMPONENTS
   Analysis
   BitReader
   BitWriter
+  C2Go
   CodeGenTypes
   Core
   Coroutines
@@ -62,6 +63,8 @@ add_clang_library(clangCodeGen
   CGAtomic.cpp
   CGBlocks.cpp
   CGBuiltin.cpp
+  CGC2GoManifestHelpers.cpp
+  CGC2GoTypeInfo.cpp
   CGCUDANV.cpp
   CGCUDARuntime.cpp
   CGCXX.cpp
