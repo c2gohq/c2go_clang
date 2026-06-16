@@ -17,6 +17,7 @@ add_llvm_component_library(LLVMPasses
   AggressiveInstCombine
   Analysis
   CFGuard
+  C2Go
   CodeGen
   GlobalISel
   Core
