@@ -27,9 +27,11 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/BinaryFormat/COFF.h"
 #include "llvm/BinaryFormat/ELF.h"
@@ -37,6 +39,7 @@
 #include "llvm/CodeGen/AsmPrinter.h"
 #include "llvm/CodeGen/FaultMaps.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineJumpTableInfo.h"
@@ -44,21 +47,28 @@
 #include "llvm/CodeGen/MachineOperand.h"
 #include "llvm/CodeGen/StackMaps.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Mangler.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCInstBuilder.h"
+#include "llvm/MC/MCPlan9AsmStreamer.h"
 #include "llvm/MC/MCSectionELF.h"
 #include "llvm/MC/MCSectionMachO.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/MC/MCValue.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/Support/C2GoEmergencyFlag.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Compiler.h"
@@ -66,6 +76,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include "llvm/Transforms/Instrumentation/HWAddressSanitizer.h"
 #include <cassert>
 #include <cstdint>
@@ -91,6 +102,21 @@ static cl::opt<PtrauthCheckMode> PtrauthAuthChecks(
     cl::desc("Check pointer authentication auth/resign failures"),
     cl::init(Default));
 
+// c2go #284 (S5): gate emission of FUNCDATA $2 (per-function stack-objects
+// table). Default OFF: the existing Approach B摊平 path (`c2goExpandDirect-
+// AllocaFields` field-fanout into FUNCDATA $1) remains the sole GC root
+// reporter — 900/900 SQLite-robust. ON: also collect alloca→StkObjEntry and
+// publish to the Plan 9 streamer; the FUNCDATA $1 摊平 is left intact (real
+// tightening of $1 is deferred until S6 stale-field probe + SQLite 6×150
+// GOGC=1 stress regression certifies equivalence). The flag therefore opts
+// in to *additional* emit only — zero behavior change for default OFF.
+// See docs/c2go_design.md §4.10.4.2 S5.
+static cl::opt<bool> C2GoFuncData2(
+    "c2go-funcdata2", cl::Hidden,
+    cl::desc("c2go #284: emit FUNCDATA $2 (stack-objects table). Default OFF; "
+             "default ON awaits S6 stale-field probe + SQLite stress soak."),
+    cl::init(false));
+
 namespace {
 
 class AArch64AsmPrinter : public AsmPrinter {
@@ -105,6 +131,20 @@ class AArch64AsmPrinter : public AsmPrinter {
   DenseMap<MCSection *, std::vector<std::pair<MCSymbol *, MCSymbol *>>>
       SectionToImportedFunctionCalls;
   unsigned PAuthIFuncNextUniqueID = 1;
+
+  // c2go #284 S2.2: per-function FUNCDATA $2 stkobj accumulator. Populated
+  // by LowerSTATEPOINT for Direct(SP, off) locations whose owning alloca is
+  // a structured pointer-bearing type with a known `c2go.gcbitmap.<X>`
+  // symbol. Cleared in emitFunctionBodyStart / published in
+  // emitFunctionBodyEnd (publishC2GoStackObjects). Keyed by alloca pointer
+  // for cross-statepoint dedup. Only used when `-c2go-funcdata2` is ON;
+  // otherwise stays empty (zero cost).
+  SmallSetVector<const AllocaInst *, 8> C2GoStkObjSeen;
+  SmallVector<StkObjEntry, 8> C2GoStkObjEntries;
+
+  // Helper: publish (and clear) the accumulator to MCPlan9AsmStreamer.
+  // Called from emitFunctionBodyEnd; no-op when accumulator is empty.
+  void publishC2GoStackObjects();
 
 public:
   static char ID;
@@ -286,7 +326,11 @@ public:
 
     SetupMachineFunction(MF);
 
-    if (STI->isTargetCOFF()) {
+    // c2go: the Plan 9 (.s) output is a system-independent Go-assembler
+    // text stream; per-function COFF symbol-table records have no Plan 9
+    // equivalent and would crash the non-COFF Plan 9 streamer. Skip them
+    // when emitting Plan 9 (see emitStartOfAsmFile / emitEndOfAsmFile).
+    if (STI->isTargetCOFF() && !OutStreamer->isPlan9AsmStreamer()) {
       bool Local = MF.getFunction().hasLocalLinkage();
       COFF::SymbolStorageClass Scl =
           Local ? COFF::IMAGE_SYM_CLASS_STATIC : COFF::IMAGE_SYM_CLASS_EXTERNAL;
@@ -377,6 +421,13 @@ private:
 } // end anonymous namespace
 
 void AArch64AsmPrinter::emitStartOfAsmFile(Module &M) {
+  // c2go: the Plan 9 (.s) output is independent of the host object format;
+  // everything here is COFF feature symbols / ELF build-attribute + GNU
+  // note emission with no Plan 9 equivalent (and crashes the Plan 9 pass on
+  // COFF targets). Skip it — see emitEndOfAsmFile.
+  if (OutStreamer->isPlan9AsmStreamer())
+    return;
+
   const Triple &TT = TM.getTargetTriple();
 
   if (TT.isOSBinFormatCOFF()) {
@@ -986,6 +1037,18 @@ static void emitAuthenticatedPointer(MCStreamer &OutStreamer,
 }
 
 void AArch64AsmPrinter::emitEndOfAsmFile(Module &M) {
+  // c2go: the Plan 9 (.s) output is a Go-assembler text stream and is
+  // deliberately independent of the host object format. Everything below
+  // is Mach-O/ELF/COFF object finalization (`.subsections_via_symbols`,
+  // COFF import-call sections, auth-pointer stubs, fault maps) that has no
+  // Plan 9 equivalent — and the base MCStreamer makes the format-specific
+  // directives unreachable on a non-matching streamer (crashing the Plan 9
+  // pass on Mach-O and COFF targets). The .s stream is closed by
+  // MCPlan9AsmStreamer::finishImpl, not here, so skip object finalization
+  // entirely when emitting Plan 9.
+  if (OutStreamer->isPlan9AsmStreamer())
+    return;
+
   emitHwasanMemaccessSymbols(M);
 
   const Triple &TT = TM.getTargetTriple();
@@ -1106,6 +1169,32 @@ void AArch64AsmPrinter::emitLOHs() {
 void AArch64AsmPrinter::emitFunctionBodyEnd() {
   if (!AArch64FI->getLOHRelated().empty())
     emitLOHs();
+  // c2go #284 S2.2: hand off accumulated stkobj entries to the Plan 9
+  // streamer (which emits FUNCDATA $2 in flushC2GoStackmaps). No-op when
+  // -c2go-funcdata2 is OFF (accumulator stays empty) or when the function
+  // has no qualifying alloca.
+  publishC2GoStackObjects();
+}
+
+void AArch64AsmPrinter::publishC2GoStackObjects() {
+  if (C2GoStkObjEntries.empty()) {
+    // Always clear in case a prior function populated and then was emitted
+    // with empty entries (defensive).
+    C2GoStkObjSeen.clear();
+    return;
+  }
+  if (OutStreamer->isPlan9AsmStreamer()) {
+    // c2go #376: publish via the streamer instance (was a static call into
+    // a thread_local side-channel). The stkobj table is collected at body
+    // end so we have a streamer pointer; route directly.
+    C2GoFunctionMetadata M;
+    M.Name = std::string(MF->getName());
+    M.StackObjects.emplace(C2GoStkObjEntries.begin(), C2GoStkObjEntries.end());
+    static_cast<MCPlan9AsmStreamer *>(OutStreamer.get())
+        ->publishC2GoFunction(std::move(M));
+  }
+  C2GoStkObjEntries.clear();
+  C2GoStkObjSeen.clear();
 }
 
 /// GetCPISymbol - Return the symbol for the specified constant pool entry.
@@ -1356,6 +1445,16 @@ void AArch64AsmPrinter::emitJumpTableImpl(const MachineJumpTableInfo &MJTI,
       const MCExpr *Value =
           MCSymbolRefExpr::create(JTBB->getSymbol(), OutContext);
 
+      // c2go (Plan 9 JT): Size == 8 means absolute-address entries. We
+      // emit `.quad LBB` directly so Plan 9 .s can express the JT as
+      // 8-byte symbol-ref DATA directives. The dispatch in
+      // LowerJumpTableDest's Size==8 path loads this absolute value and
+      // branches to it without any base-relative ADD.
+      if (Size == 8) {
+        OutStreamer->emitValue(Value, Size);
+        continue;
+      }
+
       // Each entry is:
       //     .byte/.hword (LBB - Lbase)>>2
       // or plain:
@@ -1404,6 +1503,21 @@ void AArch64AsmPrinter::emitFunctionEntryLabel() {
     auto *TS =
         static_cast<AArch64TargetStreamer *>(OutStreamer->getTargetStreamer());
     TS->emitDirectiveVariantPCS(CurrentFnSym);
+  }
+
+  // c2go #376: republish per-function metadata staged on the AFI by
+  // C2GoFrameEmitter into the actual MCPlan9AsmStreamer instance, BEFORE
+  // the base class's emitLabel(CurrentFnSym). The streamer's emitLabel
+  // reads C2GoFnMeta to decide whether to emit a `TEXT … $framesize-argsize`
+  // TEXT directive (Stage 1 dispatch) — so the publish must precede the
+  // label emission.
+  if (OutStreamer->isPlan9AsmStreamer()) {
+    auto *AFI = MF->getInfo<AArch64FunctionInfo>();
+    if (AFI->hasC2GoStagedMeta()) {
+      auto Meta = AFI->takeC2GoStagedMeta();
+      static_cast<MCPlan9AsmStreamer *>(OutStreamer.get())
+          ->publishC2GoFunction(std::move(*Meta));
+    }
   }
 
   AsmPrinter::emitFunctionEntryLabel();
@@ -1530,6 +1644,23 @@ void AArch64AsmPrinter::LowerJumpTableDest(llvm::MCStreamer &OutStreamer,
   EmitToStreamer(OutStreamer, MCInstBuilder(AArch64::ADR)
                                   .addReg(DestReg)
                                   .addExpr(LabelExpr));
+
+  // c2go (Plan 9 JT): Size == 8 means EK_BlockAddress — table entries
+  // are full 8-byte absolute target addresses (not PC-relative offsets).
+  // The dispatch is: LDR Xdest, [Xtable, Xentry, LSL #3]; BR Xdest.
+  // No ADR / ADD needed since the loaded value is the final branch
+  // target. The ADR was emitted above (line 1479) before we knew this;
+  // it's now dead but harmless (DCE may remove later). Plan 9 .s can
+  // express the 8-byte absolute entries.
+  if (Size == 8) {
+    EmitToStreamer(OutStreamer, MCInstBuilder(AArch64::LDRXroX)
+                                    .addReg(DestReg)
+                                    .addReg(TableReg)
+                                    .addReg(EntryReg)
+                                    .addImm(0)
+                                    .addImm(1));  // LSL #3 implicit for X
+    return;
+  }
 
   // Load the number of instruction-steps to offset from the label.
   unsigned LdrOpcode;
@@ -1703,6 +1834,59 @@ void AArch64AsmPrinter::LowerMOPS(llvm::MCStreamer &OutStreamer,
   }
 }
 
+// c2go GC Approach B (#330): OR-in M5 per-call live ptr-tagged spill slots
+// onto `SpOffsets`, used by both LowerSTACKMAP (lightweight) and
+// LowerSTATEPOINT (RS4GC). M2 tags every regalloc-spilled ptr slot in
+// InlineSpiller; M5 (AArch64C2GoPtrSlotLivenessPass) computes per-PC
+// liveness so each slot is marked ONLY at the safepoints where it
+// actually holds a live pointer.
+//
+// The pre-M5 fallback ("mark every ptr-tagged slot at every safepoint")
+// is unsound on workloads with spiller slot reuse (`deep`/`all` over-
+// marks). LowerSTACKMAP omits the fallback because the lightweight path
+// runs at -O0/-O1 where M5 is always available when spill tags exist;
+// LowerSTATEPOINT keeps it for bisecting M5 itself.
+//
+// Both call sites gate behind `c2go-gc-spill-tags` (default on); FI→SP
+// rebase mirrors the original inline code: SP-relative + non-negative.
+static void appendC2GoPtrSpillSlotOffsets(const MachineFunction &MF,
+                                          const MachineInstr &MI,
+                                          SmallVectorImpl<int64_t> &SpOffsets,
+                                          bool IncludeFallback) {
+  // #377: was `cl::getRegisteredOptions().lookup("c2go-gc-spill-tags")`.
+  if (llvm::c2go::isC2GoDisabled("spill-tags"))
+    return;
+  const MachineFrameInfo &MFI = MF.getFrameInfo();
+  const auto *AFI = MF.getInfo<AArch64FunctionInfo>();
+  const TargetFrameLowering *TFL = MF.getSubtarget().getFrameLowering();
+  auto AddSlot = [&](int FI) {
+    if (FI < MFI.getObjectIndexBegin() || FI >= MFI.getObjectIndexEnd() ||
+        MFI.isDeadObjectIndex(FI) || MFI.getObjectAllocation(FI))
+      return;
+    Register FrameReg;
+    StackOffset FIOff = TFL->getFrameIndexReference(MF, FI, FrameReg);
+    if (FrameReg != AArch64::SP)
+      return;
+    int64_t SPoff = FIOff.getFixed();
+    if (SPoff >= 0)
+      SpOffsets.push_back(SPoff);
+  };
+  if (AFI->isC2GoPtrSlotLivenessValid()) {
+    // M5 path: only the FIs M5 marked live at THIS call MI.
+    for (int FI : AFI->getC2GoLiveSpillSlotsAtCall(&MI))
+      AddSlot(FI);
+  } else if (IncludeFallback) {
+    // Pre-M5 fallback (UNSOUND on workloads with spiller slot reuse —
+    // kept only for bisecting M5 itself): mark every ptr-tagged slot.
+    // #375 slice 3: spill-slot tags now live on AArch64FunctionInfo.
+    for (const auto &KV : AFI->getC2GoSpillSlotTags()) {
+      if (KV.second != "ptr")
+        continue;
+      AddSlot(KV.first);
+    }
+  }
+}
+
 void AArch64AsmPrinter::LowerSTACKMAP(MCStreamer &OutStreamer, StackMaps &SM,
                                       const MachineInstr &MI) {
   unsigned NumNOPBytes = StackMapOpers(&MI).getNumPatchBytes();
@@ -1712,6 +1896,39 @@ void AArch64AsmPrinter::LowerSTACKMAP(MCStreamer &OutStreamer, StackMaps &SM,
   OutStreamer.emitLabel(MILabel);
 
   SM.recordStackMap(*MILabel, MI);
+  // c2go Phase 1: Plan 9 mode emits FUNCDATA/PCDATA inline rather than
+  // a binary __llvm_stackmaps section. After recordStackMap has parsed
+  // this MI's operand list into Locations, harvest the Direct(SP, N)
+  // entries and forward them to the Plan 9 streamer to compute a
+  // bitmap + emit `PCDATA $1, $<idx>`. We pull from CSInfos.back()
+  // because recordStackMap just appended this site's entry.
+  if (OutStreamer.isPlan9AsmStreamer()) {
+    auto *Plan9 = static_cast<MCPlan9AsmStreamer *>(&OutStreamer);
+    const auto &CSI = SM.getCSInfos().back();
+    // Location.Reg is a DWARF register number (StackMaps::parseOperand
+    // applies TRI->getDwarfRegNum before storing). On AArch64 SP=31,
+    // FP/x29=29. Capture both — c2go frames may anchor allocas either
+    // to SP (NOFRAME) or FP (frame-pointer-bearing functions).
+    const TargetRegisterInfo *TRI = MF->getSubtarget().getRegisterInfo();
+    unsigned DwarfSP = TRI->getDwarfRegNum(AArch64::SP, /*isEH=*/false);
+    unsigned DwarfFP = TRI->getDwarfRegNum(AArch64::FP, /*isEH=*/false);
+    SmallVector<int64_t, 8> SpOffsets;
+    for (const auto &Loc : CSI.Locations) {
+      if (Loc.Type == StackMaps::Location::Direct &&
+          (Loc.Reg == DwarfSP || Loc.Reg == DwarfFP))
+        SpOffsets.push_back(Loc.Offset);
+    }
+    // c2go (#330 finding 2): mirror LowerSTATEPOINT — OR-in the M5 per-call
+    // live ptr-tagged spill slots. The lightweight path (@llvm.experimental.
+    // stackmap, emitted by C2GoSafepoint at -O0 / -c2go-statepoint-gc=0) only
+    // surfaces the explicit pointer LOCALS as stackmap operands; anonymous
+    // spill slots created by RegAlloc / InlineSpiller (M2 tagged "ptr") are
+    // never operands and would be missed. No fallback: the lightweight path
+    // runs at -O0/-O1 where M5 is always available when spill tags exist.
+    appendC2GoPtrSpillSlotOffsets(*MF, MI, SpOffsets,
+                                  /*IncludeFallback=*/false);
+    Plan9->recordC2GoStackmapSite(SpOffsets);
+  }
   assert(NumNOPBytes % 4 == 0 && "Invalid number of NOP bytes requested!");
 
   // Scan ahead to trim the shadow.
@@ -1767,9 +1984,321 @@ void AArch64AsmPrinter::LowerPATCHPOINT(MCStreamer &OutStreamer, StackMaps &SM,
     EmitToStreamer(OutStreamer, MCInstBuilder(AArch64::NOP));
 }
 
+// c2go #327: recursively append the SP-relative byte offsets of every pointer
+// FIELD of type `Ty` based at `Base`, skipping union-ambiguous words. Mirrors
+// AArch64FrameLowering::c2goMarkPtrFieldBits and clang's
+// C2GoSafepoint::collectPointerFieldOffsets, but emits raw offsets (the Plan 9
+// streamer turns each into a locals-bitmap bit = offset/8).
+static void c2goAppendPtrFieldOffsets(Type *Ty, int64_t Base,
+                                      const DataLayout &DL,
+                                      const DenseSet<int64_t> &SkipBytes,
+                                      SmallVectorImpl<int64_t> &Out) {
+  if (Ty->isPointerTy()) {
+    if (!SkipBytes.contains(Base))
+      Out.push_back(Base);
+    return;
+  }
+  if (auto *ST = dyn_cast<StructType>(Ty)) {
+    const StructLayout *SL = DL.getStructLayout(ST);
+    for (unsigned I = 0, N = ST->getNumElements(); I < N; ++I)
+      c2goAppendPtrFieldOffsets(ST->getElementType(I),
+                                Base + (int64_t)SL->getElementOffset(I), DL,
+                                SkipBytes, Out);
+  } else if (auto *AT = dyn_cast<ArrayType>(Ty)) {
+    Type *ET = AT->getElementType();
+    int64_t ESz = (int64_t)DL.getTypeAllocSize(ET).getFixedValue();
+    for (uint64_t I = 0, N = AT->getNumElements(); I < N; ++I)
+      c2goAppendPtrFieldOffsets(ET, Base + (int64_t)I * ESz, DL, SkipBytes, Out);
+  }
+  // Scalars contribute no pointer word.
+}
+
+// c2go #284 (S2-S3): given a Direct(SP, Off) statepoint location and the
+// owning MachineFunction, derive a per-function StkObjEntry candidate for
+// FUNCDATA $2. Returns std::nullopt when the alloca is not a tracked stkobj
+// candidate (vararg-pack alloca, no pointer fields, or no recognized
+// `c2go.gcbitmap.<X>` sym in the module). Only called when
+// `-c2go-funcdata2` is ON. Per-function dedup (one entry per AI) is the
+// caller's responsibility.
+//
+// `Off` is SP-relative; the entry stores `varp`-relative (locals < 0) or
+// `argp`-relative (args >= 0) per §4.10.4.1 pt 2. Conversion uses the c2go
+// framesize (MFI.getStackSize() — c2GoFrameSize already set it).
+//
+// gcdata symbol name: we restrict to record types whose typeinfo path
+// already produced `c2go.gcbitmap.<recname>` (via CGC2GoTypeInfo). Scalar
+// pointer / array allocas are skipped in this v0 — under-marking is sound
+// (Approach B 摊平 still emits them into FUNCDATA $1 since `c2goExpand-
+// DirectAllocaFields` is still called); precision tightening for those is a
+// follow-up (S6 stale probe).
+static std::optional<llvm::StkObjEntry>
+c2goCollectStkObjEntry(const MachineFunction &MF, int64_t SpOff,
+                       const llvm::AllocaInst *AI) {
+  if (!AI)
+    return std::nullopt;
+  // #327 mirror: never include vararg-pack allocas — RS4GC liveness over-
+  // reports them at unrelated safepoints and stack-coloring reuses their
+  // slot for other packs. Same conservative skip as the摊平 path.
+  if (AI->getMetadata(llvm::c2go::kVaPackMD))
+    return std::nullopt;
+
+  llvm::Type *Ty = AI->getAllocatedType();
+  if (!Ty || !Ty->isSized())
+    return std::nullopt;
+
+  const llvm::DataLayout &DL = MF.getDataLayout();
+  uint64_t SizeBytes = DL.getTypeAllocSize(Ty).getFixedValue();
+  if (SizeBytes == 0)
+    return std::nullopt;
+
+  // gcdata sym: only recognize structs whose CGC2GoTypeInfo already emitted
+  // `c2go.gcbitmap.<RecName>`. Probe Module::getNamedGlobal so we never
+  // reference a sym the linker can't resolve. LLVM struct type names look
+  // like `struct.<X>` or `union.<X>`; CGC2GoTypeInfo names the bitmap by
+  // the *source* record name (e.g. `c2go.gcbitmap.struct.foo`). We try the
+  // raw LLVM struct name first (covers SQLite's `struct.<X>` pattern).
+  auto *ST = llvm::dyn_cast<llvm::StructType>(Ty);
+  if (!ST || !ST->hasName())
+    return std::nullopt;
+  llvm::StringRef LLVMName = ST->getName();
+  // Strip leading `struct.` / `union.` if present so the bitmap name
+  // matches CGC2GoTypeInfo's convention (`c2go.gcbitmap.<X>`).
+  llvm::StringRef RecName = LLVMName;
+  if (RecName.consume_front("struct."))
+    ; // RecName now bare
+  else if (RecName.consume_front("union."))
+    ;
+  std::string BitmapName = ("c2go.gcbitmap." + RecName).str();
+  const llvm::Module *M = MF.getFunction().getParent();
+  const llvm::GlobalVariable *GV =
+      M ? M->getNamedGlobal(BitmapName) : nullptr;
+  if (!GV)
+    return std::nullopt; // no bitmap emitted for this type — skip safely
+
+  // ptrBytes = pointer-containing prefix length. Compute as 8 × (highest
+  // pointer-word index + 1). Cheap via the existing field-offset walker
+  // (c2goAppendPtrFieldOffsets), which yields SP-relative byte offsets;
+  // we strip the SP base by subtracting SpOff.
+  llvm::SmallVector<int64_t, 8> Tmp;
+  llvm::DenseSet<int64_t> NoSkip;
+  c2goAppendPtrFieldOffsets(Ty, /*Base=*/0, DL, NoSkip, Tmp);
+  uint32_t PtrBytes = 0;
+  for (int64_t O : Tmp) {
+    uint64_t End = uint64_t(O) + 8;
+    if (End > PtrBytes)
+      PtrBytes = static_cast<uint32_t>(End);
+  }
+  // Pure-data records (no pointer fields) carry no GC interest — skip per
+  // §4.10.4.1 pt 5 spirit (would just inflate the table for no gain).
+  if (PtrBytes == 0)
+    return std::nullopt;
+
+  // §4.10.4.1 pt 2: convert SP-relative -> varp/argp-relative.
+  //
+  // Use `MFI.getStackSize()` (= funcspdelta in Go traceback terminology, the
+  // physical SP decrement performed by c2goEmitPrologue, == c2GoFrameSize()).
+  // This is the value the Go runtime's `varp = SP + funcspdelta - 8` /
+  // `argp = SP + funcspdelta` uses (see runtime/stack.go scanstack +
+  // runtime/traceback.go). It is NOT the same as the TEXT directive's
+  // declared framesize `$N` (= MFI.getStackSize() - 16, the value go asm
+  // sees after it adds back its own 16-byte LR-save + alignment). The
+  // FUNCDATA $1 locals bitmap also uses funcspdelta (Nbit =
+  // (MFI.getStackSize() - 8)/8 — see MCPlan9AsmStreamer::emitC2GoFuncData-
+  // Preamble), so stkobj and stackmap stay symmetric.
+  //
+  // Example: MFI.getStackSize()=48, declared TEXT $32, alloca at SP+24
+  //   → varp = SP+40, frameOffset = 24 - 40 = -16.
+  int64_t FrameSize =
+      static_cast<int64_t>(MF.getFrameInfo().getStackSize());
+  int32_t FrameOffset;
+  if (SpOff < FrameSize) {
+    // locals region — varp-relative, must be negative.
+    FrameOffset = static_cast<int32_t>(SpOff - (FrameSize - 8));
+  } else {
+    // args region — argp-relative, non-negative.
+    FrameOffset = static_cast<int32_t>(SpOff - FrameSize);
+  }
+
+  llvm::StkObjEntry E;
+  E.frameOffset = FrameOffset;
+  E.size = static_cast<uint32_t>(SizeBytes);
+  E.ptrBytes = PtrBytes;
+  E.gcdataSymName = std::move(BitmapName);
+  return E;
+}
+
+// c2go #327: given a Direct StackMap location (the live value IS the address
+// SP+`Off`, i.e. an alloca that RewriteStatepointsForGC tracks as a base), find
+// the owning alloca and append the SP-relative offsets of its pointer FIELDS to
+// `Out`. This is the per-PC, liveness-driven replacement for the static
+// all-PCs aggregate-field mask (AArch64FrameLowering #288): pointer fields held
+// in stack memory (e.g. SQLite's `yyParser.yytos = &yystack[0]`,
+// `yyParser.pParse = &sParse`) are not SSA values, so RS4GC cannot relocate
+// them directly — but it DOES keep the enclosing alloca live, so we expand its
+// fields here. Because we only expand allocas that are live at THIS safepoint,
+// a slot reused for an int after the alloca dies (stack coloring) is not marked
+// (fixes the "bad pointer ... 0xa" over-mark). A scalar `alloca i32` expands to
+// no pointer fields; a scalar `alloca ptr` expands to one field at offset 0 (so
+// an address-taken pointer local is still marked).
+static void c2goExpandDirectAllocaFields(const MachineFunction &MF,
+                                         int64_t Off,
+                                         SmallVectorImpl<int64_t> &Out) {
+  const MachineFrameInfo &MFI = MF.getFrameInfo();
+  const TargetFrameLowering *TFL = MF.getSubtarget().getFrameLowering();
+  const DataLayout &DL = MF.getDataLayout();
+  for (int FI = MFI.getObjectIndexBegin(), E = MFI.getObjectIndexEnd(); FI < E;
+       ++FI) {
+    if (MFI.isDeadObjectIndex(FI))
+      continue;
+    const AllocaInst *AI = MFI.getObjectAllocation(FI);
+    if (!AI)
+      continue;
+    Register FrameReg;
+    StackOffset SO = TFL->getFrameIndexReference(MF, FI, FrameReg);
+    if (FrameReg != AArch64::SP || SO.getFixed() != Off)
+      continue;
+    // #327: do NOT expand vararg-pack allocas (`!c2go.va.pack`: the
+    // c2go.va.argptrs arrays and their c2go.va.slot storage). RS4GC keeps their
+    // address live across UNRELATED safepoints (e.g. sqlite3RunParser), and
+    // stack-coloring merges disjoint-lifetime va slots, so at such a PC the slot
+    // holds another pack's stale content or an uninitialized word (0x1) —
+    // expanding the pointer field there marks a non-pointer ("bad pointer in
+    // frame ... 0x1"). The pack address is still relocated as an Indirect spill
+    // where it is genuinely live; its interior `&slot` pointers are stack-local
+    // in an unmanaged (managed(0)) workload — same conservative under-marking
+    // class as the union-ambiguous #312 words. (Genuine in-memory pointer
+    // fields of plain C aggregates like yyParser.yytos are NOT va-pack-flagged
+    // and ARE expanded, so copystack still relocates them per-PC.)
+    if (AI->getMetadata(llvm::c2go::kVaPackMD))
+      continue;
+    // #312: skip union-ambiguous pointer words (a union word that is a pointer
+    // in one member and an integer in another) — same conservative
+    // under-marking as the lightweight path; the static FUNCDATA map cannot
+    // disambiguate which union member is active at runtime.
+    DenseSet<int64_t> SkipBytes;
+    if (const MDNode *MD = AI->getMetadata(llvm::c2go::kUnionAmbigWordsMD))
+      for (const MDOperand &Op : MD->operands())
+        if (auto *CMD = dyn_cast<ConstantAsMetadata>(Op.get()))
+          if (auto *CI = dyn_cast<ConstantInt>(CMD->getValue()))
+            SkipBytes.insert(Off + (int64_t)CI->getZExtValue());
+    c2goAppendPtrFieldOffsets(AI->getAllocatedType(), Off, DL, SkipBytes, Out);
+    return; // one alloca per frame offset
+  }
+}
+
 void AArch64AsmPrinter::LowerSTATEPOINT(MCStreamer &OutStreamer, StackMaps &SM,
                                         const MachineInstr &MI) {
   StatepointOpers SOpers(&MI);
+
+  // c2go (GC-S2): in Plan 9 mode the statepoint's live managed pointers
+  // (spilled to stack by RewriteStatepointsForGC) drive a Go locals
+  // pointer-map bitmap, emitted as `PCDATA $1, $<idx>`. The PCDATA must be
+  // emitted BEFORE the call: Go's runtime backs the return PC up to the call
+  // PC when reading the stack map (runtime/stkframe.go pcdatavalue at the
+  // call site), so the map must be in effect at the BL itself. We therefore
+  // parse the statepoint locations and emit the bitmap up front, then fall
+  // through to emit the call. (recordStatepoint only records metadata keyed to
+  // a label; it emits nothing to the stream, so calling it here is safe.)
+  MCSymbol *MILabel = nullptr;
+  if (OutStreamer.isPlan9AsmStreamer()) {
+    MILabel = OutStreamer.getContext().createTempSymbol();
+    SM.recordStatepoint(*MILabel, MI);
+    const auto &CSI = SM.getCSInfos().back();
+    const TargetRegisterInfo *TRI = MF->getSubtarget().getRegisterInfo();
+    unsigned DwarfSP = TRI->getDwarfRegNum(AArch64::SP, /*isEH=*/false);
+    unsigned DwarfFP = TRI->getDwarfRegNum(AArch64::FP, /*isEH=*/false);
+    // Harvest stack-resident live values. The Go locals bitmap marks slots
+    // whose CONTENTS are heap pointers that copystack must relocate, so we
+    // take ONLY Indirect locations (StackMaps::IndirectMemRefOp = "the live
+    // value is STORED AT [Reg+off]", i.e. an RS4GC spill slot holding the
+    // pointer value).
+    //
+    // #327: Direct locations (DirectMemRefOp = "the live value IS the address
+    // [Reg+off]") are NOT marked as a scalar pointer at `off`. Under the
+    // c2go-gc strategy an alloca's address is a base-defining value
+    // (findBaseDefiningValue / RS4GC #326), so an address-taken stack local
+    // (`&errcode`) appears in the statepoint's gc-live set and lowers to a
+    // Direct(SP, off) location. That `off` is the alloca's own STORAGE — which
+    // for a scalar `int` holds the value (e.g. 0xa), not a heap pointer.
+    // Marking the slot whole-cloth makes copystack read the int as a pointer
+    // and abort ("bad pointer in frame ... 0xa"). The alloca address itself
+    // needs no relocation: it is recomputed from SP at every use (`ADD $off,
+    // RSP, Rn`) and moves with the frame.
+    //
+    // INSTEAD, we expand the alloca's pointer FIELDS per-PC
+    // (c2goExpandDirectAllocaFields): a scalar `alloca i32` yields nothing, a
+    // scalar `alloca ptr` yields one bit at `off`, and an aggregate yields a
+    // bit per pointer field. This is the sound, liveness-driven replacement
+    // for the static all-PCs aggregate-field mask (AArch64FrameLowering #288,
+    // disabled in statepoint mode): in-memory pointer fields (SQLite's
+    // `yyParser.yytos`/`.pParse`) are not SSA values RS4GC can relocate, but
+    // the enclosing alloca IS kept live, so we expand it here — and only at the
+    // PCs where it is live, so a stack-colored slot reused for an int after the
+    // alloca dies is left unmarked. (The lightweight path, LowerSTACKMAP, takes
+    // Direct as a whole-slot mark instead: there the stackmap operand is a
+    // managed-pointer LOCAL whose alloca slot HOLDS the pointer.)
+    //
+    // FP-relative offsets are rebased to SP because c2go anchors the locals
+    // map at SP and lays the saved FP at SP-8 (AArch64FrameLowering c2go
+    // prologue): SPoff = FPoff - 8.
+    //
+    // NOTE: this filter is sound only while c2go statepoints carry no
+    // stack-resident deopt operands (we emit them with an empty deopt bundle);
+    // if deopt stack values are ever added, restrict to the gc-pointer operand
+    // range (StatepointOpers) so scalars are never marked as pointer words.
+    SmallVector<int64_t, 8> SpOffsets;
+    for (const auto &Loc : CSI.Locations) {
+      if (Loc.Reg != DwarfSP && Loc.Reg != DwarfFP)
+        continue;
+      int64_t Off = Loc.Offset;
+      if (Loc.Reg == DwarfFP)
+        Off -= 8;
+      if (Loc.Type == StackMaps::Location::Indirect)
+        SpOffsets.push_back(Off);
+      else if (Loc.Type == StackMaps::Location::Direct) {
+        c2goExpandDirectAllocaFields(*MF, Off, SpOffsets);
+        // c2go #284 S2.2: ALSO collect a StkObjEntry candidate for FUNCDATA
+        // $2. Gated by `-c2go-funcdata2`; OFF path retains Approach B
+        // 摊平 exactly (above call still runs; the entry collection is a
+        // pure addition). Per-alloca dedup via C2GoStkObjSeen so multiple
+        // Direct locations on the same alloca contribute one entry.
+        if (C2GoFuncData2) {
+          const MachineFrameInfo &MFI = MF->getFrameInfo();
+          const TargetFrameLowering *TFL =
+              MF->getSubtarget().getFrameLowering();
+          for (int FI = MFI.getObjectIndexBegin(),
+                   FE = MFI.getObjectIndexEnd();
+               FI < FE; ++FI) {
+            if (MFI.isDeadObjectIndex(FI))
+              continue;
+            const AllocaInst *AI = MFI.getObjectAllocation(FI);
+            if (!AI)
+              continue;
+            Register FrameReg;
+            StackOffset SO = TFL->getFrameIndexReference(*MF, FI, FrameReg);
+            if (FrameReg != AArch64::SP || SO.getFixed() != Off)
+              continue;
+            if (!C2GoStkObjSeen.insert(AI))
+              break; // already accounted
+            if (auto E = c2goCollectStkObjEntry(*MF, Off, AI))
+              C2GoStkObjEntries.push_back(std::move(*E));
+            break;
+          }
+        }
+      }
+    }
+    // c2go GC Approach B (#330): OR-in derived/interior ptr spill slots that
+    // RS4GC misses (it tracks only base allocas, not `&s.field` / `&buf[k]`).
+    // M2 tags such slots in InlineSpiller; M5 computes per-PC liveness so
+    // only safepoints where the slot really holds a live pointer are marked.
+    // IncludeFallback=true keeps the unsound pre-M5 marking available for
+    // bisecting M5 itself (gated by `c2go-gc-spill-tags` default on).
+    appendC2GoPtrSpillSlotOffsets(*MF, MI, SpOffsets,
+                                  /*IncludeFallback=*/true);
+    static_cast<MCPlan9AsmStreamer &>(OutStreamer).recordC2GoStackmapSite(
+        SpOffsets);
+  }
+
   if (unsigned PatchBytes = SOpers.getNumPatchBytes()) {
     assert(PatchBytes % 4 == 0 && "Invalid number of NOP bytes requested!");
     for (unsigned i = 0; i < PatchBytes; i += 4)
@@ -1802,10 +2331,17 @@ void AArch64AsmPrinter::LowerSTATEPOINT(MCStreamer &OutStreamer, StackMaps &SM,
                    MCInstBuilder(CallOpcode).addOperand(CallTargetMCOp));
   }
 
+  if (OutStreamer.isPlan9AsmStreamer()) {
+    // Plan 9 path already recorded the statepoint and emitted PCDATA above;
+    // just define the label at the return PC for completeness.
+    OutStreamer.emitLabel(MILabel);
+    return;
+  }
+
   auto &Ctx = OutStreamer.getContext();
-  MCSymbol *MILabel = Ctx.createTempSymbol();
-  OutStreamer.emitLabel(MILabel);
-  SM.recordStatepoint(*MILabel, MI);
+  MCSymbol *Label = Ctx.createTempSymbol();
+  OutStreamer.emitLabel(Label);
+  SM.recordStatepoint(*Label, MI);
 }
 
 void AArch64AsmPrinter::LowerFAULTING_OP(const MachineInstr &FaultingMI) {
@@ -3057,6 +3593,194 @@ void AArch64AsmPrinter::EmitToStreamer(MCStreamer &S, const MCInst &Inst) {
 #endif
 }
 
+namespace {
+// c2go §D2 phase 2/3: Plan 9 .s emit only.
+//
+// For an LDR/STR-immediate MachineInstr that loads/stores through a GEP
+// whose source struct type is `c2go_struct`-tagged, rewrite the immediate
+// operand of the lowered MCInst from a raw byte offset to an
+// `MCSymbolRefExpr` referencing the `<RecName>_<FieldName>` symbol Go's
+// compiler emits into `go_asm.h` for the c2gobind-generated struct.
+//
+// The Plan 9 InstPrinter then renders the LDR/STR as
+//   `MOVW Node_val(R0), R0`  (symbolic) rather than
+//   `WORD $0xb9400800`        (raw bytes).
+//
+// Phase 3 extension — nested fields:
+// Path-aware TBAA propagates the *outermost* struct as BaseType across a
+// chain of field accesses like `outer->inner.y`, so the (BaseTy, Off)
+// tuple we read here is `(Outer, offsetof(Outer, inner) + offsetof(Inner,
+// y))`. CodeGenTypes already flattened the corresponding `.fields`
+// metadata entries to `(absOff, "<outerField>+<InnerRec>_<innerField>")`,
+// so the lookup naturally lands on the nested entry and the synthesized
+// symbol name becomes e.g. `Outer_inner+Inner_y` — a Plan 9 additive
+// symbol expression matching the form Go's own runtime uses
+// (`(g_sched+gobuf_sp)(R10)`). At link time it resolves via the two
+// asmhdr-emitted defines `Outer_inner` and `Inner_y`.
+//
+// Note: the resulting MCSymbol name contains a literal `+`, which is not
+// a valid unquoted character for ELF asm. We rely on the Plan 9
+// emission pipeline (MCPlan9AsmStreamer + AArch64Plan9InstPrinter) to
+// print the symbol name verbatim via `StringRef`, never going through
+// `MCSymbol::print` (which would quote it). The ELF object pipeline
+// keeps the raw-byte form because we only run this rewrite when
+// `OutputAsmVariant == 2`.
+//
+// On any miss (no memoperand, no GEP, struct not c2go-tagged, field name
+// not found, opcode not in the rewrite table) we leave the immediate
+// untouched — the printer / streamer fall back to the existing raw-byte
+// path so we never break correctness.
+//
+// Returns true if a rewrite was performed.
+static bool rewriteC2GoFieldImmToSymbol(const MachineInstr *MI, MCInst &Inst,
+                                         MCContext &Ctx) {
+  // Only the unscaled-immediate LDR/STR family forms we currently
+  // care about. The operand layout is uniformly:
+  //   op[0]=Rt, op[1]=Rn, op[2]=imm12
+  // (Both LDR/STR use the same shape; the SIMD .Q form falls under
+  // STRQui/LDRQui handled below for completeness.)
+  unsigned Op = Inst.getOpcode();
+  switch (Op) {
+  case AArch64::LDRXui:
+  case AArch64::LDRWui:
+  case AArch64::LDRBBui:
+  case AArch64::LDRHHui:
+  case AArch64::LDRSBWui:
+  case AArch64::LDRSHWui:
+  case AArch64::LDRSWui:
+  case AArch64::LDRSui:
+  case AArch64::LDRDui:
+  case AArch64::LDRQui:
+  case AArch64::STRXui:
+  case AArch64::STRWui:
+  case AArch64::STRBBui:
+  case AArch64::STRHHui:
+  case AArch64::STRSui:
+  case AArch64::STRDui:
+  case AArch64::STRQui:
+    break;
+  default:
+    return false;
+  }
+  if (Inst.getNumOperands() < 3 || !Inst.getOperand(2).isImm())
+    return false;
+
+  // Recovery strategy: opaque-pointer canonicalisation turns clang's
+  // structured `getelementptr %Node, ptr %p, 0, i32 1` into
+  // `getelementptr i8, ptr %p, i64 8`, so we cannot read the struct
+  // identity from the GEP alone. TBAA metadata is preserved through
+  // SROA/InstCombine and carries `(base type descriptor, access type,
+  // offset)` — the base type descriptor's first operand is the
+  // struct's name (matching the AST stable name we used as the
+  // metadata key in CodeGenTypes.cpp), and `offset` is the byte
+  // offset into that base.
+  if (MI->memoperands_empty())
+    return false;
+  const MachineMemOperand *MMO = *MI->memoperands_begin();
+  const llvm::MDNode *TBAA = MMO->getAAInfo().TBAA;
+  if (!TBAA || TBAA->getNumOperands() < 3)
+    return false;
+  // TBAA access tag layout (path-aware TBAA, the modern default):
+  //   op[0] = base-type descriptor MDNode
+  //   op[1] = access-type descriptor MDNode
+  //   op[2] = byte offset into base (i64 constant)
+  auto *BaseTyMD = llvm::dyn_cast<llvm::MDNode>(TBAA->getOperand(0));
+  auto *OffMD = llvm::dyn_cast_or_null<llvm::ConstantAsMetadata>(
+      TBAA->getOperand(2));
+  if (!BaseTyMD || !OffMD)
+    return false;
+  // The base type descriptor's first operand is its name as an
+  // MDString. For struct accesses this is the AST stable name of the
+  // C struct (e.g. "Node"). Pointer/scalar accesses (e.g. raw
+  // dereferences not through a c2go-managed struct field) have
+  // names like "any pointer" / "int" / "omnipotent char" — those
+  // won't match a `c2go.struct.<X>` metadata key, so we fall back to
+  // raw byte offset for them, which is the correct behaviour.
+  if (BaseTyMD->getNumOperands() == 0)
+    return false;
+  auto *NameMDS = llvm::dyn_cast<llvm::MDString>(BaseTyMD->getOperand(0));
+  if (!NameMDS)
+    return false;
+  llvm::StringRef STName = NameMDS->getString();
+  if (STName.empty())
+    return false;
+  auto *OffCI = llvm::dyn_cast<llvm::ConstantInt>(OffMD->getValue());
+  if (!OffCI)
+    return false;
+  int64_t WantOff = static_cast<int64_t>(OffCI->getZExtValue());
+
+  // The Module reference comes via the MachineFunction.
+  const llvm::Function *F = &MI->getMF()->getFunction();
+  const llvm::Module *M = F->getParent();
+  if (!M)
+    return false;
+  // Phase 1 named metadata: presence of `c2go.struct.<X>` proves
+  // this struct is c2go-managed. Phase 2 adds a sibling
+  // `c2go.struct.<X>.fields` metadata with (offset, fieldname) pairs.
+  llvm::SmallString<64> ManagedKey;
+  ManagedKey = llvm::c2go::kStructMDPrefix;
+  ManagedKey += STName;
+  if (!M->getNamedMetadata(ManagedKey))
+    return false;
+  llvm::SmallString<80> FieldsKey;
+  FieldsKey = ManagedKey.str();
+  FieldsKey += ".fields";
+  llvm::NamedMDNode *FieldsNMD = M->getNamedMetadata(FieldsKey);
+  if (!FieldsNMD)
+    return false;
+
+  // Match the TBAA offset against the c2go.struct.<X>.fields list.
+  llvm::StringRef FieldName;
+  for (unsigned I = 0, N = FieldsNMD->getNumOperands(); I < N; ++I) {
+    llvm::MDNode *Pair = FieldsNMD->getOperand(I);
+    if (!Pair || Pair->getNumOperands() < 2)
+      continue;
+    auto *FOffMD = llvm::dyn_cast<llvm::ConstantAsMetadata>(Pair->getOperand(0));
+    auto *FNameMD = llvm::dyn_cast<llvm::MDString>(Pair->getOperand(1));
+    if (!FOffMD || !FNameMD)
+      continue;
+    auto *FOffCI = llvm::dyn_cast<llvm::ConstantInt>(FOffMD->getValue());
+    if (!FOffCI)
+      continue;
+    if (static_cast<int64_t>(FOffCI->getZExtValue()) == WantOff) {
+      FieldName = FNameMD->getString();
+      break;
+    }
+  }
+  if (FieldName.empty())
+    return false;
+
+  // Build the `<Rec>_<Field>` symbol — this is the exact name Go's
+  // compiler emits into `go_asm.h` for any Go struct it compiles
+  // (see go/src/cmd/compile/internal/gc/asm.go::dumpasmhdr). Plan 9
+  // assembler accepts it as a bare absolute constant.
+  //
+  // Go-keyword rename: c2gobind's emit.go applies `renameGoKeyword`
+  // to any C-source field whose name collides with a Go reserved
+  // word (`type`, `func`, `chan`, …) — append `_` so `et_info::type`
+  // becomes Go field `type_` and go_asm.h gets `et_info_type_`.
+  // Plan 9 InstPrinter must apply the IDENTICAL rule when building
+  // the `<Rec>_<Field>` reference here, otherwise the assembler
+  // can't resolve the constant.
+  static const llvm::StringSet<> GoKeywords{
+      "break", "case", "chan", "const", "continue", "default",
+      "defer", "else", "fallthrough", "for", "func", "go", "goto",
+      "if", "import", "interface", "map", "package", "range",
+      "return", "select", "struct", "switch", "type", "var",
+  };
+  llvm::SmallString<64> SymName;
+  SymName = STName;
+  SymName += '_';
+  SymName += FieldName;
+  if (GoKeywords.contains(FieldName))
+    SymName += '_';
+  MCSymbol *Sym = Ctx.getOrCreateSymbol(SymName);
+  const MCExpr *SymRef = MCSymbolRefExpr::create(Sym, Ctx);
+  Inst.getOperand(2) = MCOperand::createExpr(SymRef);
+  return true;
+}
+} // end anonymous namespace
+
 void AArch64AsmPrinter::emitInstruction(const MachineInstr *MI) {
   AArch64_MC::verifyInstructionPredicates(MI->getOpcode(), STI->getFeatureBits());
 
@@ -3066,6 +3790,21 @@ void AArch64AsmPrinter::emitInstruction(const MachineInstr *MI) {
     assert(STI->getInstrInfo()->getInstSizeInBytes(*MI) >= InstsEmitted * 4);
   });
 #endif
+
+  // c2go (GC-S2b): in the Plan 9 .s path, `go tool asm` owns the
+  // prologue/epilogue for a framed `TEXT $framesize` (it injects the LR/
+  // FP save + SP adjustment at entry and expands RET into the teardown).
+  // Suppress the c2go hand-rolled frame setup/teardown
+  // (AArch64FrameLowering::emitC2GoPrologue/Epilogue) here so the two do
+  // not double-frame the SP. GoABI0 uses CSR_AArch64_NoRegs, so the only
+  // FrameSetup/FrameDestroy instructions in a c2go function are exactly
+  // that prologue/epilogue — there are no callee-saved spills to drop.
+  // The .o path (non-Plan 9) keeps the hand-rolled frame intact.
+  if (OutStreamer->isPlan9AsmStreamer() &&
+      MF->getFunction().getParent()->getModuleFlag(llvm::c2go::kGoabiModuleFlag) &&
+      (MI->getFlag(MachineInstr::FrameSetup) ||
+       MI->getFlag(MachineInstr::FrameDestroy)))
+    return;
 
   // Do any auto-generated pseudo lowerings.
   if (MCInst OutInst; lowerPseudoInstExpansion(MI, OutInst)) {
@@ -3693,6 +4432,19 @@ void AArch64AsmPrinter::emitInstruction(const MachineInstr *MI) {
   // Finally, do the automated lowerings for everything else.
   MCInst TmpInst;
   MCInstLowering.Lower(MI, TmpInst);
+  // c2go §D2 phase 2: only mutate the MCInst when we are in the Plan 9
+  // #211 — Go assembler **does not** accept `<symbolic_const>(<gp_reg>)`
+  // form. Only `<literal_int>(<gp_reg>)` and `<sym>(<pseudo_reg>)` (SB/
+  // FP/SP) work. So while §D2's TBAA-driven imm→`<Rec>_<Field>` rewrite
+  // makes the .s human-readable, the resulting `MOVW Db_pBt(R0), R8`
+  // syntax fails at `go tool asm` with "expected pseudo-register; found
+  // R0". The c2go regression suite only checks .s emission (no full
+  // link), so this slipped through.
+  //
+  // Disabled — the literal byte offset emitted by the standard
+  // InstPrinter path (`MOVW 16(R0), R8`) assembles cleanly. A future
+  // §D2 v2 could keep the field name as a `// access of <Rec>.<Field>`
+  // comment for readability without affecting assemblability.
   EmitToStreamer(*OutStreamer, TmpInst);
 }
 
