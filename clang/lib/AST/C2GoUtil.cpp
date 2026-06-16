@@ -169,6 +169,196 @@ bool recordContainsManagedPointer(const RecordDecl *RD) {
 
 namespace {
 
+// c2go §A4 helpers — classify a single union alternative.
+
+// One observed alternative slot at byte offset `Offset` inside the union.
+// `Kind` distinguishes the cases the classifier cares about:
+//   * ScanPtr — a DATA pointer the GC must scan: managed pointer OR
+//     unmanaged data pointer. 2026-06-16: both are force-scanned (§3.1 /
+//     §9.2), so for union-slot purposes they are identical — each
+//     contributes a scan bit at its offset and is "pure" only when no
+//     scalar overlaps it.
+//   * FuncPtr — a function pointer (points at code, never scanned, §3.4).
+//     Benign for GC: no scan bit, does not block a scan-pointer at the
+//     same offset.
+//   * Scalar — anything else that occupies bytes (int, float, struct of
+//     scalars, byte array, etc.). Blocks the precise-slot encoding when
+//     it overlaps a scan-pointer offset.
+enum class AltKind { ScanPtr, FuncPtr, Scalar };
+
+struct UnionAlt {
+  uint64_t OffsetBytes;
+  uint64_t SizeBytes;
+  AltKind Kind;
+  std::string FieldName; // for diagnostics
+};
+
+
+// Collect alternatives for a record at base offset `BaseOff`. For unions
+// this means every direct field (each at BaseOff + 0); for structs that
+// appear as anonymous-struct alternatives this means each field at
+// BaseOff + field-relative-offset. The parent's c2go-managed default
+// (`ParentIsC2Go`) determines whether unannotated raw pointers count as
+// managed.
+static void collectAlternatives(const RecordDecl *RD, uint64_t BaseOff,
+                                bool ParentIsC2Go, const ASTContext &Ctx,
+                                llvm::SmallVectorImpl<UnionAlt> &Out) {
+  if (!RD)
+    return;
+  RD = RD->getDefinition();
+  if (!RD)
+    return;
+  const ASTRecordLayout &RL = Ctx.getASTRecordLayout(RD);
+  unsigned FieldNo = 0;
+  for (const FieldDecl *F : RD->fields()) {
+    uint64_t FieldOffBits = RL.getFieldOffset(FieldNo);
+    uint64_t FieldOff = BaseOff + (FieldOffBits / 8);
+    ++FieldNo;
+    // Keep the as-written field type so round 22 attr-only managed sugar
+    // survives — `getCanonicalType()` would strip the AttributedType
+    // wrapper. Use a separately-canonicalized view only for the byte size.
+    QualType FT = F->getType();
+    std::string FName = F->getNameAsString();
+    if (FName.empty())
+      FName = "<anonymous>";
+
+    // Peel arrays for classification — `T arr[N]` of pointer counts as a
+    // pointer slot at offset 0 of the array; later array slots also hold
+    // pointers but they collectively occupy multiple words and we treat
+    // that as "scalar with size" for scheme1 purposes (a single-bit
+    // bitmap can't cover an array of pointers). Concretely: an array of
+    // managed pointers in a union alternative falls through to Scalar
+    // (blocks scheme1) which is the correct conservative answer — Scheme2
+    // is needed to express that case.
+    QualType Peeled = FT;
+    bool IsArray = false;
+    while (const ArrayType *AT = Peeled->getAsArrayTypeUnsafe()) {
+      IsArray = true;
+      Peeled = AT->getElementType();
+    }
+
+    if (!IsArray && Peeled->isPointerType()) {
+      // 2026-06-16: function pointers are no-scan (§3.4); every other
+      // pointer (managed OR unmanaged data pointer) is force-scanned
+      // (§3.1 / §9.2) → ScanPtr. (void)fieldIsExplicitManaged: the
+      // managed/unmanaged distinction no longer changes the GC slot
+      // classification for unions — both scan.
+      AltKind K =
+          Peeled->isFunctionPointerType() ? AltKind::FuncPtr : AltKind::ScanPtr;
+      (void)ParentIsC2Go;
+      uint64_t Sz = Ctx.getTypeSizeInChars(FT).getQuantity();
+      Out.push_back({FieldOff, Sz, K, std::move(FName)});
+      continue;
+    }
+
+    if (const RecordType *RT = Peeled->getAs<RecordType>()) {
+      const RecordDecl *Inner = RT->getDecl()->getDefinition();
+      if (Inner && !Inner->isUnion() && !IsArray) {
+        // Anonymous (or named) struct as a union alternative — descend
+        // so each leaf field contributes its own alternative entry. The
+        // anonymous-struct case is the common one: `union { struct {
+        // int tag; Node *p; } tab; ... }` — without descent we would
+        // treat `tab` as one big scalar and erase the pointer-at-offset
+        // information that scheme1 needs.
+        collectAlternatives(Inner, FieldOff, ParentIsC2Go, Ctx, Out);
+        continue;
+      }
+      // Nested union or array-of-record: treat as a scalar blob covering
+      // its whole footprint. A nested union with managed pointers is a
+      // legitimate case that scheme1 cannot encode (would need a second
+      // bit position), so falling through to Scalar correctly forces
+      // scheme2.
+    }
+
+    uint64_t Sz = Ctx.getTypeSizeInChars(FT).getQuantity();
+    Out.push_back({FieldOff, Sz, AltKind::Scalar, std::move(FName)});
+  }
+}
+
+} // namespace
+
+C2GoUnionClassification classifyC2GoUnion(const RecordDecl *UnionRD,
+                                          const ASTContext &Ctx) {
+  C2GoUnionClassification Result;
+  if (!UnionRD)
+    return Result;
+  UnionRD = UnionRD->getDefinition();
+  if (!UnionRD || !UnionRD->isUnion())
+    return Result; // NotApplicable
+
+  // Determine the c2go-managed default for this union's pointer fields.
+  // A union that carries C2GoStructAttr (explicitly or via #pragma c2go
+  // push) makes raw pointers managed by default; everywhere else, the
+  // pointer-in-union is unmanaged unless individually annotated. This
+  // mirrors the field-world resolution used by CGC2GoTypeInfo.
+  const bool ParentIsC2Go = UnionRD->hasAttr<C2GoStructAttr>();
+
+  llvm::SmallVector<UnionAlt, 16> Alts;
+  collectAlternatives(UnionRD, /*BaseOff=*/0, ParentIsC2Go, Ctx, Alts);
+
+  // Partition by AltKind and collect offsets. 2026-06-16: a scan-pointer
+  // alternative (managed OR unmanaged data ptr) contributes a scan offset;
+  // function pointers are benign (no scan, do not block the precise slot).
+  llvm::SmallDenseSet<uint64_t, 4> ScanPtrOffsets;
+  llvm::SmallVector<const UnionAlt *, 8> Scalars;
+  for (const UnionAlt &A : Alts) {
+    if (A.Kind == AltKind::ScanPtr)
+      ScanPtrOffsets.insert(A.OffsetBytes);
+    else if (A.Kind == AltKind::Scalar)
+      Scalars.push_back(&A);
+    // FuncPtr is benign — neither contributes a scan bit nor blocks the
+    // precise-slot encoding (the alternative is opaque code-handle storage).
+  }
+
+  if (ScanPtrOffsets.empty()) {
+    // No scan-pointer alternative → no GC bits needed. The union is a
+    // plain opaque slab from the GC's point of view; classify as
+    // NotApplicable so the caller doesn't bother emitting a single-bit
+    // bitmap nor a punning diagnostic.
+    return Result;
+  }
+
+  // Precise single-slot (Scheme1) requires (a) all scan-pointer
+  // alternatives at the same offset and (b) no scalar alternative overlaps
+  // that offset. Otherwise the union type-puns a pointer slot → hard error
+  // (Scheme2 classification; the any-subtype box scaffolding is deleted).
+  if (ScanPtrOffsets.size() != 1) {
+    Result.Scheme = C2GoUnionScheme::Scheme2;
+    // Pick any second offset as the "blocker" hint.
+    uint64_t First = *ScanPtrOffsets.begin();
+    for (const UnionAlt &A : Alts) {
+      if (A.Kind == AltKind::ScanPtr && A.OffsetBytes != First) {
+        Result.BlockerFieldName = A.FieldName;
+        Result.BlockerReason =
+            "scanned pointer at a different offset than other ptr "
+            "alternatives";
+        break;
+      }
+    }
+    return Result;
+  }
+
+  uint64_t PtrOff = *ScanPtrOffsets.begin();
+  const unsigned PtrSize = Ctx.getTargetInfo().getPointerWidth(LangAS::Default) / 8;
+  uint64_t PtrEnd = PtrOff + PtrSize;
+  for (const UnionAlt *S : Scalars) {
+    uint64_t SBeg = S->OffsetBytes;
+    uint64_t SEnd = SBeg + (S->SizeBytes ? S->SizeBytes : 1);
+    // Overlap test: [SBeg, SEnd) intersects [PtrOff, PtrEnd).
+    if (SBeg < PtrEnd && PtrOff < SEnd) {
+      Result.Scheme = C2GoUnionScheme::Scheme2;
+      Result.BlockerFieldName = S->FieldName;
+      Result.BlockerReason =
+          "scalar alternative overlaps the managed pointer slot";
+      return Result;
+    }
+  }
+
+  Result.Scheme = C2GoUnionScheme::Scheme1;
+  Result.PointerOffsetBytes = PtrOff;
+  return Result;
+}
+
 std::string getStableRecordName(const RecordDecl *RD, const ASTContext &Ctx) {
   if (!RD)
     return std::string();

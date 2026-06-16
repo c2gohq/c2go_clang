@@ -2267,6 +2267,16 @@ def err_c2go_managed_cross_type : Error<
   "words. Bridge through a (managed) void* "
   "('(__attribute__((c2go_managed)) void *)'), or ensure one type's pointer "
   "layout is an initial prefix of the other (structural embedding)">;
+// c2go v15 §3.5 D5: a plain union overlay mixing a c2go_managed pointer
+// alternative and a non-managed alternative cannot be safely scanned by
+// the GC — the storage is opaque (no per-PC discriminator for which
+// alternative is live). Warn so the user either splits the union, pins
+// the pointee, or annotates fields with c2go_unmanaged.
+def warn_c2go_managed_union_overlay : Warning<
+  "union %0 mixes c2go_managed and unmanaged fields without "
+  "c2go_union_scheme1 / c2go_union_scheme2 attribute; "
+  "GC treats the storage as unmanaged (no relocation)">,
+  InGroup<C2GoManagedOverlay>;
 // c2go #472 (Wave J): storing &local (address of an automatic / parameter
 // variable in the current function) into a c2go-managed heap-rooted
 // pointer field. The heap object outlives the stack frame, so once the

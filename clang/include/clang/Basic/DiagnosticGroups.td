@@ -1806,6 +1806,8 @@ def ExperimentalOption : DiagGroup<"experimental-option">;
 def C2GoManagedAS1 : DiagGroup<"c2go-managed-as1">;
 // c2go v15 §3.5 D4: ptrtoint of a managed pointer escapes AS1.
 def C2GoManagedPtrToInt : DiagGroup<"c2go-managed-ptrtoint">;
+// c2go v15 §3.5 D5: union overlay mixing managed and unmanaged fields.
+def C2GoManagedOverlay : DiagGroup<"c2go-managed-overlay">;
 // c2go #472 (Wave J): storing &local into a c2go-managed heap-rooted
 // pointer field escapes the stack frame; the heap object outlives the
 // stack and the GC will trip on a dangling pointer if scanned post-return.
