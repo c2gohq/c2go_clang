@@ -8481,6 +8481,21 @@ ExprResult InitializationSequence::Perform(Sema &S,
         return ExprError();
       CurInit = Result;
 
+      // c2go v15 §3.5 D1 (init path): "initialization is also a store" —
+      // reject managed→unmanaged pointer init that would silently drop the
+      // AS1 GC discriminator. Skip param / return / stmt-expr-result paths;
+      // those have dedicated diagnostics
+      // (err_c2go_managed_to_unmanaged_call/return) with better wording.
+      if (S.getLangOpts().C2GoMode && !Entity.isParameterKind() &&
+          Entity.getKind() != InitializedEntity::EK_Result &&
+          Entity.getKind() != InitializedEntity::EK_StmtExprResult) {
+        S.checkC2GoManagedToUnmanagedStore(Step->Type, InitialCurInit.get(),
+                                           Kind.getLocation());
+        // c2go v15 §3.5.1 D4 (init path): managed→different-managed gcdata.
+        S.checkC2GoManagedCrossTypeCast(Step->Type, InitialCurInit.get(),
+                                        Kind.getLocation());
+      }
+
       // If this is a call, allow conversion to a transparent union.
       ExprResult CurInitExprRes = CurInit;
       if (!S.IsAssignConvertCompatible(ConvTy) && Entity.isParameterKind() &&

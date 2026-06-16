@@ -19,6 +19,7 @@
 #include "clang/AST/ASTLambda.h"
 #include "clang/AST/ASTMutationListener.h"
 #include "clang/AST/Attrs.inc"
+#include "clang/AST/C2GoUtil.h"
 #include "clang/AST/CXXInheritance.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclObjC.h"
@@ -30,6 +31,7 @@
 #include "clang/AST/ExprObjC.h"
 #include "clang/AST/MangleNumberingContext.h"
 #include "clang/AST/OperationKinds.h"
+#include "clang/AST/RecordLayout.h"
 #include "clang/AST/Type.h"
 #include "clang/AST/TypeLoc.h"
 #include "clang/Basic/Builtins.h"
@@ -66,6 +68,7 @@
 #include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/TypeSize.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include <limits>
 #include <optional>
 
@@ -6161,6 +6164,21 @@ bool Sema::GatherArgumentsForCall(SourceLocation CallLoc, FunctionDecl *FDecl,
         return true;
 
       Arg = ArgE.getAs<Expr>();
+
+      // c2go v15 §3.5 D3: passing a c2go_managed pointer to an unmanaged
+      // parameter (e.g. extern `void *`) drops the AS1 discriminator. The
+      // escape hatch is an explicit `(c2go_managed) T *` cast at the call site.
+      if (getLangOpts().C2GoMode && c2goTypeDropsManaged(ProtoArgType)) {
+        QualType OrigTy = Args[ArgIx - 1]->IgnoreParenImpCasts()->getType();
+        if (c2goTypeIsManagedPtr(OrigTy) &&
+            !c2goExprIsExplicitManagedCast(Args[ArgIx - 1])) {
+          bool IsExtern =
+              FDecl && (FDecl->getStorageClass() == SC_Extern ||
+                        !FDecl->hasBody());
+          Diag(Arg->getBeginLoc(), diag::err_c2go_managed_to_unmanaged_call)
+              << (IsExtern ? 1 : 0) << (i + 1) << ProtoArgType;
+        }
+      }
     } else {
       assert(Param && "can't use default arguments without a known callee");
 
@@ -14210,6 +14228,341 @@ static void CheckIdentityFieldAssignment(Expr *LHSExpr, Expr *RHSExpr,
 }
 
 // C99 6.5.16.1
+// c2go v15: is this expression a known *unmanaged* pointer? Conservative —
+// returns true only when the world is statically determinable (a decl or
+// field carrying c2go_unmanaged); unknown world → false (no diagnostic).
+static bool c2goExprIsUnmanagedPtr(const Expr *E) {
+  E = E->IgnoreParenImpCasts();
+  if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+    if (const ValueDecl *D = DRE->getDecl())
+      return D->hasAttr<C2GoUnmanagedAttr>();
+  } else if (const auto *ME = dyn_cast<MemberExpr>(E)) {
+    if (const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl()))
+      return FD->hasAttr<C2GoUnmanagedAttr>();
+  }
+  return false;
+}
+
+// c2go v15 §3.5 (D1/D2/D3): is this type a *managed* pointer? Delegates to
+// the shared `c2go::isManagedPointerType` helper (round 24 Blocker #2 v2)
+// so Sema, CGC2GoTypeInfo bitmap walkers and C2GoUtil's transitive walks
+// agree on the same definition. The discriminator mirrors AS1 lowering in
+// CodeGenTypes.cpp::isC2GoManagedRecordPointee — Sema is the first line of
+// defense against AS1 → void* leaks.
+bool Sema::c2goTypeIsManagedPtr(QualType Ty) const {
+  return c2go::isManagedPointerType(Ty);
+}
+
+// c2go v15 §3.5: target type drops the managed discriminator? True iff target
+// is a non-managed pointer (e.g. `void *` or any plain `T *` without
+// c2go_managed and whose pointee is not a c2go_struct).
+bool Sema::c2goTypeDropsManaged(QualType Ty) const {
+  if (Ty.isNull() || !Ty->isPointerType())
+    return false;
+  return !c2goTypeIsManagedPtr(Ty);
+}
+
+// c2go v15 §3.5: is this an explicit escape-hatch cast back to managed?
+// (`(__attribute__((c2go_managed)) T *)expr`). We detect by walking C-style
+// casts in the source; if any layer is annotated managed we treat the value
+// as user-acknowledged.
+bool Sema::c2goExprIsExplicitManagedCast(const Expr *E) const {
+  for (const Expr *Cur = E; Cur;) {
+    Cur = Cur->IgnoreParens();
+    if (const auto *CSC = dyn_cast<CStyleCastExpr>(Cur)) {
+      if (c2goTypeIsManagedPtr(CSC->getType()))
+        return true;
+      Cur = CSC->getSubExpr();
+      continue;
+    }
+    break;
+  }
+  return false;
+}
+
+// c2go v15: storing a pointer into a managed-pointer field *through an
+// unmanaged struct pointer* cannot emit the required GC write barrier — an
+// unmanaged pointer is not guaranteed to point to GC-managed memory, so the
+// barrier's precondition can't be established. Reject it; the user must
+// re-enter the managed world (managed handle or (c2go_managed) cast) to
+// mutate managed fields. Reads / scalar-field writes / unmanaged-field writes
+// through an unmanaged pointer are unaffected (the borrow sweet spot).
+// See docs/c2go_design.md "v15 转折点" dual-world subsection (task #267).
+static void checkC2GoManagedFieldStore(Sema &S, Expr *LHSExpr,
+                                       SourceLocation Loc) {
+  if (!S.getLangOpts().C2GoMode)
+    return;
+  const auto *ME = dyn_cast<MemberExpr>(LHSExpr->IgnoreParenImpCasts());
+  if (!ME || !ME->isArrow())
+    return; // only `p->field` (reached through a pointer)
+  const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());
+  if (!FD || !FD->getType()->isPointerType())
+    return;
+  // Field must be a MANAGED pointer: c2go_managed (explicit or Ptr-bit
+  // stamped), or a pointer to an already-managed struct (signal (ii)), and
+  // not explicitly unmanaged.
+  bool FieldManaged = FD->hasAttr<C2GoManagedAttr>();
+  if (!FieldManaged && !FD->hasAttr<C2GoUnmanagedAttr>())
+    if (const auto *RT = FD->getType()->getPointeeType()->getAs<RecordType>())
+      if (const RecordDecl *P = RT->getDecl())
+        FieldManaged = P->hasAttr<C2GoStructAttr>();
+  if (!FieldManaged)
+    return;
+  // Base must be reached through an UNMANAGED pointer (the borrow case).
+  if (!c2goExprIsUnmanagedPtr(ME->getBase()))
+    return;
+  S.Diag(Loc, diag::warn_c2go_managed_field_via_unmanaged) << FD->getDeclName();
+}
+
+// c2go #472 (Wave J): storing `&local` (address of an automatic or parameter
+// variable in the *current* function) into a heap-rooted c2go-managed
+// pointer field escapes the stack frame. The heap object outlives the
+// stack frame, so the stored address dangles into reclaimed stack memory
+// once the function returns; the GC will trip on it the next time the
+// heap object is scanned. We detect:
+//   LHS = `p->f` or `p.f` where the field is a pointer type AND the
+//         storage of the field is reachable from the Go GC (the base is a
+//         managed pointer / pointer-to-c2go_struct, and the field is not
+//         explicitly c2go_unmanaged);
+//   RHS = `&local` where `local` is a VarDecl with local storage
+//         (automatic local OR ParamVarDecl) of the current function.
+// Default-ON warning (-Wc2go-managed-stack-escape); not an error because
+// the escape may be locally safe if the function never returns while the
+// heap object is observable (rare, but production code uses this pattern
+// for short-lived temporaries). See task S2 / #472.
+//
+// Scope (intraprocedural-syntactic-only — #472 doc, task U2). Known gaps,
+// ordered by leakage surface (largest first):
+//   * SemaInit aggregate initialisers that bury `&local` in a designated
+//     initialiser of a heap-rooted struct
+//     (e.g. `struct Node n = {.next = &local};` where `n` later escapes).
+//     SemaInit reaches the field-init through a separate SK_CAssignment
+//     step (`SemaInit.cpp:8489-8493`) that calls
+//     `checkC2GoManagedToUnmanagedStore` only — `checkC2GoManagedStoreOf
+//     LocalAddr` is NOT wired there, so this entire init-list shape is
+//     uncovered. Largest known gap; a parallel hook would have to be
+//     added at that step.
+//   * Interprocedural taint laundered through a ParmVarDecl of a callee
+//     that carries stack provenance (e.g. caller writes `helper(&local);`
+//     and `helper` does `p->f = arg;`). This check only sees RHS spelled
+//     literally as `&local` (after paren / impcast / one optional C-style
+//     cast peeling); cross-function taint is out of scope here.
+//   * Compound assignments (`+=`, `-=`, ...) on pointer-typed LHS fields:
+//     the parent CheckAssignmentOperands is invoked for both plain `=`
+//     and compound forms, so a write like `p->f += (long)&local`
+//     (legal but obscure pointer-arith compound assignment) ALSO trips
+//     this warning. This is a CONSERVATIVE trip rather than a missed
+//     case: pointer-arith semantics intentionally drop the original
+//     `&local` bit pattern, so the warning here is a false-positive
+//     candidate — recorded for future narrowing if it surfaces in
+//     practice.
+void Sema::checkC2GoManagedStoreOfLocalAddr(Expr *LHSExpr, Expr *RHSExpr,
+                                            SourceLocation Loc) {
+  if (!getLangOpts().C2GoMode)
+    return;
+  if (!LHSExpr || !RHSExpr)
+    return;
+
+  // LHS must be a member-access `p->f` or `p.f`.
+  const auto *ME = dyn_cast<MemberExpr>(LHSExpr->IgnoreParenImpCasts());
+  if (!ME)
+    return;
+  const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());
+  if (!FD || !FD->getType()->isPointerType())
+    return;
+  if (FD->hasAttr<C2GoUnmanagedAttr>())
+    return;
+
+  // Base must reach a GC-managed heap object. Two cases:
+  //   (a) `p->f` — base is a managed pointer (c2go_managed sugar or
+  //       pointer-to-c2go_struct);
+  //   (b) `o.f`  — base is an lvalue whose type is a c2go_struct record
+  //       (the storage itself is GC-tracked).
+  const Expr *Base = ME->getBase();
+  bool BaseInHeap = false;
+  if (ME->isArrow()) {
+    BaseInHeap = c2goTypeIsManagedPtr(Base->getType());
+  } else {
+    QualType BT = Base->getType();
+    if (const RecordType *RT = BT->getAs<RecordType>())
+      if (const RecordDecl *RD = RT->getDecl())
+        BaseInHeap = RD->hasAttr<C2GoStructAttr>();
+  }
+  if (!BaseInHeap)
+    return;
+
+  // RHS must be `&local` after peeling parens / implicit casts / one
+  // optional C-style cast (e.g. `(void *)&local`).
+  const Expr *R = RHSExpr->IgnoreParenImpCasts();
+  if (const auto *CSC = dyn_cast<CStyleCastExpr>(R))
+    R = CSC->getSubExpr()->IgnoreParenImpCasts();
+  const auto *UO = dyn_cast<UnaryOperator>(R);
+  if (!UO || UO->getOpcode() != UO_AddrOf)
+    return;
+  const auto *DRE = dyn_cast<DeclRefExpr>(UO->getSubExpr()->IgnoreParenImpCasts());
+  if (!DRE)
+    return;
+  const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+  if (!VD || !VD->hasLocalStorage())
+    return;
+
+  Diag(Loc, diag::warn_c2go_managed_stack_escape);
+}
+
+// c2go v15 §3.5 D1: storing a managed pointer (RHS) into an unmanaged
+// pointer location (LHS type) drops the AS1 discriminator. Reject; the
+// escape hatch is an explicit `(__attribute__((c2go_managed)) T *)` cast
+// c2go v15 §3.5.1 D4 (Rule G, task T4) — collect the byte offsets of every
+// *scannable* pointer word (any non-function pointer; §3.4) in a record's
+// layout, recursing into embedded records and arrays. The resulting sorted
+// list IS the record's GC pointer layout (gcdata), at the AST level. Mirrors
+// the CGC2GoTypeInfo bitmap walker's scan decision (function-pointer no-scan;
+// both managed and unmanaged data pointers are force-scanned) so the front
+// end and the typeinfo emitter agree on what the GC will scan.
+static void collectC2GoScanPtrOffsets(
+    const RecordDecl *RD, uint64_t BaseOff, const ASTContext &Ctx,
+    llvm::SmallPtrSetImpl<const RecordDecl *> &Visited,
+    llvm::SmallVectorImpl<uint64_t> &Out) {
+  if (!RD)
+    return;
+  RD = RD->getDefinition();
+  if (!RD || RD->isUnion() || !Visited.insert(RD).second)
+    return;
+  const ASTRecordLayout &RL = Ctx.getASTRecordLayout(RD);
+  unsigned FieldNo = 0;
+  for (const FieldDecl *F : RD->fields()) {
+    uint64_t FieldOff = BaseOff + RL.getFieldOffset(FieldNo) / 8;
+    ++FieldNo;
+    QualType T = F->getType();
+    // Peel arrays: each element occupies its own word(s); emit one offset
+    // per element slot so an array of pointers contributes all its words.
+    uint64_t NumElems = 1;
+    QualType Elem = T;
+    while (const ArrayType *AT = Elem->getAsArrayTypeUnsafe()) {
+      if (const auto *CAT = dyn_cast<ConstantArrayType>(AT))
+        NumElems *= CAT->getSize().getZExtValue();
+      else
+        NumElems = 0; // VLA / incomplete: contributes no fixed offsets
+      Elem = AT->getElementType();
+    }
+    if (Elem.isNull())
+      continue;
+    if (Elem->isPointerType()) {
+      if (Elem->isFunctionPointerType())
+        continue; // no-scan (§3.4)
+      uint64_t ElemSz = Ctx.getTypeSizeInChars(Elem).getQuantity();
+      for (uint64_t I = 0; I < NumElems; ++I)
+        Out.push_back(FieldOff + I * ElemSz);
+      continue;
+    }
+    if (const RecordType *RT = Elem->getAs<RecordType>()) {
+      const RecordDecl *Inner = RT->getDecl();
+      uint64_t ElemSz = Ctx.getTypeSizeInChars(Elem).getQuantity();
+      for (uint64_t I = 0; I < NumElems; ++I)
+        collectC2GoScanPtrOffsets(Inner, FieldOff + I * ElemSz, Ctx, Visited,
+                                  Out);
+    }
+  }
+  Visited.erase(RD);
+}
+
+// Returns the sorted scan-pointer offset list for a record's pointee type.
+static llvm::SmallVector<uint64_t, 8>
+c2goRecordScanPtrLayout(const RecordDecl *RD, const ASTContext &Ctx) {
+  llvm::SmallVector<uint64_t, 8> Offs;
+  llvm::SmallPtrSet<const RecordDecl *, 8> Visited;
+  collectC2GoScanPtrOffsets(RD, 0, Ctx, Visited, Offs);
+  llvm::sort(Offs);
+  return Offs;
+}
+
+// D4 prefix-embedding exemption: is one record's GC pointer layout an initial
+// prefix of the other's (a "common-initial pointer sequence", e.g. struct
+// embedding A as the first member of B), AND the prefix type no larger than
+// the container? Identical layouts are the degenerate prefix and return true.
+static bool c2goLayoutsPrefixCompatible(const RecordDecl *A,
+                                        const RecordDecl *B,
+                                        const ASTContext &Ctx) {
+  auto OA = c2goRecordScanPtrLayout(A, Ctx);
+  auto OB = c2goRecordScanPtrLayout(B, Ctx);
+  const auto &Short = OA.size() <= OB.size() ? OA : OB;
+  const auto &Long = OA.size() <= OB.size() ? OB : OA;
+  for (size_t I = 0; I < Short.size(); ++I)
+    if (Short[I] != Long[I])
+      return false;
+  // The shorter (prefix) record must fit within the longer one so reading
+  // its fields out of the other object stays in-bounds.
+  const RecordDecl *ShortRD = OA.size() <= OB.size() ? A : B;
+  const RecordDecl *LongRD = OA.size() <= OB.size() ? B : A;
+  ShortRD = ShortRD->getDefinition();
+  LongRD = LongRD->getDefinition();
+  if (!ShortRD || !LongRD)
+    return Short.empty(); // incomplete: only safe when no pointers at all
+  uint64_t ShortSz = Ctx.getASTRecordLayout(ShortRD).getSize().getQuantity();
+  uint64_t LongSz = Ctx.getASTRecordLayout(LongRD).getSize().getQuantity();
+  return ShortSz <= LongSz;
+}
+
+// c2go v15 §3.5.1 D4 (Rule G, task T4): converting a c2go_managed pointer to a
+// *different* managed pointer type. The GC scans the pointee with the
+// destination type's gcdata bitmap; if the two record types' scan-pointer
+// layouts are not prefix-compatible the scan reads the wrong words. Exempt:
+// (a) either side is a (managed) void* bridge; (b) prefix-embedding. Shared by
+// the assignment/init store path and the explicit-cast path.
+void Sema::checkC2GoManagedCrossTypeCast(QualType DestType, Expr *SrcExpr,
+                                         SourceLocation Loc) {
+  if (!getLangOpts().C2GoMode || !SrcExpr)
+    return;
+  if (!c2goTypeIsManagedPtr(DestType))
+    return;
+  QualType SrcType = SrcExpr->IgnoreParenImpCasts()->getType();
+  if (!c2goTypeIsManagedPtr(SrcType))
+    return;
+  // (a) void* bridge — managed void* is the escape hatch; either direction OK.
+  QualType DestPointee = DestType->getPointeeType();
+  QualType SrcPointee = SrcType->getPointeeType();
+  if (DestPointee.isNull() || SrcPointee.isNull())
+    return;
+  if (DestPointee->isVoidType() || SrcPointee->isVoidType())
+    return;
+  const auto *DestRT = DestPointee->getAs<RecordType>();
+  const auto *SrcRT = SrcPointee->getAs<RecordType>();
+  if (!DestRT || !SrcRT)
+    return; // non-record managed pointee (e.g. pointer-to-pointer) — not D4.
+  const RecordDecl *DestRD = DestRT->getDecl();
+  const RecordDecl *SrcRD = SrcRT->getDecl();
+  if (!DestRD || !SrcRD ||
+      DestRD->getCanonicalDecl() == SrcRD->getCanonicalDecl())
+    return; // same record type — gcdata identical, OK.
+  // Note: unlike D1/D2 there is no "(c2go_managed) cast" escape for D4 — the
+  // only managed→managed exemptions are the void* bridge (handled above) and
+  // prefix-embedding (below) per §3.5.
+  // (b) prefix-embedding exemption (common-initial pointer sequence).
+  if (c2goLayoutsPrefixCompatible(SrcRD, DestRD, Context))
+    return;
+  Diag(Loc, diag::err_c2go_managed_cross_type) << SrcType << DestType;
+}
+
+// back to managed at the load site. Exposed as a Sema member so the init
+// path (SemaInit SK_CAssignment) can share the hook with the assignment
+// path (CheckAssignmentOperands).
+void Sema::checkC2GoManagedToUnmanagedStore(QualType LHSType, Expr *RHSExpr,
+                                            SourceLocation Loc) {
+  if (!getLangOpts().C2GoMode)
+    return;
+  if (!RHSExpr)
+    return;
+  if (!c2goTypeDropsManaged(LHSType))
+    return;
+  QualType RHSType = RHSExpr->IgnoreParenImpCasts()->getType();
+  if (!c2goTypeIsManagedPtr(RHSType))
+    return;
+  // Allow explicit user-acknowledged AS1 → void* via cast on the RHS.
+  if (c2goExprIsExplicitManagedCast(RHSExpr))
+    return;
+  Diag(Loc, diag::err_c2go_managed_to_unmanaged_store) << LHSType;
+}
+
 QualType Sema::CheckAssignmentOperands(Expr *LHSExpr, ExprResult &RHS,
                                        SourceLocation Loc,
                                        QualType CompoundType,
@@ -14219,6 +14572,15 @@ QualType Sema::CheckAssignmentOperands(Expr *LHSExpr, ExprResult &RHS,
   // Verify that LHS is a modifiable lvalue, and emit error if not.
   if (CheckForModifiableLvalue(LHSExpr, Loc, *this))
     return QualType();
+
+  // c2go v15: reject storing into a managed-ptr field via an unmanaged ptr.
+  checkC2GoManagedFieldStore(*this, LHSExpr, Loc);
+  // c2go v15 §3.5 D1: reject managed→unmanaged ptr store (drops AS1).
+  checkC2GoManagedToUnmanagedStore(LHSExpr->getType(), RHS.get(), Loc);
+  // c2go v15 §3.5.1 D4: reject managed→different-managed ptr store (gcdata).
+  checkC2GoManagedCrossTypeCast(LHSExpr->getType(), RHS.get(), Loc);
+  // c2go #472: warn on storing &local into a heap-rooted managed field.
+  checkC2GoManagedStoreOfLocalAddr(LHSExpr, RHS.get(), Loc);
 
   QualType LHSType = LHSExpr->getType();
   QualType RHSType = CompoundType.isNull() ? RHS.get()->getType() :
@@ -16566,6 +16928,100 @@ ExprResult Sema::ActOnBuiltinOffsetOf(Scope *S,
   return BuildBuiltinOffsetOf(BuiltinLoc, ArgTInfo, Components, RParenLoc);
 }
 
+ExprResult Sema::ActOnC2GoTypeInfo(Scope *S, SourceLocation BuiltinLoc,
+                                   SourceLocation TypeLoc,
+                                   ParsedType ParsedArgTy,
+                                   SourceLocation RParenLoc) {
+  QualType ArgTy = GetTypeFromParser(ParsedArgTy);
+  if (ArgTy.isNull())
+    return ExprError();
+
+  // The operand must name a record type; its RTTI descriptor is the Go-side
+  // `_typeinfo_<Name>` symbol c2gobind emits per managed record.
+  const RecordType *RT = ArgTy->getAs<RecordType>();
+  if (!RT) {
+    Diag(TypeLoc, diag::err_c2go_typeinfo_not_record) << ArgTy;
+    return ExprError();
+  }
+
+  RecordDecl *RD = RT->getDecl();
+  std::string RecName = c2go::getStableRecordName(RD, Context);
+  if (RecName.empty()) {
+    Diag(TypeLoc, diag::err_c2go_typeinfo_anonymous);
+    return ExprError();
+  }
+
+  // Reference the per-type RTTI descriptor global `c2go.typeinfo.<Name>`.
+  // This is the SAME symbol CGC2GoTypeInfo emits for the record (a C-owner
+  // `c2go._gotype` definition, or an external decl for Go-owner types). The
+  // Plan 9 InstPrinter already recognises the `c2go.typeinfo.` prefix and
+  // rewrites the address-of into `MOVD ·_typeinfo_<Name>(SB)`, the load of
+  // c2gobind's per-type indirection var — so this auto-resolves to exactly
+  // the descriptor c2gobind defines, with no manual extern declaration.
+  std::string SymName = (llvm::c2go::kTypeinfoGVPrefix + RecName).str();
+
+  // Synthesize (once per TU) an extern variable bound to SymName via
+  // AsmLabelAttr; its address is the descriptor pointer. Cached by a unique
+  // internal identifier so repeated __c2go_typeinfo(T) uses share one
+  // declaration. The variable's C type is the record type itself: CodeGen
+  // recovers the RecordDecl from it to drive CGC2GoTypeInfo's definition
+  // emission (so the descriptor is a locally-defined symbol, not a GOT-
+  // indirect extern) before taking its address.
+  TranslationUnitDecl *TU = Context.getTranslationUnitDecl();
+  // c2go #385: The descriptor VarDecl's C type is intentionally an AS-neutral
+  // scalar (`const unsigned char`) — not `const T` — so the address-of
+  // expression below does NOT match `c2goTypeIsManagedPtr` (a pointer is
+  // managed only when its pointee is a c2go_struct Record). That removes a
+  // chain of false-positives across SemaCast/SemaExpr/SemaDecl D1-D4 on the
+  // idiom `gc_malloc(c2go_typeinfo(struct N), n)`. The originating
+  // RecordDecl is preserved on the VarDecl via the internal C2GoTypeInfoAttr
+  // carrier so CodeGen can still drive CGC2GoTypeInfo's descriptor emission.
+  QualType DescTy = Context.UnsignedCharTy.withConst();
+
+  VarDecl *VD = nullptr;
+  std::string LookupName = "__c2go_typeinfo_" + RecName;
+  IdentifierInfo *VarII = &Context.Idents.get(LookupName);
+  for (NamedDecl *ND : TU->lookup(DeclarationName(VarII))) {
+    if (auto *Existing = dyn_cast<VarDecl>(ND)) {
+      VD = Existing;
+      // c2go #402(c) / #392 / #385: self-heal the cached VarDecl. PCH/Module
+      // deserialization or a user-written shadow `extern` with the same
+      // __c2go_typeinfo_<Name> identifier can yield a cached VarDecl that
+      // lacks C2GoTypeInfoAttr. Without the attr CGExpr's
+      // EmitGlobalVarDeclLValue lookup misses, silently skipping the
+      // CGC2GoTypeInfo descriptor emission and leaving the c2go.typeinfo.<N>
+      // reference as a dangling extern. Re-attach the attr on cache-hit so
+      // every code path agrees on the originating RecordDecl.
+      if (!VD->hasAttr<C2GoTypeInfoAttr>())
+        VD->addAttr(C2GoTypeInfoAttr::CreateImplicit(Context, RD, BuiltinLoc));
+      break;
+    }
+  }
+  if (!VD) {
+    VD = VarDecl::Create(Context, TU, BuiltinLoc, BuiltinLoc, VarII, DescTy,
+                         Context.getTrivialTypeSourceInfo(DescTy, BuiltinLoc),
+                         SC_Extern);
+    VD->setImplicit();
+    VD->addAttr(AsmLabelAttr::CreateImplicit(Context, SymName, BuiltinLoc));
+    // c2go #385: carry the originating RecordDecl on the VarDecl so
+    // EmitGlobalVarDeclLValue can drive CGC2GoTypeInfo without inferring
+    // from the now-scalar VarDecl type.
+    VD->addAttr(C2GoTypeInfoAttr::CreateImplicit(Context, RD, BuiltinLoc));
+    TU->addDecl(VD);
+  }
+
+  // Build &__c2go_typeinfo_<Name>, yielding a `const void *` RTTI pointer.
+  ExprResult Ref = BuildDeclRefExpr(
+      VD, DescTy, VK_LValue,
+      DeclarationNameInfo(VD->getDeclName(), BuiltinLoc));
+  if (Ref.isInvalid())
+    return ExprError();
+  ExprResult AddrOf = CreateBuiltinUnaryOp(BuiltinLoc, UO_AddrOf, Ref.get());
+  if (AddrOf.isInvalid())
+    return ExprError();
+  QualType VoidPtrTy = Context.getPointerType(Context.VoidTy.withConst());
+  return ImpCastExprToType(AddrOf.get(), VoidPtrTy, CK_BitCast);
+}
 
 ExprResult Sema::ActOnChooseExpr(SourceLocation BuiltinLoc,
                                  Expr *CondExpr,

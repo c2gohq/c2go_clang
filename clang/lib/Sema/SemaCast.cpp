@@ -3287,6 +3287,16 @@ void CastOperation::CheckCStyleCast() {
         Diag = diag::warn_pointer_to_int_cast;
       Self.Diag(OpRange.getBegin(), Diag) << SrcType << DestType << OpRange;
     }
+    // c2go v15 §3.5 D4: managed pointer -> integer drops AS1 tracking.
+    // Same root cause as D1/D2/D3 (store/return/call): the integer carries
+    // no GC discriminator, so the pointee cannot be relocated across a
+    // safepoint. Warn (not error) — pure hash/printf uses are common and
+    // safe so long as the integer does not outlive a safepoint.
+    if (Self.getLangOpts().C2GoMode &&
+        Self.c2goTypeIsManagedPtr(SrcType) &&
+        DestType->isIntegerType() && !DestType->isBooleanType()) {
+      Self.Diag(OpRange.getBegin(), diag::warn_c2go_managed_ptrtoint);
+    }
   }
 
   if (Self.getLangOpts().OpenCL && !Self.getOpenCLOptions().isAvailableOption(
@@ -3348,6 +3358,15 @@ void CastOperation::CheckCStyleCast() {
       SrcExpr = ExprError();
       return;
     }
+
+    // c2go v15 §3.5.1 D4 (Rule G, task T4): explicit C-style cast between two
+    // managed pointer types with incompatible GC layouts. The void* bridge,
+    // prefix-embedding, and explicit (c2go_managed) escape exemptions live in
+    // the shared helper. (Compiler-internal union conversions use CK_ToUnion,
+    // not a pointer-to-pointer cast, so they never reach here.)
+    if (Self.getLangOpts().C2GoMode)
+      Self.checkC2GoManagedCrossTypeCast(DestType, SrcExpr.get(),
+                                         OpRange.getBegin());
   }
 
   DiagnoseCastOfObjCSEL(Self, SrcExpr, DestType);

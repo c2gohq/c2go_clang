@@ -1801,3 +1801,12 @@ def TrivialAutoVarInit : DiagGroup<"trivial-auto-var-init">;
 
 // A warning for options that enable a feature that is not yet complete
 def ExperimentalOption : DiagGroup<"experimental-option">;
+
+// c2go v15 §3.5 AS1 interconversion diagnostics (D1/D2/D3).
+def C2GoManagedAS1 : DiagGroup<"c2go-managed-as1">;
+// c2go v15 §3.5 D4: ptrtoint of a managed pointer escapes AS1.
+def C2GoManagedPtrToInt : DiagGroup<"c2go-managed-ptrtoint">;
+// c2go #472 (Wave J): storing &local into a c2go-managed heap-rooted
+// pointer field escapes the stack frame; the heap object outlives the
+// stack and the GC will trip on a dangling pointer if scanned post-return.
+def C2GoManagedStackEscape : DiagGroup<"c2go-managed-stack-escape">;

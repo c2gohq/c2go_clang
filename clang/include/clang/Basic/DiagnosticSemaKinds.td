@@ -2217,6 +2217,66 @@ def select_special_member_kind : TextSubstitution<
 def note_member_declared_at : Note<"member is declared here">;
 def note_ivar_decl : Note<"instance variable is declared here">;
 def note_bitfield_decl : Note<"bit-field is declared here">;
+// c2go v15 §3.5 AS1 interconversion (D1/D2/D3): managed-pointer -> void* /
+// unmanaged-pointer drops the Go-managed-heap discriminator, so storing it
+// into an unmanaged location, returning it as void*, or passing it to an
+// extern void* parameter would let it escape RS4GC root tracking. The
+// in-source escape hatch is an explicit cast back to managed.
+def err_c2go_managed_to_unmanaged_store : ExtWarn<
+  "storing a c2go_managed pointer into an unmanaged location of type %0 "
+  "drops the Go GC discriminator (AS1) and is not safe: the pointer will "
+  "not be tracked across GC safepoints. Cast back to managed at the load "
+  "site, or pin the object via runtime.KeepAlive">,
+  InGroup<C2GoManagedAS1>, DefaultError;
+def err_c2go_managed_to_unmanaged_return : ExtWarn<
+  "returning a c2go_managed pointer through unmanaged return type %0 "
+  "drops the Go GC discriminator (AS1) and is not safe: callers will not "
+  "track this pointer across safepoints. Mark the return type managed, "
+  "or copy the pointee into the caller's managed memory">,
+  InGroup<C2GoManagedAS1>, DefaultError;
+def err_c2go_managed_to_unmanaged_call : ExtWarn<
+  "passing a c2go_managed pointer to %select{parameter %1|extern parameter %1}0 "
+  "of unmanaged type %2 drops the Go GC discriminator (AS1) and is not "
+  "safe: the callee will not track the pointer across safepoints. Mark the "
+  "parameter managed, or pass an unmanaged copy">,
+  InGroup<C2GoManagedAS1>, DefaultError;
+// c2go v15 §3.5 D4: ptrtoint of a managed pointer escapes AS1 — the
+// integer carries no GC discriminator, so if it outlives a safepoint
+// and is later cast back to a pointer, RewriteStatepointsForGC cannot
+// find the root. Warn (do not block); user can pin or keep the pointer
+// in a managed location across the safepoint.
+def warn_c2go_managed_ptrtoint : Warning<
+  "converting a c2go_managed pointer to integer drops AS1 GC provenance "
+  "(lowered to `ptrtoaddr`, non-capturing address extract); "
+  "the integer must not outlive a safepoint — if it does and is cast back, "
+  "RewriteStatepointsForGC cannot find the root">,
+  InGroup<C2GoManagedPtrToInt>;
+// c2go v15 §3.5 / §3.5.1 D4 (Rule G, task T4): converting a c2go_managed
+// pointer to a *different* managed pointer type whose GC pointer layout
+// (gcdata) is not a prefix of the source's. The GC scans the pointee with
+// the destination type's bitmap; if the pointer layouts differ, scanning
+// reads the wrong words (a scalar misread as a pointer, or a live pointer
+// missed). Exempt: a (managed) void* bridge, and structural embedding where
+// the destination's pointer layout is an initial prefix of the source's
+// (common-initial pointer sequence). The escape hatch is an explicit
+// (__attribute__((c2go_managed)) T *) cast.
+def err_c2go_managed_cross_type : Error<
+  "converting between c2go_managed pointer types with incompatible GC "
+  "layouts (%0 -> %1): the Go GC scans the pointee with the destination "
+  "type's gcdata bitmap, so a mismatched pointer layout would scan the wrong "
+  "words. Bridge through a (managed) void* "
+  "('(__attribute__((c2go_managed)) void *)'), or ensure one type's pointer "
+  "layout is an initial prefix of the other (structural embedding)">;
+// c2go #472 (Wave J): storing &local (address of an automatic / parameter
+// variable in the current function) into a c2go-managed heap-rooted
+// pointer field. The heap object outlives the stack frame, so once the
+// function returns the stored address dangles into reclaimed stack memory
+// and the GC will trip on it the next time the heap object is scanned.
+def warn_c2go_managed_stack_escape : Warning<
+  "storing &local into a c2go-managed heap-rooted pointer field; the heap "
+  "object outlives the stack frame and the GC will trip on a dangling "
+  "pointer if scanned post-return">,
+  InGroup<C2GoManagedStackEscape>;
 // c2go: __c2go_typeinfo(type) RTTI surface.
 def err_c2go_typeinfo_not_record : Error<
   "'__c2go_typeinfo' requires a record (struct/union) type; %0 is not a "
