@@ -89,6 +89,10 @@ public:
 
   bool hasReservedCallFrame(const MachineFunction &MF) const override;
 
+  bool canSimplifyCallFramePseudos(const MachineFunction &MF) const override;
+
+  bool needsFrameIndexResolution(const MachineFunction &MF) const override;
+
   bool
   assignCalleeSavedSpillSlots(MachineFunction &MF,
                               const TargetRegisterInfo *TRI,

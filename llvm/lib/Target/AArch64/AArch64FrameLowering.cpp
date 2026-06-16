@@ -220,8 +220,10 @@
 #include "AArch64RegisterInfo.h"
 #include "AArch64SMEAttributes.h"
 #include "AArch64Subtarget.h"
+#include "C2GoFrameEmitter.h"
 #include "MCTargetDesc/AArch64AddressingModes.h"
 #include "MCTargetDesc/AArch64MCTargetDesc.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -243,11 +245,17 @@
 #include "llvm/CodeGen/WinEHFuncInfo.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/CallingConv.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugLoc.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Metadata.h"
+#include "llvm/IR/Module.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCDwarf.h"
+#include "llvm/MC/MCPlan9AsmStreamer.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -256,6 +264,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include <cassert>
 #include <cstdint>
 #include <iterator>
@@ -269,6 +278,16 @@ using namespace llvm;
 static cl::opt<bool> EnableRedZone("aarch64-redzone",
                                    cl::desc("enable use of redzone on AArch64"),
                                    cl::init(false), cl::Hidden);
+
+// c2go GC Approach B (#330) Milestone 3+5: pointer-spill-slot marking
+// (OR "ptr"-tagged anonymous spill slots into the locals pointer map).
+//
+// #377: was `-c2go-gc-spill-tags` cl::opt (default ON). Mature path (SQLite
+// 7×150 soak, abitest 9/9). Operators can disable via
+// `-mllvm -c2go-disable=spill-tags` if a regression is reported; without it
+// the pipeline falls back to the pre-M3 RS4GC-only path. M5 per-PC liveness
+// (default ON) computes the per-PC live set; both call sites read the
+// emergency flag directly through llvm::c2go::isC2GoDisabled().
 
 static cl::opt<bool> StackTaggingMergeSetTag(
     "stack-tagging-merge-settag",
@@ -643,12 +662,70 @@ bool AArch64FrameLowering::isFPReserved(const MachineFunction &MF) const {
 /// included as part of the stack frame.
 bool AArch64FrameLowering::hasReservedCallFrame(
     const MachineFunction &MF) const {
+  // c2go (#130): only c2go-mode functions that CALL an AAPCS variadic
+  // callee need to disable reserved-call-frame — the AAPCS variadic
+  // spec lays outgoing args at sp+0, which would clash with our
+  // saved-LR-at-sp+0 contract. Per-callsite sub/add sp separates the
+  // variadic outgoing-args region from the LR slot.
+  //
+  // Every OTHER c2go function (including the common case: AAPCS caller
+  // -> GoABI0 callee like runtime.mallocgc) keeps reserved-call-frame.
+  // The outgoing-args block is allocated once in the prologue, and
+  // retval reads use frame-relative fixed sp offsets — no per-callsite
+  // sub/add sp ambiguity. This is what fixes the SQLite "random crash
+  // on return value" symptom (was #125, now dissolved).
+  if (MF.getFunction().getParent()->getModuleFlag(llvm::c2go::kGoabiModuleFlag) != nullptr) {
+    auto *AFI = MF.getInfo<AArch64FunctionInfo>();
+    if (AFI && AFI->hasC2GoVariadicOutgoingCall())
+      return false;
+  }
   // The stack probing code for the dynamically allocated outgoing arguments
   // area assumes that the stack is probed at the top - either by the prologue
   // code, which issues a probe if `hasVarSizedObjects` return true, or by the
   // most recent variable-sized object allocation. Changing the condition here
   // may need to be followed up by changes to the probe issuing logic.
   return !MF.getFrameInfo().hasVarSizedObjects();
+}
+
+/// canSimplifyCallFramePseudos - PEI's calculateCallFrameInfo eliminates the
+/// ADJCALLSTACKDOWN/UP pseudos EARLY (and stops tracking SP adjustment for
+/// frame-index elimination) whenever this returns true. The generic default
+/// returns `hasReservedCallFrame(MF) || hasFP(MF)`: with a frame pointer,
+/// locals are normally reached via FP, which does not move during a
+/// per-callsite SUB/ADD SP, so SPAdj tracking is unnecessary.
+///
+/// c2go (#130/#229) breaks that assumption: c2go functions DO have FP (Darwin
+/// frame chain), but their locals are addressed via SP, not FP (see
+/// resolveFrameOffsetReference's c2go branch). On the non-reserved-call-frame
+/// path (a c2go function that calls an AAPCS variadic), a local spilled INSIDE
+/// the per-callsite SUB/ADD window must have SPAdj added back to its SP-
+/// relative offset (AArch64RegisterInfo::eliminateFrameIndex, #229), or it
+/// lands in the just-subtracted callsite slab — at frame_base+0, the
+/// go-asm-saved-LR slot — clobbering the return address. Keep the pseudos
+/// alive so PEI tracks SPAdj for exactly these functions.
+bool AArch64FrameLowering::canSimplifyCallFramePseudos(
+    const MachineFunction &MF) const {
+  if (MF.getFunction().getParent()->getModuleFlag(llvm::c2go::kGoabiModuleFlag) != nullptr &&
+      !hasReservedCallFrame(MF))
+    return false;
+  return TargetFrameLowering::canSimplifyCallFramePseudos(MF);
+}
+
+/// needsFrameIndexResolution - Returning false here lets PEI skip the
+/// frame-index-replacement walk entirely (the generic default skips it when
+/// the function has no stack objects). That walk is ALSO where the
+/// ADJCALLSTACKDOWN/UP pseudos get eliminated when canSimplifyCallFramePseudos
+/// is false. So for the c2go non-reserved-call-frame path — where we keep the
+/// pseudos alive precisely to track SPAdj — we must force the walk to run even
+/// for a function with no stack objects (e.g. one whose only call is a variadic
+/// taking a stack arg materialized straight off SP), or the pseudos survive to
+/// the emitter ("Unsupported instruction: ADJCALLSTACKDOWN").
+bool AArch64FrameLowering::needsFrameIndexResolution(
+    const MachineFunction &MF) const {
+  if (MF.getFunction().getParent()->getModuleFlag(llvm::c2go::kGoabiModuleFlag) != nullptr &&
+      !hasReservedCallFrame(MF))
+    return true;
+  return TargetFrameLowering::needsFrameIndexResolution(MF);
 }
 
 MachineBasicBlock::iterator AArch64FrameLowering::eliminateCallFramePseudoInstr(
@@ -1211,14 +1288,30 @@ void AArch64FrameLowering::emitPacRetPlusLeafHardening(
   }
 }
 
+// c2go #238 (Phase 1): the c2go helpers (isC2GoMode, c2goMakesRealCall,
+// c2GoFrameSize, c2goMarkPtrFieldBits, emitC2GoPrologue, emitC2GoEpilogue)
+// have been moved to C2GoFrameEmitter.{h,cpp}. The local references in this
+// file now go through `llvm::c2go::` (see emitPrologue / emitEpilogue
+// dispatch and resolveFrameOffsetReference / getFrameIndexReferencePreferSP
+// below).
+
+
 void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
                                         MachineBasicBlock &MBB) const {
+  // c2go Phase B/E: c2go-mode requires a hand-rolled Plan 9 prologue
+  // (LR at [sp+0], FP at [sp-8] red zone). Bypass the standard
+  // AArch64PrologueEmitter machinery for those functions.
+  if (c2go::emitC2GoPrologue(MF, MBB))
+    return;
   AArch64PrologueEmitter PrologueEmitter(MF, MBB, *this);
   PrologueEmitter.emitPrologue();
 }
 
 void AArch64FrameLowering::emitEpilogue(MachineFunction &MF,
                                         MachineBasicBlock &MBB) const {
+  // c2go Phase B/E mirror — see emitPrologue.
+  if (c2go::emitC2GoEpilogue(MF, MBB))
+    return;
   AArch64EpilogueEmitter EpilogueEmitter(MF, MBB, *this);
   EpilogueEmitter.emitEpilogue();
 }
@@ -1366,6 +1459,48 @@ StackOffset AArch64FrameLowering::resolveFrameOffsetReference(
   const auto &Subtarget = MF.getSubtarget<AArch64Subtarget>();
   const AArch64RegisterInfo *RegInfo = Subtarget.getRegisterInfo();
   const auto *AFI = MF.getInfo<AArch64FunctionInfo>();
+
+  // c2go Phase B/E: Plan 9 frame layout has FP register = sp - 8
+  // (BELOW the new frame, in the red zone). LLVM's standard
+  // getFPOffset formula assumes FP is at the standard ARM64 CS-area
+  // position; for Plan 9 we override directly.
+  //   FP-based (incoming args, in the caller's frame above sp+framesize):
+  //     FP + framesize + 8 + ObjectOffset
+  //       = (sp - 8) + framesize + 8 + ObjectOffset
+  //       = sp + framesize + ObjectOffset
+  //   SP-based (locals): sp + framesize - 8 + ObjectOffset
+  //     The extra -8 reserves the frame-top FP slot [sp+framesize-8,
+  //     sp+framesize) that c2GoFrameSize set aside, so locals occupy
+  //     [sp+8, sp+framesize-8) and no managed local lands at
+  //     sp+framesize-8 (== varp, which the runtime's locals scan
+  //     excludes). LR stays at sp+0.
+  if (c2go::isC2GoMode(MF) && !MFI.isScalableStackID(StackID)) {
+    // Prefer the c2go-published framesize on AArch64FunctionInfo; falls back
+    // to MFI for paths where the c2go prologue was skipped (true leaf with
+    // no locals — both shares yield 0 here).
+    int64_t FrameSize = AFI->hasC2GoFrameSize()
+                            ? static_cast<int64_t>(AFI->getC2GoFrameSize())
+                            : static_cast<int64_t>(MFI.getStackSize());
+    // c2go (#306): ALWAYS base on SP — for incoming args (FIXED objects)
+    // as well as locals. The Plan 9 emitter only translates SP-based
+    // memory operands: AArch64Plan9InstPrinter::tryPrintSPPair bails on
+    // any non-SP base, so an LDP/STP load-pair through FP (which -O2
+    // forms when it merges two adjacent FP-relative arg loads) degrades
+    // to a raw WORD carrying the stale internal AAPCS offset → it reads
+    // the wrong stack slot (this was #306's deterministic malformed-schema
+    // miscompile). c2go rejects VLAs / dynamic alloca (#280), so SP is
+    // always a statically-known valid base and FP buys nothing here.
+    // FP = sp - 8, so the old FP branch (FP + framesize + 8 + ObjectOffset)
+    // and this SP form (sp + framesize + ObjectOffset for a FIXED arg)
+    // resolve to the SAME address — this only swaps the base register.
+    FrameReg = AArch64::SP;
+    // Locals reserve the frame-top FP word (-8 below the top); incoming
+    // args are FIXED objects living in the caller's frame ABOVE
+    // sp+framesize, so they must NOT get the reservation shift (otherwise
+    // an SP-based arg access reads 8 bytes too low, landing on the
+    // saved-LR word instead of the first GoABI0 stack arg).
+    return StackOffset::getFixed(ObjectOffset + FrameSize - (isFixed ? 0 : 8));
+  }
 
   int64_t FPOffset = getFPOffset(MF, ObjectOffset).getFixed();
   int64_t Offset = getStackOffset(MF, ObjectOffset).getFixed();
@@ -3520,6 +3655,16 @@ StackOffset AArch64FrameLowering::getFrameIndexReferencePreferSP(
     FrameReg = AArch64::SP;
     return StackOffset::getFixed(MFI.getObjectOffset(FI));
   }
+
+  // c2go: route through the common c2go frame resolution
+  // (resolveFrameOffsetReference) so STATEPOINT stackmap offsets — resolved
+  // here by PEI — match the body's spill stores. Both must apply the c2go
+  // frame-top FP-word reservation (-8 for SP-based locals); the generic
+  // getStackOffset path below does NOT, which would otherwise record gc
+  // spill slots 8 bytes high (at varp, where the Go locals scan can't see
+  // them). See c2GoFrameSize / resolveFrameOffsetReference.
+  if (c2go::isC2GoMode(MF))
+    return getFrameIndexReference(MF, FI, FrameReg);
 
   // Go to common code if we cannot provide sp + offset.
   if (MFI.hasVarSizedObjects() ||

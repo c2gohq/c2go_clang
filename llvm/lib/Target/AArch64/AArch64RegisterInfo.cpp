@@ -30,8 +30,10 @@
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 
 using namespace llvm;
 
@@ -86,6 +88,14 @@ AArch64RegisterInfo::getCalleeSavedRegs(const MachineFunction *MF) const {
       return CSR_Win_AArch64_AAPCS_SwiftError_SaveList;
     return CSR_AArch64_AAPCS_SwiftError_SaveList;
   }
+
+  // c2go Phase B/E: c2go-mode emitC2GoPrologue handles LR/FP save manually in
+  // Plan 9 layout (LR at [sp+0], FP at [sp-8] red zone). The standard CSR
+  // spill machinery must NOT also try to save them — return an empty CSR list.
+  // All other registers are caller-saved (callers spill what they need).
+  if (F.getCallingConv() == CallingConv::GoABI0 ||
+      F.getParent()->getModuleFlag(llvm::c2go::kGoabiModuleFlag) != nullptr)
+    return CSR_AArch64_NoRegs_SaveList;
 
   switch (F.getCallingConv()) {
   case CallingConv::GHC:
@@ -273,6 +283,12 @@ AArch64RegisterInfo::getCallPreservedMask(const MachineFunction &MF,
   bool SCS = MF.getFunction().hasFnAttribute(Attribute::ShadowCallStack);
   if (CC == CallingConv::GHC)
     // This is academic because all GHC calls are (supposed to be) tail calls
+    return SCS ? CSR_AArch64_NoRegs_SCS_RegMask : CSR_AArch64_NoRegs_RegMask;
+  if (CC == CallingConv::GoABI0 ||
+      MF.getFunction().getParent()->getModuleFlag(llvm::c2go::kGoabiModuleFlag) != nullptr)
+    // c2go Phase B/E: callee preserves only FP/LR via custom
+    // prologue (no standard CSR machinery). Nothing user-visible is
+    // preserved across calls.
     return SCS ? CSR_AArch64_NoRegs_SCS_RegMask : CSR_AArch64_NoRegs_RegMask;
   if (CC == CallingConv::PreserveNone)
     return SCS ? CSR_AArch64_NoneRegs_SCS_RegMask
@@ -490,6 +506,25 @@ AArch64RegisterInfo::getStrictlyReservedRegs(const MachineFunction &MF) const {
     markSuperRegs(Reserved, AArch64::X28);
     markSuperRegs(Reserved, AArch64::W27);
     markSuperRegs(Reserved, AArch64::W28);
+  }
+
+  // c2go Phase B7: in any module containing GoABI0 functions, reserve the
+  // registers the Go runtime / assembler reserve on arm64, which the c2go
+  // neutral-ELF codegen triple would otherwise hand to the register allocator:
+  //   X28 = g (goroutine pointer; runtime loads/stores through it directly),
+  //   X27 = REGTMP (Go assembler/linker scratch — clobbering corrupts it),
+  //   X18 = platform register (Go reserves it; `go tool asm` rejects it as an
+  //         operand: "illegal addressing mode for symbol R18").
+  // LLVM-emitted c2go code must not allocate any of these. Reserve per-function
+  // for GoABI0 functions plus any function in a c2go.goabi-flagged module.
+  if (MF.getFunction().getCallingConv() == CallingConv::GoABI0 ||
+      MF.getFunction().getParent()->getModuleFlag(llvm::c2go::kGoabiModuleFlag) != nullptr) {
+    markSuperRegs(Reserved, AArch64::X28);
+    markSuperRegs(Reserved, AArch64::W28);
+    markSuperRegs(Reserved, AArch64::X27);
+    markSuperRegs(Reserved, AArch64::W27);
+    markSuperRegs(Reserved, AArch64::X18);
+    markSuperRegs(Reserved, AArch64::W18);
   }
 
   assert(checkAllSuperRegsMarked(Reserved));
@@ -977,7 +1012,15 @@ void AArch64RegisterInfo::getOffsetOpcodes(
 bool AArch64RegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
                                               int SPAdj, unsigned FIOperandNum,
                                               RegScavenger *RS) const {
-  assert(SPAdj == 0 && "Unexpected");
+  // #229: c2go-mode introduces non-reserved call frames for c2go-style
+  // variadic outgoing calls (see AArch64FrameLowering.cpp
+  // hasReservedCallFrame). In that mode PEI inserts CFA-adjusting
+  // SUB/ADD SP, #N around each call site; references to locals inside
+  // the call sequence must have SPAdj added to their SP-relative
+  // offset, or they land in the just-allocated argument slab instead
+  // of the caller's frame. Upstream LLVM asserts SPAdj==0 here because
+  // every other AArch64 path keeps a reserved call frame; for c2go we
+  // accept a non-zero SPAdj and propagate it below (FrameReg == SP).
 
   MachineInstr &MI = *II;
   MachineBasicBlock &MBB = *MI.getParent();
@@ -986,6 +1029,15 @@ bool AArch64RegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
   const AArch64InstrInfo *TII =
       MF.getSubtarget<AArch64Subtarget>().getInstrInfo();
   const AArch64FrameLowering *TFI = getFrameLowering(MF);
+  // Preserve the upstream invariant `SPAdj==0` for any non-c2go function.
+  // Only c2go-mode modules opt into the non-reserved call-frame path that
+  // legitimately propagates a non-zero SPAdj into the eliminated offset.
+  // Without this guard a third-party pass on a non-c2go binary could silently
+  // miscompile when it sets SPAdj!=0.
+  assert((MF.getFunction().getParent()->getModuleFlag(llvm::c2go::kGoabiModuleFlag) !=
+              nullptr ||
+          SPAdj == 0) &&
+         "Unexpected non-zero SPAdj outside c2go mode");
   int FrameIndex = MI.getOperand(FIOperandNum).getIndex();
   bool Tagged =
       MI.getOperand(FIOperandNum).getTargetFlags() & AArch64II::MO_TAGGED;
@@ -1050,6 +1102,14 @@ bool AArch64RegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
     Offset = TFI->resolveFrameIndexReference(
         MF, FrameIndex, FrameReg, /*PreferFP=*/false, /*ForSimm=*/true);
   }
+
+  // #229: when SP was adjusted by a CFA-frame insertion earlier in the
+  // call sequence (non-reserved call frame, c2go variadic path), the
+  // resolved offset is relative to the pre-CFA SP; add SPAdj so the
+  // emitted SP-relative immediate points to the same physical address
+  // again. FP-relative refs are immune (FP didn't move).
+  if (SPAdj != 0 && FrameReg == AArch64::SP)
+    Offset += StackOffset::getFixed(SPAdj);
 
   // Modify MI as necessary to handle as much of 'Offset' as possible
   if (rewriteAArch64FrameIndex(MI, FIOperandNum, FrameReg, Offset, TII))

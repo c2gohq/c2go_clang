@@ -15,7 +15,9 @@
 
 #include "AArch64SMEAttributes.h"
 #include "AArch64Subtarget.h"
+#include "C2GoFrameEmitter.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/CallingConvLower.h"
@@ -23,6 +25,7 @@
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/IR/Function.h"
+#include "llvm/MC/MCC2GoFunctionMetadata.h"
 #include "llvm/MC/MCLinkerOptimizationHint.h"
 #include "llvm/MC/MCSymbol.h"
 #include <cassert>
@@ -221,6 +224,87 @@ class AArch64FunctionInfo final : public MachineFunctionInfo {
 
   /// Whether this function changes streaming mode within the function.
   bool HasStreamingModeChanges = false;
+
+  /// c2go #427: all c2go-specific per-function state nested together so the
+  /// surrounding AArch64FunctionInfo stays close to upstream layout. Field
+  /// semantics (HasVariadicOutgoingCall / FrameSize{,Valid} / FI /
+  /// StagedMeta / LiveSpillSlotsAtCall / PtrSlotLivenessValid /
+  /// SpillSlotTags) are unchanged; only the storage was relocated. Public
+  /// accessors below still use the original `hasC2Go…/getC2Go…/setC2Go…`
+  /// names.
+  struct AArch64C2GoFunctionState {
+    /// c2go (#130): this function contains at least one AAPCS-variadic
+    /// outgoing call. AAPCS variadic spec lays the variadic outgoing
+    /// args at sp+0, which clashes with c2go's saved-LR-at-sp+0 contract.
+    /// We work around it by disabling reserved-call-frame ONLY for these
+    /// functions (per-callsite sub/add sp keeps the variadic spill region
+    /// separate from the LR slot). Non-variadic c2go functions stay
+    /// reserved-call-frame so retval reads from GoABI0 callees (e.g.
+    /// runtime.mallocgc) use frame-relative fixed offsets — see #125.
+    bool HasVariadicOutgoingCall = false;
+
+    /// c2go: the framesize computed by c2GoFrameSize() and consumed by the
+    /// c2go epilogue / resolveFrameOffsetReference. Stored explicitly on
+    /// AArch64FunctionInfo so the producer (emitC2GoPrologue) and consumers
+    /// don't rely on MachineFrameInfo::getStackSize() as an implicit channel
+    /// — any insert-pass between PEI sub-steps could otherwise stomp it.
+    /// Valid only when FrameSizeValid is set.
+    uint64_t FrameSize = 0;
+    bool FrameSizeValid = false;
+
+    /// c2go #238 (Phase 2): cached pure-function summary of the c2go frame
+    /// decisions (FrameSize + MakesRealCall). Filled lazily by
+    /// getOrComputeC2GoFI() — set once per MF and reused by the prologue/
+    /// epilogue emitters and the FrameLowering hooks that previously rescan
+    /// the function. See C2GoFrameEmitter.h::C2GoFrameInfo.
+    std::optional<c2go::C2GoFrameInfo> FI;
+
+    /// c2go #376: per-MF staged metadata aggregate written by the producer
+    /// (AArch64FrameLowering's c2go prologue and the stkobj collector in
+    /// AArch64AsmPrinter) and consumed by AArch64AsmPrinter::
+    /// emitFunctionEntryLabel — at which point we have a streamer pointer
+    /// and can call MCPlan9AsmStreamer::publishC2GoFunction. Replaces the
+    /// pre-#376 static side-channel that the producer published into
+    /// directly (no streamer handle at producer time).
+    std::optional<C2GoFunctionMetadata> StagedMeta;
+
+    /// c2go GC Approach B (#330) Milestone 5: per-PC liveness of pointer-
+    /// tagged spill slots. Populated by AArch64C2GoPtrSlotLivenessPass
+    /// (post-PEI, pre-emit) and queried by AArch64AsmPrinter::
+    /// LowerSTATEPOINT / LowerSTACKMAP. The key is the call MachineInstr
+    /// (STATEPOINT / STACKMAP / any isCall MI we emit stackmap data for);
+    /// the value is the set of "ptr"-tagged frame-indices that are LIVE
+    /// (i.e. were stored to by a ptr-derived value before this PC AND
+    /// will be loaded again after) — those are the only slots the locals
+    /// bitmap must mark at this safepoint. An absent key falls back to
+    /// "no live spill-slot pointer" (conservative post-M5 default; before
+    /// M5 the AsmPrinter ORed ALL ptr-tagged slots). #375 slice 2: moved
+    /// off MachineFrameInfo (target-independent) onto AArch64FunctionInfo
+    /// — it is transient pass-state owned by an AArch64-specific pass and
+    /// consumed only by AArch64 AsmPrinter.
+    DenseMap<const MachineInstr *, SmallVector<int, 4>> LiveSpillSlotsAtCall;
+
+    /// Set by M5 once it has finished its dataflow scan; tells the
+    /// AsmPrinter to USE the per-PC `LiveSpillSlotsAtCall` instead of
+    /// falling back to the "OR every ptr-tagged slot at every safepoint"
+    /// approximation.
+    bool PtrSlotLivenessValid = false;
+
+    /// c2go §B2 phase 2.5 / GC Approach B (#330) M2: per-frame-index
+    /// "managed pointer" tag for RegAlloc-introduced spill slots (no
+    /// backing alloca). Populated by AArch64InstrInfo::storeRegToStackSlot
+    /// (#426 piggyback; previously the TII::recordPointerSpillSlot virtual
+    /// called from InlineSpiller) when a pointer-derived vreg is spilled;
+    /// consumed by C2GoFrameEmitter, AArch64C2GoPtrSlotLivenessPass and
+    /// AArch64AsmPrinter to mark the slot in the locals pointer bitmap /
+    /// per-PC stackmap.
+    ///   * empty / absent key → unmanaged (treated as bytes by GC).
+    ///   * non-empty string   → managed pointer; current value: "ptr".
+    /// #375 slice 3: moved off MachineFrameInfo (target-independent) onto
+    /// AArch64FunctionInfo — produced and consumed only by AArch64 passes.
+    DenseMap<int, std::string> SpillSlotTags;
+  };
+  AArch64C2GoFunctionState C2GoState;
 
   /// True if the function need unwind information.
   mutable std::optional<bool> NeedsDwarfUnwindInfo;
@@ -635,6 +719,109 @@ public:
   bool hasStreamingModeChanges() const { return HasStreamingModeChanges; }
   void setHasStreamingModeChanges(bool HasChanges) {
     HasStreamingModeChanges = HasChanges;
+  }
+
+  bool hasC2GoVariadicOutgoingCall() const {
+    return C2GoState.HasVariadicOutgoingCall;
+  }
+  void setHasC2GoVariadicOutgoingCall() {
+    C2GoState.HasVariadicOutgoingCall = true;
+  }
+
+  bool hasC2GoFrameSize() const { return C2GoState.FrameSizeValid; }
+  uint64_t getC2GoFrameSize() const {
+    assert(C2GoState.FrameSizeValid && "c2go frame size not set");
+    return C2GoState.FrameSize;
+  }
+  void setC2GoFrameSize(uint64_t Size) {
+    C2GoState.FrameSize = Size;
+    C2GoState.FrameSizeValid = true;
+  }
+
+  /// c2go #238 (Phase 2): lazy idempotent accessor for the cached
+  /// C2GoFrameInfo. First call runs c2go::computeC2GoFrameInfo(MF); later
+  /// calls return the cached value. Result is a const reference so callers
+  /// can't accidentally invalidate the cache. The MF argument is required
+  /// (vs holding a back-pointer) to keep AArch64FunctionInfo a passive
+  /// data-holder — matching how the file's other lazy fields (e.g.
+  /// NeedsDwarfUnwindInfo) are accessed.
+  const c2go::C2GoFrameInfo &getOrComputeC2GoFI(const MachineFunction &MF) {
+    if (!C2GoState.FI)
+      C2GoState.FI = c2go::computeC2GoFrameInfo(MF);
+    return *C2GoState.FI;
+  }
+  bool hasC2GoFI() const { return C2GoState.FI.has_value(); }
+  const c2go::C2GoFrameInfo &getC2GoFI() const {
+    assert(C2GoState.FI && "c2go frame info not computed");
+    return *C2GoState.FI;
+  }
+
+  /// c2go #376: producer-side staging of per-function metadata to be
+  /// republished into the Plan 9 streamer instance at AsmPrinter time.
+  /// Move-in: takes ownership of `M`. The consumer
+  /// (AArch64AsmPrinter::emitFunctionEntryLabel) calls
+  /// takeC2GoStagedMeta() to extract and consume the value.
+  void setC2GoStagedMeta(C2GoFunctionMetadata M) {
+    C2GoState.StagedMeta = std::move(M);
+  }
+  bool hasC2GoStagedMeta() const { return C2GoState.StagedMeta.has_value(); }
+  std::optional<C2GoFunctionMetadata> takeC2GoStagedMeta() {
+    std::optional<C2GoFunctionMetadata> R = std::move(C2GoState.StagedMeta);
+    C2GoState.StagedMeta.reset();
+    return R;
+  }
+
+  /// c2go GC Approach B (#330) Milestone 5: record the live ptr-tagged spill
+  /// slots at \p Call. Called by AArch64C2GoPtrSlotLivenessPass once per call
+  /// MI; the set should already exclude slots that are DEAD at this PC.
+  void setC2GoLiveSpillSlotsAtCall(const MachineInstr *Call,
+                                   ArrayRef<int> FIs) {
+    auto &V = C2GoState.LiveSpillSlotsAtCall[Call];
+    V.assign(FIs.begin(), FIs.end());
+  }
+  /// Get the live ptr-tagged spill slots at \p Call. Returns empty if either
+  /// no slots are live there or M5 has not (yet) populated the map.
+  ArrayRef<int> getC2GoLiveSpillSlotsAtCall(const MachineInstr *Call) const {
+    auto It = C2GoState.LiveSpillSlotsAtCall.find(Call);
+    if (It == C2GoState.LiveSpillSlotsAtCall.end())
+      return {};
+    return It->second;
+  }
+  bool isC2GoPtrSlotLivenessValid() const {
+    return C2GoState.PtrSlotLivenessValid;
+  }
+  void setC2GoPtrSlotLivenessValid(bool V) {
+    C2GoState.PtrSlotLivenessValid = V;
+  }
+
+  /// c2go §B2 phase 2.5: associate \p Tag with the spill slot at \p
+  /// ObjectIdx. Called by AArch64InstrInfo::storeRegToStackSlot (#426
+  /// piggyback; was the TII::recordPointerSpillSlot virtual before #426)
+  /// when the vreg being spilled originated from a managed-pointer
+  /// alloca / GC-rooted derivation chain. An empty \p Tag is treated as
+  /// "unset" and removes any prior entry.
+  void setC2GoSpillSlotTag(int ObjectIdx, StringRef Tag) {
+    if (Tag.empty()) {
+      C2GoState.SpillSlotTags.erase(ObjectIdx);
+      return;
+    }
+    C2GoState.SpillSlotTags[ObjectIdx] = Tag.str();
+  }
+
+  /// c2go §B2 phase 2.5: look up the managed-pointer tag for spill slot
+  /// \p ObjectIdx. Returns an empty StringRef when the slot has no tag.
+  StringRef getC2GoSpillSlotTag(int ObjectIdx) const {
+    auto It = C2GoState.SpillSlotTags.find(ObjectIdx);
+    if (It == C2GoState.SpillSlotTags.end())
+      return StringRef();
+    return It->second;
+  }
+
+  /// c2go §B2 phase 2.5: read-only view of the entire spill-slot tag map.
+  /// Used by C2GoFrameEmitter / AArch64C2GoPtrSlotLivenessPass /
+  /// AArch64AsmPrinter to enumerate every managed-pointer spill slot.
+  const DenseMap<int, std::string> &getC2GoSpillSlotTags() const {
+    return C2GoState.SpillSlotTags;
   }
 
   bool hasStackProbing() const { return StackProbeSize != 0; }
