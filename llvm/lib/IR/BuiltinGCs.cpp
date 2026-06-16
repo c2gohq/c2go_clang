@@ -114,6 +114,42 @@ public:
   }
 };
 
+/// A GCStrategy for the c2go runtime (clang -fc2go output linked into the Go
+/// runtime). Like the statepoint-example/CoreCLR strategies it uses statepoint
+/// lowering and addrspace(1) to distinguish Go-managed heap pointers, so that
+/// RewriteStatepointsForGC spills live managed pointers to stack slots at every
+/// safepoint. The resulting statepoint stackmaps are translated into Go-format
+/// FUNCDATA/PCDATA pointer maps by the AArch64 Plan 9 asm-printer path; the Go
+/// heap is non-moving so gc.relocate is effectively the identity. UsesMetadata
+/// is false: c2go emits its own Go-format maps, not LLVM's stackmap section.
+class C2GoGC : public GCStrategy {
+public:
+  C2GoGC() {
+    UseStatepoints = true;
+    UseRS4GC = true;
+    // gc.root-specific options; off so the gc.root lowering code doesn't run.
+    NeededSafePoints = false;
+    UsesMetadata = false;
+  }
+
+  std::optional<bool> isGCManagedPointer(const Type *Ty) const override {
+    // c2go (STAGE I, #326): track BOTH AS0 (plain C pointers) and AS1 (managed
+    // Go-heap pointers). In the Go model EVERY pointer-typed value is a
+    // potential stack root: the goroutine stack is MOVABLE, so copystack must
+    // relocate any pointer that happens to point into the moving stack. The
+    // lightweight alloca-only stackmap misses pointers that -O2 regalloc keeps
+    // in callee-saved registers / anonymous spill slots across calls; RS4GC
+    // closes that gap by forcing every live relocatable pointer to a tracked
+    // slot at each safepoint. Returning std::nullopt means "don't override" —
+    // RS4GC's isGCPointerType uses isGCManagedPointer(T).value_or(true), so a
+    // nullopt result tracks ALL pointer types (both address spaces). We must
+    // NOT addrspacecast AS0->AS1 (RS4GC aborts on that cast); treating AS0 as a
+    // tracked pointer directly is the supported route. gc.relocate preserves
+    // the address space, so AS0 stays AS0 across the relocate.
+    return std::nullopt;
+  }
+};
+
 } // end anonymous namespace
 
 // Register all the above so that they can be found at runtime.  Note that
@@ -127,6 +163,8 @@ static GCRegistry::Add<ShadowStackGC>
 static GCRegistry::Add<StatepointGC> D("statepoint-example",
                                        "an example strategy for statepoint");
 static GCRegistry::Add<CoreCLRGC> E("coreclr", "CoreCLR-compatible GC");
+static GCRegistry::Add<C2GoGC> F("c2go-gc",
+                                 "c2go (clang->Go runtime) statepoint GC");
 
 // Provide hook to ensure the containing library is fully loaded.
 void llvm::linkAllBuiltinGCs() {}

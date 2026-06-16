@@ -318,7 +318,14 @@ public:
 
     PAuthTest,
     MTIA,
-    LastEnvironmentType = MTIA
+
+    // Go ABI: produced object/archive is intended to be linked into a Go
+    // binary, with C allocations going through runtime.mallocgc and C
+    // structs carrying Go type information. Triggered by an explicit
+    // "-goabi" environment suffix in the target triple.
+    GoABI,
+
+    LastEnvironmentType = GoABI
   };
   enum ObjectFormatType {
     UnknownObjectFormat,

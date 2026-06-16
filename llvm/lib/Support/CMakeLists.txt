@@ -161,6 +161,7 @@ add_llvm_component_library(LLVMSupport
   BlockFrequency.cpp
   BranchProbability.cpp
   BuryPointer.cpp
+  C2GoEmergencyFlag.cpp
   CachePruning.cpp
   Caching.cpp
   circular_raw_ostream.cpp
