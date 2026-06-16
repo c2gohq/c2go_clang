@@ -41,6 +41,9 @@
 #include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCInstBuilder.h"
+#include "llvm/MC/MCPlan9AsmStreamer.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include "llvm/MC/MCSectionCOFF.h"
 #include "llvm/MC/MCSectionELF.h"
 #include "llvm/MC/MCSectionMachO.h"
@@ -52,6 +55,29 @@
 #include "llvm/Target/TargetMachine.h"
 
 using namespace llvm;
+
+// c2go #298 Wave AC.2: gate emission of FUNCDATA $2 (per-function stack-
+// objects table) on X86. Mirror of the AArch64 `-c2go-funcdata2` flag
+// (AArch64AsmPrinter.cpp:105-118). Default OFF — the existing Approach B
+// 摊平 path (c2goExpandDirectAllocaFields field-fanout into FUNCDATA $1)
+// remains the sole GC root reporter; ON also collects alloca→StkObjEntry
+// and publishes to the Plan-9 streamer.
+static cl::opt<bool>
+    X86C2GoFuncData2("x86-c2go-funcdata2", cl::Hidden,
+                     cl::desc("c2go #298 X86 mirror: emit FUNCDATA $2 "
+                              "(stack-objects table). Default OFF."),
+                     cl::init(false));
+
+namespace llvm {
+namespace c2go {
+// Visible to X86MCInstLower.cpp's LowerSTATEPOINT so the Direct(SP, off)
+// stkobj collection branch checks the same flag the AsmPrinter-side
+// publisher uses (mirror of AArch64's C2GoFuncData2). Kept in
+// llvm::c2go:: to avoid colliding with the cl::opt symbol while still
+// sharing the same backing storage.
+bool isX86C2GoFuncData2Enabled() { return X86C2GoFuncData2; }
+} // namespace c2go
+} // namespace llvm
 
 X86AsmPrinter::X86AsmPrinter(TargetMachine &TM,
                              std::unique_ptr<MCStreamer> Streamer)
@@ -106,6 +132,55 @@ bool X86AsmPrinter::runOnMachineFunction(MachineFunction &MF) {
   return false;
 }
 
+void X86AsmPrinter::emitFunctionEntryLabel() {
+  // c2go #298 Wave Z Track B / #376: republish per-function metadata staged
+  // on the X86 MFI (set by the X86 c2go producer — frame-lowering or leaf-ABI
+  // pass) into the actual MCPlan9AsmStreamer instance BEFORE the base class's
+  // `emitLabel(CurrentFnSym)`. The streamer's emitLabel consults C2GoFnMeta
+  // to decide whether to emit a Stage-1 `TEXT … $framesize-argsize` directive
+  // (NOSPLIT|NOFRAME, $0-M for the strict-leaf X86 path) or fall back to the
+  // Stage-4 TU-local `NOFRAME, $0` (the current X86 production behaviour
+  // until the second `c2go.x86-leaf-abi` gate flips ON for a function).
+  //
+  // Mirrors `AArch64AsmPrinter::emitFunctionEntryLabel` (#376 plumbing). The
+  // publish must precede the label emission — otherwise Stage 1 misses and
+  // the streamer emits the fallback (argsize-less) TEXT.
+  if (OutStreamer->isPlan9AsmStreamer()) {
+    auto *MFI = MF->getInfo<X86MachineFunctionInfo>();
+    if (MFI->hasC2GoStagedMeta()) {
+      auto Meta = MFI->takeC2GoStagedMeta();
+      // Wave AA GPT NEEDS_FIX Fix 3 (B4 X86 stager loud-fail): on the
+      // Plan-9 streamer path, a C2GoABIInternal-flipped callee MUST
+      // carry a numeric ArgSize (from the IR `c2go-argsize` attr that
+      // clang stamps on every internal GoABI0 function — see clang
+      // CodeGenModule.cpp:2871-2886). The X86C2GoFrameMetaStager only
+      // sets Meta.ArgSize when the attr is present; if it's nullopt at
+      // publish time the streamer would fall back to publishing an
+      // implicit `$N-0` which is Plan-9 legal but semantically wrong
+      // for any callee with a non-empty parameter list (callers would
+      // corrupt the outgoing arg frame). Hand-written IR / c2go-lto
+      // rehydration paths can leave this gap.
+      if (MF->getFunction().getCallingConv() ==
+              CallingConv::C2GoABIInternal &&
+          !Meta->ArgSize.has_value()) {
+        report_fatal_error(
+            Twine("X86 c2go: function '") + MF->getName() +
+            "' was flipped to CallingConv::C2GoABIInternal by the Wave V "
+            "leaf-ABI pass but is missing the `c2go-argsize` IR fn "
+            "attribute reaching the Plan-9 streamer — see Wave V "
+            "eligibility predicate (X86C2GoLeafEligibility) or clang "
+            "CodeGenModule.cpp:2871-2886. A missing argsize would emit "
+            "`$0-0` (Plan-9 legal, semantically wrong for nonzero-arg "
+            "leaf).");
+      }
+      static_cast<MCPlan9AsmStreamer *>(OutStreamer.get())
+          ->publishC2GoFunction(std::move(*Meta));
+    }
+  }
+
+  AsmPrinter::emitFunctionEntryLabel();
+}
+
 void X86AsmPrinter::emitFunctionBodyStart() {
   if (EmitFPOData) {
     auto *XTS =
@@ -122,6 +197,37 @@ void X86AsmPrinter::emitFunctionBodyEnd() {
         static_cast<X86TargetStreamer *>(OutStreamer->getTargetStreamer());
     XTS->emitFPOEndProc();
   }
+  // c2go #298 Wave AC.2: hand off accumulated stkobj entries to the Plan-9
+  // streamer (which emits FUNCDATA $2 in flushC2GoStackmaps). No-op when
+  // `-x86-c2go-funcdata2` is OFF (accumulator stays empty) or when the
+  // function has no qualifying alloca. Mirrors AArch64AsmPrinter.cpp:1169.
+  publishC2GoStackObjects();
+}
+
+void X86AsmPrinter::publishC2GoStackObjects() {
+  if (C2GoStkObjEntries.empty()) {
+    // Defensive clear in case a prior function populated but was emitted
+    // without reaching this hook (mirror of AArch64 #376 path).
+    C2GoStkObjSeen.clear();
+    return;
+  }
+  if (OutStreamer->isPlan9AsmStreamer()) {
+    // Fresh aggregate carrying ONLY the StackObjects payload — every
+    // other field stays nullopt so Wave AA Fix 1's partial-update
+    // semantics in `MCPlan9AsmStreamer::publishC2GoFunction` preserves
+    // the primary producer's earlier publish (FrameSize / ArgSize /
+    // SavedLinkSize=0 / FrameAlignment=0 staged by the X86 c2go frame
+    // emitter — see X86C2GoFrameEmitter.cpp). A non-optional struct
+    // here would silently reset those back to defaults (the foot-gun
+    // Wave AA Fix 1 closed).
+    C2GoFunctionMetadata M;
+    M.Name = std::string(MF->getName());
+    M.StackObjects.emplace(C2GoStkObjEntries.begin(), C2GoStkObjEntries.end());
+    static_cast<MCPlan9AsmStreamer *>(OutStreamer.get())
+        ->publishC2GoFunction(std::move(M));
+  }
+  C2GoStkObjEntries.clear();
+  C2GoStkObjSeen.clear();
 }
 
 uint32_t X86AsmPrinter::MaskKCFIType(uint32_t Value) {
@@ -1019,6 +1125,18 @@ static bool usesMSVCFloatingPoint(const Triple &TT, const Module &M) {
 
 void X86AsmPrinter::emitEndOfAsmFile(Module &M) {
   const Triple &TT = TM.getTargetTriple();
+
+  // c2go Wave Y Track C: the Plan 9 (.s) output is a Go-assembler text
+  // stream and is *independent* of the host object format. None of the
+  // per-object-format trailers below have a Plan 9 equivalent:
+  //   * Mach-O `emitSubsectionsViaSymbols` + non-lazy stubs + fault-map
+  //   * COFF  `RetpolineV1` import-call table + `_fltused` MSVC stub
+  //   * ELF   `__llvm_stackmaps`-like sections (already not in this hook)
+  // The Plan 9 streamer's `finishImpl()` runs its own end-of-stream
+  // bookkeeping; early-return here so we don't write SysV trailers
+  // into the .s text. Mirrors AArch64AsmPrinter::emitEndOfAsmFile.
+  if (OutStreamer->isPlan9AsmStreamer())
+    return;
 
   if (TT.isOSBinFormatMachO()) {
     // Mach-O uses non-lazy symbol stubs to encode per-TU information into

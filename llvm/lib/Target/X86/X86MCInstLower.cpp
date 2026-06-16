@@ -23,19 +23,26 @@
 #include "X86RegisterInfo.h"
 #include "X86ShuffleDecodeConstantPool.h"
 #include "X86Subtarget.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/CodeGen/MachineBranchProbabilityInfo.h"
 #include "llvm/CodeGen/MachineConstantPool.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineModuleInfoImpls.h"
 #include "llvm/CodeGen/MachineOperand.h"
 #include "llvm/CodeGen/StackMaps.h"
+#include "llvm/CodeGen/TargetFrameLowering.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/WinEHFuncInfo.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/GlobalValue.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Mangler.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCCodeEmitter.h"
 #include "llvm/MC/MCContext.h"
@@ -43,12 +50,14 @@
 #include "llvm/MC/MCFixup.h"
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCInstBuilder.h"
+#include "llvm/MC/MCPlan9AsmStreamer.h"
 #include "llvm/MC/MCSection.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Target/TargetLoweringObjectFile.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include "llvm/Transforms/CFGuard.h"
 #include "llvm/Transforms/Instrumentation/AddressSanitizer.h"
 #include "llvm/Transforms/Instrumentation/AddressSanitizerCommon.h"
@@ -783,6 +792,261 @@ static void emitX86Nops(MCStreamer &OS, unsigned NumBytes,
   }
 }
 
+// c2go #298 Wave Z Track D — mirrors AArch64 `c2goAppendPtrFieldOffsets`
+// (AArch64AsmPrinter.cpp): recursively append the SP-relative byte offsets of
+// every pointer FIELD of `Ty` based at `Base`, honouring a SkipBytes set of
+// union-ambiguous words. The Plan-9 streamer converts each offset to a
+// locals-bitmap bit (= offset/8). Identical logic to the AArch64 version —
+// kept as a file-static here because the helpers are not exported across TUs.
+static void c2goAppendPtrFieldOffsets(Type *Ty, int64_t Base,
+                                      const DataLayout &DL,
+                                      const DenseSet<int64_t> &SkipBytes,
+                                      SmallVectorImpl<int64_t> &Out) {
+  if (Ty->isPointerTy()) {
+    if (!SkipBytes.contains(Base))
+      Out.push_back(Base);
+    return;
+  }
+  if (auto *ST = dyn_cast<StructType>(Ty)) {
+    const StructLayout *SL = DL.getStructLayout(ST);
+    for (unsigned I = 0, N = ST->getNumElements(); I < N; ++I)
+      c2goAppendPtrFieldOffsets(ST->getElementType(I),
+                                Base + (int64_t)SL->getElementOffset(I), DL,
+                                SkipBytes, Out);
+  } else if (auto *AT = dyn_cast<ArrayType>(Ty)) {
+    Type *ET = AT->getElementType();
+    int64_t ESz = (int64_t)DL.getTypeAllocSize(ET).getFixedValue();
+    for (uint64_t I = 0, N = AT->getNumElements(); I < N; ++I)
+      c2goAppendPtrFieldOffsets(ET, Base + (int64_t)I * ESz, DL, SkipBytes,
+                                Out);
+  }
+  // Scalars contribute no pointer word.
+}
+
+// c2go #489 (Wave AO.1) — convert a PEI-resolved frame anchor (RSP or RBP)
+// plus byte offset into the Go locals-bitmap coordinate: byte offset from
+// the obj6.go-injected post-prologue HARDWARE SP (bit = offset/8, see
+// MCPlan9AsmStreamer::recordC2GoStackmapSite).
+//
+// Frame contract (mirror of cmd/internal/obj/x86/obj6.go preprocess): for a
+// framed `TEXT $FrameSize` (FrameSize = MFI.getStackSize(), published by the
+// X86C2GoFrameMetaStager / emitX86C2GoPrologue) the Go assembler injects
+//   ADJSP $(FrameSize+8); MOVQ BP, FrameSize(SP); LEAQ FrameSize(SP), BP
+// i.e. it adds a saved-BP word (`bpsize`) ON TOP of the declared framesize.
+// With entry-SP = S (CALL-pushed retaddr at [S]):
+//   real post-prologue SP = S - FrameSize - 8
+//   BP                    = S - 8           (= realSP + FrameSize)
+//   LLVM's own post-prologue SP view E = S - FrameSize (the suppressed
+//   SysV `push rbp + sub` / c2go `SUB` prologue totals exactly StackSize —
+//   it never knows about obj6's extra BP word).
+// The Go runtime scans locals over [realSP, realSP + Nbit*8) where
+// Nbit = FrameSize/8 (varp = BP backs over the saved-BP word, see
+// runtime/traceback.go frame.varp -= PtrSize for framepointer_enabled).
+//
+// The conversion depends on which anchor the BODY's slot addressing is
+// pinned to — `FrameUsesFP` = X86FrameLowering::hasFP(MF):
+//
+//   * hasFP body (production darwin: clang stamps "frame-pointer"="all",
+//     and any STACKMAP forces hasFP via hasFPImpl): eliminateFrameIndex
+//     resolves locals RBP-relative, so a slot's PHYSICAL address is pinned
+//     to BP = S-8 (the obj6-injected value coincides with LLVM's model).
+//     LLVM's SP view E is then 8 bytes ABOVE realSP:
+//       RSP-anchored Off (relative to E):  bitmap off = Off + 8
+//       RBP-anchored Off (relative to BP): bitmap off = Off + FrameSize
+//
+//   * no-FP body (e.g. linux triple without the frame-pointer attr):
+//     locals are addressed off the live hardware SP, so slots TRACK the
+//     real post-prologue SP — RSP-anchored offsets pass through verbatim
+//     and an RBP anchor cannot arise (getFrameRegister = RSP); return
+//     nullopt for it (sound under-marking skip).
+//
+// For a frameless TEXT (FrameSize == 0, NOFRAME) obj6 injects nothing:
+// RSP offsets pass through verbatim; an RBP anchor cannot arise — nullopt.
+//
+// This replaces the pre-#489 unconditional `Loc.Reg == DwarfFP` skip +
+// verbatim-RSP policy whose "c2go-managed frames are NOFRAME" assumption
+// went stale with the framesize rework, silently zeroing every framed
+// hasFP function's locals bitmap and breaking copystack pointer relocation
+// (amd64 ascast validator=0 / SIGBUS dual-mode failure).
+static std::optional<int64_t> x86C2GoBitmapOffFromAnchor(uint64_t FrameSize,
+                                                         bool FrameUsesFP,
+                                                         bool AnchorIsSP,
+                                                         int64_t Off) {
+  if (FrameSize == 0 || !FrameUsesFP)
+    return AnchorIsSP ? std::optional<int64_t>(Off) : std::nullopt;
+  return AnchorIsSP ? Off + 8 : Off + static_cast<int64_t>(FrameSize);
+}
+
+// c2go #298 Wave Z Track D — mirrors AArch64 `c2goExpandDirectAllocaFields`:
+// for a Direct statepoint location (the live value IS the address of an
+// alloca that RewriteStatepointsForGC tracks as a base), find the owning
+// alloca and append locals-bitmap byte offsets of its pointer
+// FIELDS to `Out`. This is the per-PC, liveness-driven replacement for the
+// static all-PCs aggregate-field mask: in-memory pointer fields are not SSA
+// values RS4GC can relocate, but the enclosing alloca IS kept live, so we
+// expand it here — and ONLY at the PCs where it is live, so a stack-colored
+// slot reused after the alloca dies is left unmarked. Vararg-pack allocas
+// (`c2go.va.pack`) and union-ambiguous words (`c2go.union.ambig.words`)
+// follow the same conservative-skip rules as AArch64.
+//
+// c2go #489 (Wave AO.1): `BitOff` is in the locals-bitmap coordinate (the
+// caller already ran x86C2GoBitmapOffFromAnchor on the raw location). The
+// frame-index matcher below must compare in the SAME coordinate:
+// `getFrameIndexReference` answers RBP-relative on the framed (hasFP)
+// SysV-fallback path while PEI's `getFrameIndexReferencePreferSP` resolves
+// STATEPOINT operands RSP-relative — the pre-#489 `FrameReg != X86::RSP`
+// equality test therefore never matched on framed functions and the
+// expansion silently produced zero bits (all-zero FUNCDATA $1, the amd64
+// ascast root). Converting both sides through the same helper makes the
+// match anchor-independent.
+static void c2goExpandDirectAllocaFields(const MachineFunction &MF,
+                                         int64_t BitOff,
+                                         SmallVectorImpl<int64_t> &Out) {
+  const MachineFrameInfo &MFI = MF.getFrameInfo();
+  const TargetFrameLowering *TFL = MF.getSubtarget().getFrameLowering();
+  const DataLayout &DL = MF.getDataLayout();
+  const uint64_t FrameSize = MFI.getStackSize();
+  const bool FrameUsesFP = TFL->hasFP(MF);
+  for (int FI = MFI.getObjectIndexBegin(), E = MFI.getObjectIndexEnd(); FI < E;
+       ++FI) {
+    if (MFI.isDeadObjectIndex(FI))
+      continue;
+    const AllocaInst *AI = MFI.getObjectAllocation(FI);
+    if (!AI)
+      continue;
+    Register FrameReg;
+    StackOffset SO = TFL->getFrameIndexReference(MF, FI, FrameReg);
+    if (FrameReg != X86::RSP && FrameReg != X86::RBP)
+      continue;
+    std::optional<int64_t> RefBitOff = x86C2GoBitmapOffFromAnchor(
+        FrameSize, FrameUsesFP, FrameReg == X86::RSP, SO.getFixed());
+    if (!RefBitOff || *RefBitOff != BitOff)
+      continue;
+    // Mirror AArch64 #327: never expand vararg-pack allocas — RS4GC keeps
+    // their address live across UNRELATED safepoints and stack-coloring
+    // merges disjoint-lifetime va slots, so at such a PC the slot holds
+    // another pack's stale content or 0x1. The pack address is still
+    // relocated as an Indirect spill where genuinely live; interior &slot
+    // pointers are stack-local in managed(0) workloads — same conservative
+    // under-marking class as #312 union-ambig words.
+    if (AI->getMetadata(llvm::c2go::kVaPackMD))
+      continue;
+    // #312: skip union-ambiguous pointer words.
+    DenseSet<int64_t> SkipBytes;
+    if (const MDNode *MD = AI->getMetadata(llvm::c2go::kUnionAmbigWordsMD))
+      for (const MDOperand &Op : MD->operands())
+        if (auto *CMD = dyn_cast<ConstantAsMetadata>(Op.get()))
+          if (auto *CI = dyn_cast<ConstantInt>(CMD->getValue()))
+            SkipBytes.insert(BitOff + (int64_t)CI->getZExtValue());
+    c2goAppendPtrFieldOffsets(AI->getAllocatedType(), BitOff, DL, SkipBytes,
+                              Out);
+    return; // one alloca per frame offset
+  }
+}
+
+namespace llvm {
+namespace c2go {
+// Defined in X86AsmPrinter.cpp; backs the `-x86-c2go-funcdata2` cl::opt
+// gate so this TU can decide whether to populate the AsmPrinter's stkobj
+// accumulator from Direct(SP, off) statepoint locations.
+bool isX86C2GoFuncData2Enabled();
+} // namespace c2go
+} // namespace llvm
+
+// c2go #298 Wave AC.2 — X86 mirror of AArch64 `c2goCollectStkObjEntry`
+// (AArch64AsmPrinter.cpp:2034-2128). Given a `Direct(SP, off)` statepoint
+// location's SP-relative offset `SpOff` and its owning alloca, build a
+// `StkObjEntry` describing the on-stack object for FUNCDATA $2.
+//
+// X86 amd64 deviations from the AArch64 version (mirror of frame
+// contract — X86C2GoFrameEmitter.cpp:186-192):
+//   * `SavedLinkSize = 0` on X86 (no software-spilled LR — the CALL-pushed
+//     return PC lives ABOVE the declared `$framesize`, not inside it).
+//     AArch64 anchors `varp = SP + funcspdelta - 8` because of its
+//     hardware LR slot at SP+0; on X86 `varp = SP + funcspdelta` (no -8
+//     bump).  The locals-region branch therefore uses `SpOff - FrameSize`
+//     instead of AArch64's `SpOff - (FrameSize - 8)`.
+//
+// Returns nullopt for: vararg-pack allocas (#327 mirror), unsized types,
+// non-struct allocas, struct types lacking a `c2go.gcbitmap.<RecName>`
+// symbol, and pure-data records (no pointer fields). Sound under-marking
+// is preserved for all skipped cases — the Approach B 摊平 path in
+// FUNCDATA $1 remains the safety net.
+static std::optional<llvm::StkObjEntry>
+c2goCollectStkObjEntryX86(const MachineFunction &MF, int64_t SpOff,
+                          const llvm::AllocaInst *AI) {
+  if (!AI)
+    return std::nullopt;
+  // #327 mirror: never include vararg-pack allocas.
+  if (AI->getMetadata(llvm::c2go::kVaPackMD))
+    return std::nullopt;
+
+  llvm::Type *Ty = AI->getAllocatedType();
+  if (!Ty || !Ty->isSized())
+    return std::nullopt;
+
+  const llvm::DataLayout &DL = MF.getDataLayout();
+  uint64_t SizeBytes = DL.getTypeAllocSize(Ty).getFixedValue();
+  if (SizeBytes == 0)
+    return std::nullopt;
+
+  // gcdata sym: only recognise structs whose CGC2GoTypeInfo already emitted
+  // `c2go.gcbitmap.<RecName>`. LLVM struct names look like `struct.<X>` or
+  // `union.<X>`; the bitmap is keyed by the *source* record name.
+  auto *ST = llvm::dyn_cast<llvm::StructType>(Ty);
+  if (!ST || !ST->hasName())
+    return std::nullopt;
+  llvm::StringRef LLVMName = ST->getName();
+  llvm::StringRef RecName = LLVMName;
+  if (RecName.consume_front("struct."))
+    ;
+  else if (RecName.consume_front("union."))
+    ;
+  std::string BitmapName = ("c2go.gcbitmap." + RecName).str();
+  const llvm::Module *M = MF.getFunction().getParent();
+  const llvm::GlobalVariable *GV =
+      M ? M->getNamedGlobal(BitmapName) : nullptr;
+  if (!GV)
+    return std::nullopt; // no bitmap emitted for this type — skip safely
+
+  // ptrBytes = pointer-containing prefix length, computed as
+  // 8 × (highest pointer-word index + 1). Reuses the existing field-offset
+  // walker (`c2goAppendPtrFieldOffsets` defined earlier in this TU).
+  llvm::SmallVector<int64_t, 8> Tmp;
+  llvm::DenseSet<int64_t> NoSkip;
+  c2goAppendPtrFieldOffsets(Ty, /*Base=*/0, DL, NoSkip, Tmp);
+  uint32_t PtrBytes = 0;
+  for (int64_t O : Tmp) {
+    uint64_t End = uint64_t(O) + 8;
+    if (End > PtrBytes)
+      PtrBytes = static_cast<uint32_t>(End);
+  }
+  // Pure-data records carry no GC interest — skip.
+  if (PtrBytes == 0)
+    return std::nullopt;
+
+  // X86 contract: SavedLinkSize=0 (no LR slot), so `varp = SP + funcspdelta`
+  // and `argp = SP + funcspdelta` coincide at the SP+funcspdelta boundary
+  // (callee args live above, locals below). FrameSize = MFI.getStackSize()
+  // = funcspdelta on the c2go Plan-9 surface (X86C2GoFrameEmitter publishes
+  // the rounded value via `MF.getFrameInfo().setStackSize(FrameSize)`).
+  //
+  // The two AArch64 branches collapse into one on X86 because the -8 LR
+  // bump that distinguished varp from argp on AArch64 is absent here:
+  //   locals (SpOff < FrameSize):  FrameOffset = SpOff - FrameSize  (< 0)
+  //   args   (SpOff ≥ FrameSize):  FrameOffset = SpOff - FrameSize  (≥ 0)
+  int64_t FrameSize =
+      static_cast<int64_t>(MF.getFrameInfo().getStackSize());
+  int32_t FrameOffset = static_cast<int32_t>(SpOff - FrameSize);
+
+  llvm::StkObjEntry E;
+  E.frameOffset = FrameOffset;
+  E.size = static_cast<uint32_t>(SizeBytes);
+  E.ptrBytes = PtrBytes;
+  E.gcdataSymName = std::move(BitmapName);
+  return E;
+}
+
 void X86AsmPrinter::LowerSTATEPOINT(const MachineInstr &MI,
                                     X86MCInstLower &MCIL) {
   assert(Subtarget->is64Bit() && "Statepoint currently only supports X86-64");
@@ -790,6 +1054,121 @@ void X86AsmPrinter::LowerSTATEPOINT(const MachineInstr &MI,
   NoAutoPaddingScope NoPadScope(*OutStreamer);
 
   StatepointOpers SOpers(&MI);
+  // c2go #298 Wave Z Track D: mirror AArch64AsmPrinter::LowerSTATEPOINT
+  // Plan-9 branch — in Plan-9 (.s) mode the statepoint's live managed
+  // pointers (spilled to stack by RewriteStatepointsForGC) drive a Go locals
+  // pointer-map bitmap, emitted as `PCDATA $1, $<idx>`. The PCDATA MUST be
+  // emitted BEFORE the call: Go's runtime backs the return PC up to the call
+  // PC when reading the stack map (runtime/stkframe.go pcdatavalue at the
+  // call site), so the map must be in effect at the CALL itself. We parse
+  // the statepoint locations and forward them to the Plan-9 streamer up
+  // front, then fall through to emit the call. `recordStatepoint` only
+  // records metadata keyed to a label; it emits nothing to the stream, so
+  // calling it here (before the call instruction) is safe.
+  MCSymbol *Plan9MILabel = nullptr;
+  if (OutStreamer->isPlan9AsmStreamer()) {
+    auto *Plan9 = static_cast<MCPlan9AsmStreamer *>(OutStreamer.get());
+    Plan9MILabel = OutStreamer->getContext().createTempSymbol();
+    SM.recordStatepoint(*Plan9MILabel, MI);
+    const auto &CSI = SM.getCSInfos().back();
+    const TargetRegisterInfo *TRI = MF->getSubtarget().getRegisterInfo();
+    unsigned DwarfSP = TRI->getDwarfRegNum(X86::RSP, /*isEH=*/false);
+    unsigned DwarfFP = TRI->getDwarfRegNum(X86::RBP, /*isEH=*/false);
+    // Harvest stack-resident live values. The Go locals bitmap marks slots
+    // whose CONTENTS are heap pointers that copystack must relocate, so we
+    // take ONLY Indirect locations (IndirectMemRefOp = "live value STORED
+    // AT [Reg+off]", i.e. an RS4GC spill slot holding the pointer value).
+    //
+    // #327 mirror: Direct locations (DirectMemRefOp = "the live value IS
+    // the address [Reg+off]") are NOT marked whole-slot. Under c2go-gc an
+    // alloca's address is a base-defining value (RS4GC #326), so an
+    // address-taken stack local appears in the gc-live set and lowers to
+    // Direct(SP, off). That `off` is the alloca's STORAGE — a scalar `int`
+    // holds the value (e.g. 0xa), not a heap pointer. Marking whole-cloth
+    // makes copystack read the int as a pointer and abort. We instead
+    // expand the alloca's pointer FIELDS per-PC via
+    // `c2goExpandDirectAllocaFields`.
+    //
+    // c2go #489 (Wave AO.1) — real anchor rebase replaces the stale
+    // "c2go-managed frames are NOFRAME" Wave Z skip. Post framesize-rework
+    // the framed GoABI0 (SysV-fallback) path IS BP-based: obj6.go injects
+    // `ADJSP $(FrameSize+8)` + saved-BP, PEI resolves STATEPOINT operands
+    // via getFrameIndexReferencePreferSP (RSP-relative to LLVM's own SP
+    // view, 8 bytes ABOVE the real post-prologue SP) while
+    // getFrameIndexReference answers RBP-relative. Both anchors convert to
+    // the locals-bitmap coordinate through x86C2GoBitmapOffFromAnchor (see
+    // its contract comment). The pre-#489 verbatim-RSP + skip-RBP policy
+    // produced all-zero locals bitmaps on every framed function — the amd64
+    // ascast validator=0 / SIGBUS@copystack root.
+    //
+    // X86 also does NOT yet have an analogue of `appendC2GoPtrSpillSlotOff-
+    // sets` (M5 spill-slot ptr-tag OR-in lives on AArch64FunctionInfo).
+    // Tracked separately under #298 follow-ups; here we forward only the
+    // explicit gc-live operands plus per-PC alloca field expansion.
+    const uint64_t C2GoFrameSize = MF->getFrameInfo().getStackSize();
+    const bool C2GoFrameUsesFP =
+        MF->getSubtarget().getFrameLowering()->hasFP(*MF);
+    SmallVector<int64_t, 8> SpOffsets;
+    for (const auto &Loc : CSI.Locations) {
+      if (Loc.Reg != DwarfSP && Loc.Reg != DwarfFP)
+        continue;
+      std::optional<int64_t> BitOff = x86C2GoBitmapOffFromAnchor(
+          C2GoFrameSize, C2GoFrameUsesFP, Loc.Reg == DwarfSP, Loc.Offset);
+      if (!BitOff)
+        continue; // FP anchor on a frameless/no-FP TEXT — cannot arise; skip
+      if (Loc.Type == StackMaps::Location::Indirect)
+        SpOffsets.push_back(*BitOff);
+      else if (Loc.Type == StackMaps::Location::Direct) {
+        c2goExpandDirectAllocaFields(*MF, *BitOff, SpOffsets);
+        // c2go #298 Wave AC.2: ALSO collect a StkObjEntry candidate for
+        // FUNCDATA $2. Gated by `-x86-c2go-funcdata2`; OFF path retains
+        // Approach B 摊平 exactly (the call above still runs; the entry
+        // collection is a pure addition). Per-alloca dedup via
+        // `C2GoStkObjSeen` so multiple Direct locations on the same
+        // alloca contribute at most one entry. Mirror of
+        // AArch64AsmPrinter.cpp:2260-2287.
+        //
+        // c2go #489 (Wave AO.1): matcher converted to the locals-bitmap
+        // coordinate (same anchor-independent compare as
+        // c2goExpandDirectAllocaFields — the raw `FrameReg != X86::RSP`
+        // test never matched on framed/hasFP functions). NOTE the gated
+        // c2goCollectStkObjEntryX86 helper still carries the pre-rework
+        // "varp = argp = SP + funcspdelta" boundary comment; its locals
+        // branch (`SpOff - FrameSize`) stays correct in the new coordinate
+        // (varp = realSP + FrameSize), the args-boundary semantics are a
+        // gated-off follow-up (gate default OFF, no production effect).
+        if (llvm::c2go::isX86C2GoFuncData2Enabled()) {
+          const MachineFrameInfo &MFI = MF->getFrameInfo();
+          const TargetFrameLowering *TFL =
+              MF->getSubtarget().getFrameLowering();
+          for (int FI = MFI.getObjectIndexBegin(),
+                   FE = MFI.getObjectIndexEnd();
+               FI < FE; ++FI) {
+            if (MFI.isDeadObjectIndex(FI))
+              continue;
+            const AllocaInst *AI = MFI.getObjectAllocation(FI);
+            if (!AI)
+              continue;
+            Register FrameReg;
+            StackOffset SO = TFL->getFrameIndexReference(*MF, FI, FrameReg);
+            if (FrameReg != X86::RSP && FrameReg != X86::RBP)
+              continue;
+            std::optional<int64_t> RefBitOff = x86C2GoBitmapOffFromAnchor(
+                C2GoFrameSize, C2GoFrameUsesFP, FrameReg == X86::RSP,
+                SO.getFixed());
+            if (!RefBitOff || *RefBitOff != *BitOff)
+              continue;
+            if (!C2GoStkObjSeen.insert(AI))
+              break; // already accounted
+            if (auto E = c2goCollectStkObjEntryX86(*MF, *BitOff, AI))
+              C2GoStkObjEntries.push_back(std::move(*E));
+            break;
+          }
+        }
+      }
+    }
+    Plan9->recordC2GoStackmapSite(SpOffsets);
+  }
   if (unsigned PatchBytes = SOpers.getNumPatchBytes()) {
     emitX86Nops(*OutStreamer, PatchBytes, Subtarget);
   } else {
@@ -835,6 +1214,14 @@ void X86AsmPrinter::LowerSTATEPOINT(const MachineInstr &MI,
     CallInst.addOperand(CallTargetMCOp);
     OutStreamer->emitInstruction(CallInst, getSubtargetInfo());
     maybeEmitNopAfterCallForWindowsEH(&MI);
+  }
+
+  if (OutStreamer->isPlan9AsmStreamer()) {
+    // Plan-9 path already recorded the statepoint and forwarded the locals
+    // bitmap above; just define the label at the return PC for completeness
+    // (mirrors AArch64).
+    OutStreamer->emitLabel(Plan9MILabel);
+    return;
   }
 
   // Record our statepoint node in the same section used by STACKMAP
@@ -1027,6 +1414,53 @@ void X86AsmPrinter::LowerSTACKMAP(const MachineInstr &MI) {
   OutStreamer->emitLabel(MILabel);
 
   SM.recordStackMap(*MILabel, MI);
+  // c2go #298 Wave Z Track C: mirror AArch64AsmPrinter::LowerSTACKMAP — when
+  // emitting Plan-9 (.s) output, harvest the Direct(SP/FP, N) entries that
+  // recordStackMap just parsed into CSInfos.back() and forward their byte
+  // offsets to the Plan-9 streamer. The streamer interns them into a per-PC
+  // pointer bitmap and emits `PCDATA $1, $<idx>` so Go runtime can resolve
+  // live ptr slots at this safepoint. Unlike AArch64, X86 does not yet have
+  // an analogue of `appendC2GoPtrSpillSlotOffsets` (M5 spill-slot ptr-tag
+  // OR-in lives on AArch64FunctionInfo) — that is tracked separately under
+  // #298 follow-ups; here we only forward the explicit stackmap operands.
+  if (OutStreamer->isPlan9AsmStreamer()) {
+    auto *Plan9 = static_cast<MCPlan9AsmStreamer *>(OutStreamer.get());
+    const auto &CSI = SM.getCSInfos().back();
+    // Location.Reg is a DWARF register number (StackMaps::parseOperand
+    // applies TRI->getDwarfRegNum before storing). On X86-64 RSP=7, RBP=6;
+    // on X86-32 ESP=4, EBP=5.
+    //
+    // c2go #489 (Wave AO.1): real anchor rebase replaces the Wave Z F1/F9
+    // skip-RBP policy — STACKMAP frame indices resolve through
+    // X86RegisterInfo::eliminateFrameIndex → getFrameIndexReference, which
+    // answers RBP-relative on the framed (hasFP) path (X86RegisterInfo.cpp
+    // even asserts `BasePtr == FramePtr` for STACKMAP), so post
+    // framesize-rework EVERY framed function's entries hit the old skip
+    // and the locals bitmap silently zeroed. Convert both anchors through
+    // x86C2GoBitmapOffFromAnchor (see its contract comment) — same policy
+    // as the LowerSTATEPOINT Plan-9 branch below.
+    const TargetRegisterInfo *TRI = MF->getSubtarget().getRegisterInfo();
+    bool Is64 = Subtarget->is64Bit();
+    unsigned DwarfSP =
+        TRI->getDwarfRegNum(Is64 ? X86::RSP : X86::ESP, /*isEH=*/false);
+    unsigned DwarfFP =
+        TRI->getDwarfRegNum(Is64 ? X86::RBP : X86::EBP, /*isEH=*/false);
+    const uint64_t C2GoFrameSize = MF->getFrameInfo().getStackSize();
+    const bool C2GoFrameUsesFP =
+        MF->getSubtarget().getFrameLowering()->hasFP(*MF);
+    SmallVector<int64_t, 8> SpOffsets;
+    for (const auto &Loc : CSI.Locations) {
+      if (Loc.Type != StackMaps::Location::Direct)
+        continue;
+      if (Loc.Reg != DwarfSP && Loc.Reg != DwarfFP)
+        continue;
+      std::optional<int64_t> BitOff = x86C2GoBitmapOffFromAnchor(
+          C2GoFrameSize, C2GoFrameUsesFP, Loc.Reg == DwarfSP, Loc.Offset);
+      if (BitOff)
+        SpOffsets.push_back(*BitOff);
+    }
+    Plan9->recordC2GoStackmapSite(SpOffsets);
+  }
   unsigned NumShadowBytes = MI.getOperand(1).getImm();
   SMShadowTracker.reset(NumShadowBytes);
 }
@@ -2233,6 +2667,142 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
   // FIXME: Enable feature predicate checks once all the test pass.
   // X86_MC::verifyInstructionPredicates(MI->getOpcode(),
   //                                     Subtarget->getFeatureBits());
+
+  // c2go (AB4 GPT round-2 blocker fix): in the Plan 9 .s path, `go tool asm`
+  // (obj6.go) owns the prologue/epilogue for a framed `TEXT $framesize` (it
+  // injects the SP adjustment + optional BP save at entry and expands RET
+  // into the teardown based on the staged frame size in the manifest).
+  // X86C2GoFrameEmitter::emitX86C2GoPrologue/Epilogue stages frame setup/
+  // destroy MIs intended for the .o path; if those MIs are also lowered to
+  // the .s output, obj6 will double-inject the prologue → stack corruption.
+  // Suppress them here. Mirrors AArch64AsmPrinter.cpp:3794-3807; GoABI0 uses
+  // a no-callee-saved CC, so the only FrameSetup/FrameDestroy instructions
+  // in a c2go function are exactly that prologue/epilogue — there are no
+  // CSR spills to drop. The .o path (non-Plan 9) keeps the frame intact.
+  if (OutStreamer->isPlan9AsmStreamer() &&
+      MF->getFunction().getParent()->getModuleFlag(
+          llvm::c2go::kGoabiModuleFlag) &&
+      (MI->getFlag(MachineInstr::FrameSetup) ||
+       MI->getFlag(MachineInstr::FrameDestroy)))
+    return;
+
+  // c2go #298 Wave AK.2 — raw SP-arithmetic loud-fail (Wave AJ F4 follow-up).
+  //
+  // Audit conclusion (gosrc/src/cmd/internal/obj/x86/obj6.go:870-928):
+  // obj6 deltasp algorithm only tracks APUSH{L,Q,W,F*}, APOP{L,Q,W,F*} and
+  // AADJSP. Raw `SUBQ $imm,SP` / `ADDQ $imm,SP` falls into the `default`
+  // switch arm — silently sets FuncFlagSPWrite (auto-SPWRITE) and `continue`s
+  // (the `bad SPWRITE` fatal is gated on `!ctxt.IsAsm`, which `cmd/asm/main.go`
+  // always sets to true). deltasp stays 0 for those raw arith. obj6 then
+  // *unconditionally* injects `AADJSP $localoffset` in the prologue
+  // (obj6.go:715-721) which balances the declared `$framesize`. Net effect:
+  // no compile-time diagnostic, but the function executes BOTH the LLVM-
+  // emitted raw `SUBQ` AND the obj6-injected `AADJSP $localoffset` — SP
+  // moves twice → runtime stack corruption (silent late-bind crash).
+  //
+  // Current real-path coverage (already byte-clean in production):
+  //   - prologue/epilogue SUBQ/ADDQ in X86C2GoFrameEmitter set FrameSetup/
+  //     FrameDestroy flags → suppressed by the early-return above
+  //   - X86CallFrameOptimization bail in c2go-mode (Wave AJ.1) keeps the
+  //     outgoing-args path on reserved-CF; the `if (!reserveCallFrame)`
+  //     branch in eliminateCallFramePseudoInstr is unreachable
+  //   - the residual `if (InternalAmt) BuildStackAdjustment(...)` at
+  //     X86FrameLowering.cpp:3917 stays 0 because C2GoABIInternal is not
+  //     a callee-pop CC (X86::isCalleePop returns false; LP64 + non-sret-
+  //     i386 path makes NumBytesForCalleeToPop = 0)
+  //   - DynAlloca / TCRETURN / IRET / WIN_ALLOCA / split-stack / probe paths
+  //     are all gated out of leaf eligibility (C2GoLeafEligibility.cpp:146
+  //     hasUnanalyzableCallOrAlloca; mayTailCallThisCC excludes
+  //     C2GoABIInternal)
+  //
+  // Defensive guard: if any future change reopens a path that emits raw SP
+  // arithmetic WITHOUT a FrameSetup/FrameDestroy flag while c2go-mode +
+  // Plan-9 streamer is active, this fatals at compile time instead of
+  // silently miscompiling. Scope is the same publish-side audience as the
+  // suppression above (Plan-9 streamer + module-level c2go.goabi); the .o
+  // path (non-Plan9) is untouched. Mirrors the publish-side loud-fail
+  // discipline of `X86AsmPrinter::emitFunctionEntryLabel`'s missing-argsize
+  // check (Wave AA Fix 3).
+  if (OutStreamer->isPlan9AsmStreamer() &&
+      MF->getFunction().getParent()->getModuleFlag(
+          llvm::c2go::kGoabiModuleFlag)) {
+    unsigned Op = MI->getOpcode();
+    // c2go #298 Wave AL.3 — matcher coverage extension (AK.2.followup).
+    //
+    // Wave AK.2 matched only direct ADD/SUB-immediate-to-RSP forms. Two
+    // gaps remained:
+    //
+    //   (1) `LEA64r %rsp, [%rsp + imm]` / `LEA32r %esp, [%esp + imm]` —
+    //       X86FrameLowering::BuildStackAdjustment selects the LEA form
+    //       instead of ADD/SUB when `STI.useLeaForSP()` is true
+    //       (X86FrameLowering.cpp:378-393, branched on CPU profile /
+    //       OptForSize). The Wave AK.2 opcode whitelist did not include
+    //       LEA{32,64}r — silent miscompile when this CPU-tuned alternative
+    //       fires inside a c2go function without Frame{Setup,Destroy}.
+    //
+    //   (2) Any future X86 backend pass that materializes a `def %rsp` MI
+    //       without Frame{Setup,Destroy} flag is also outside the existing
+    //       opcode whitelist.
+    //
+    // Wave AL.3 extends the matcher to also catch LEA{32,64}r against
+    // RSP/ESP. PUSH/POP/CALL/RET/IRET implicitly def %rsp via MCInstrDesc
+    // (X86InstrInfo.cpp:10759-10765 comments), so a blanket
+    // `definesRegister(RSP)` catch-all would over-trigger on every call —
+    // we instead keep an explicit opcode whitelist that covers
+    // explicit-SP-arith forms only (ADD/SUB-imm + LEA-from-SP) and
+    // exclude the implicit-def call/push/pop family.
+    bool IsSPArithImmOp =
+        Op == X86::SUB64ri32 || Op == X86::SUB64ri8 ||
+        Op == X86::ADD64ri32 || Op == X86::ADD64ri8 ||
+        Op == X86::SUB32ri || Op == X86::SUB32ri8 ||
+        Op == X86::ADD32ri || Op == X86::ADD32ri8;
+    bool IsLEAOp = Op == X86::LEA64r || Op == X86::LEA32r;
+    bool RawSPArith = false;
+    if (IsSPArithImmOp && MI->getNumOperands() >= 3 &&
+        MI->getOperand(0).isReg() && MI->getOperand(1).isReg()) {
+      Register Dst = MI->getOperand(0).getReg();
+      Register Src = MI->getOperand(1).getReg();
+      if ((Dst == X86::RSP || Dst == X86::ESP) && Dst == Src &&
+          MI->getOperand(2).isImm())
+        RawSPArith = true;
+    } else if (IsLEAOp && MI->getNumOperands() >= 6 &&
+               MI->getOperand(0).isReg() && MI->getOperand(1).isReg()) {
+      // LEA layout: {Rd, Base, Scale, Idx, Disp, Seg}. Match the
+      // BuildStackAdjustment shape `LEA Rd=SP, [Base=SP + imm]` where
+      // Scale=1, Idx=NoReg, Disp=imm — exactly what addRegOffset emits
+      // (X86FrameLowering.cpp:380-383).
+      Register Dst = MI->getOperand(0).getReg();
+      Register Base = MI->getOperand(1).getReg();
+      if ((Dst == X86::RSP || Dst == X86::ESP) && Dst == Base &&
+          MI->getOperand(2).isImm() && MI->getOperand(2).getImm() == 1 &&
+          MI->getOperand(3).isReg() && MI->getOperand(3).getReg() == 0 &&
+          MI->getOperand(4).isImm())
+        RawSPArith = true;
+    }
+    if (RawSPArith) {
+      // Only c2go-bucketed functions reach the Plan-9 publish path
+      // (runtime helpers living in the same module keep the standard
+      // X86 lowering even when -emit-plan9-asm is on). Mirror the
+      // X86C2GoFrameMetaStager gate: c2go-argsize (internal GoABI0) OR
+      // c2go-boundary (c2go_extern boundary).
+      const Function &F = MF->getFunction();
+      if (F.hasFnAttribute("c2go-argsize") ||
+          F.hasFnAttribute("c2go-boundary")) {
+        report_fatal_error(
+            Twine("X86 c2go: raw SP arithmetic (opcode #") + Twine(Op) +
+                ") emitted without FrameSetup/FrameDestroy flag in c2go "
+                "Plan-9 path for function '" +
+                MF->getName() +
+                "'. obj6.go deltasp algorithm does not track raw "
+                "SUBQ/ADDQ/LEA $imm,SP — see obj6.go:870-928. Reserve "
+                "the stack via FrameSetup-flagged prologue or rewrite "
+                "to an AADJSP-equivalent before reaching the Plan-9 "
+                "streamer. Wave AJ F4 / Wave AK.2 / Wave AL.3 audit; "
+                "see X86MCInstLower.cpp:2587 comment for cleared paths.",
+            /*GenCrashDiag=*/false);
+      }
+    }
+  }
 
   X86MCInstLower MCInstLowering(*MF, *this);
   const X86RegisterInfo *RI =

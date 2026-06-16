@@ -9,9 +9,12 @@
 #ifndef LLVM_LIB_TARGET_X86_X86ASMPRINTER_H
 #define LLVM_LIB_TARGET_X86_X86ASMPRINTER_H
 
+#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/AsmPrinter.h"
 #include "llvm/CodeGen/FaultMaps.h"
 #include "llvm/CodeGen/StackMaps.h"
+#include "llvm/MC/MCPlan9StackObjects.h"
 
 // Implemented in X86MCInstLower.cpp
 namespace {
@@ -19,6 +22,7 @@ namespace {
 }
 
 namespace llvm {
+class AllocaInst;
 class MCCodeEmitter;
 class MCStreamer;
 class X86Subtarget;
@@ -36,6 +40,21 @@ private:
   bool ShouldEmitWeakSwiftAsyncExtendedFramePointerFlags = false;
   bool IndCSPrefix = false;
   bool EnableImportCallOptimization = false;
+
+  // c2go #298 Wave AC.2 — X86 mirror of AArch64AsmPrinter's per-function
+  // FUNCDATA $2 stkobj accumulator. Populated by LowerSTATEPOINT (in
+  // X86MCInstLower.cpp) for Direct(RSP, off) statepoint locations whose
+  // owning alloca is a structured pointer-bearing type with a known
+  // `c2go.gcbitmap.<X>` symbol; consumed by `publishC2GoStackObjects` in
+  // emitFunctionBodyEnd. Keyed by alloca pointer for cross-statepoint
+  // dedup. Only used when `-c2go-funcdata2` is ON; otherwise stays empty
+  // (zero cost). Mirrors AArch64AsmPrinter.cpp:135-147.
+  SmallSetVector<const AllocaInst *, 8> C2GoStkObjSeen;
+  SmallVector<StkObjEntry, 8> C2GoStkObjEntries;
+
+  // Helper: publish (and clear) the accumulator to MCPlan9AsmStreamer.
+  // Called from emitFunctionBodyEnd; no-op when accumulator is empty.
+  void publishC2GoStackObjects();
 
   enum ImportCallKind : unsigned {
     IMAGE_RETPOLINE_AMD64_IMPORT_BR = 0x02,
@@ -194,6 +213,13 @@ public:
   void emitFunctionBodyStart() override;
   void emitFunctionBodyEnd() override;
   void emitKCFITypeId(const MachineFunction &MF) override;
+
+  // c2go #298 Wave Z Track B / #376: republish per-function metadata staged
+  // on the X86 MFI into the MCPlan9AsmStreamer instance BEFORE the base
+  // class emits `CurrentFnSym` (whose emitLabel reads `C2GoFnMeta` to
+  // decide Stage-1 `TEXT … $framesize-argsize` vs Stage-4 fallback
+  // `NOFRAME, $0`). Mirrors `AArch64AsmPrinter::emitFunctionEntryLabel`.
+  void emitFunctionEntryLabel() override;
 
   bool shouldEmitWeakSwiftAsyncExtendedFramePointerFlags() const override {
     return ShouldEmitWeakSwiftAsyncExtendedFramePointerFlags;
