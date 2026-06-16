@@ -295,6 +295,11 @@ public:
   MCStreamer &operator=(const MCStreamer &) = delete;
   virtual ~MCStreamer();
 
+  /// c2go: identify Plan 9 (Go assembler) streamer without enabling C++ RTTI.
+  /// Used by AsmPrinter / targets to swap stackmap emission for FUNCDATA /
+  /// PCDATA + RODATA gclocals symbols (consumed by Go's pcln/funcdata).
+  virtual bool isPlan9AsmStreamer() const { return false; }
+
   void visitUsedExpr(const MCExpr &Expr);
   virtual void visitUsedSymbol(const MCSymbol &Sym);
 
