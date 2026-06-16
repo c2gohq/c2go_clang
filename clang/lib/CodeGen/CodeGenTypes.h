@@ -210,7 +210,8 @@ public:
   const CGFunctionInfo &arrangeFunctionDeclaration(const GlobalDecl GD);
   const CGFunctionInfo &arrangeFreeFunctionCall(const CallArgList &Args,
                                                 const FunctionType *Ty,
-                                                bool ChainCall);
+                                                bool ChainCall,
+                                                const Decl *TargetDecl = nullptr);
   const CGFunctionInfo &arrangeFreeFunctionType(CanQual<FunctionProtoType> Ty);
   const CGFunctionInfo &arrangeFreeFunctionType(CanQual<FunctionNoProtoType> Ty);
 

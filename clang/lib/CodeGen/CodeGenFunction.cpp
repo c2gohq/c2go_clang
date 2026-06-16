@@ -984,7 +984,10 @@ void CodeGenFunction::StartFunction(GlobalDecl GD, QualType RetTy,
           llvm::Triple::CODE16)
     Fn->addFnAttr("patchable-function", "prologue-short-redirect");
 
-  // Add no-jump-tables value.
+  // Add no-jump-tables value. For c2go-mode, NoUseJumpTables is forced
+  // to true in ParseCodeGenArgs (clang/lib/Frontend/CompilerInvocation.cpp)
+  // so the same condition catches that case without needing a separate
+  // LangOpts check here.
   if (CGM.getCodeGenOpts().NoUseJumpTables)
     Fn->addFnAttr("no-jump-tables", "true");
 
@@ -1457,6 +1460,20 @@ QualType CodeGenFunction::BuildFunctionArgList(GlobalDecl GD,
 
   if (MD && (isa<CXXConstructorDecl>(MD) || isa<CXXDestructorDecl>(MD)))
     CGM.getCXXABI().addImplicitStructorParams(*this, ResTy, Args);
+
+  // c2go §2.3: a c2go-internal variadic function receives the caller-packed
+  // argptrs cursor as a synthetic trailing `void** __c2go_va` parameter
+  // (matching the extra non-variadic IR arg added in arrangeLLVMFunctionInfo).
+  // The function itself is emitted non-variadic, so there is no platform
+  // register-save-area prologue. va_start reads this param's value.
+  if (CGM.usesC2GoVoidPtrVararg(FD->getType()->getAs<FunctionType>(), FD)) {
+    QualType VaTy = getContext().getPointerType(getContext().VoidPtrTy);
+    auto *VaParam = ImplicitParamDecl::Create(
+        getContext(), const_cast<FunctionDecl *>(FD), FD->getLocation(),
+        &getContext().Idents.get("__c2go_va"), VaTy, ImplicitParamKind::Other);
+    Args.push_back(VaParam);
+    C2GoVarArgParam = VaParam;
+  }
 
   return ResTy;
 }

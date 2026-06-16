@@ -2360,6 +2360,32 @@ void CodeGenFunction::EmitAggregateCopy(LValue Dest, LValue Src, QualType Ty,
   auto *Inst = Builder.CreateMemCpy(DestPtr, SrcPtr, SizeVal, isVolatile);
   addInstToCurrentSourceAtom(Inst, nullptr);
 
+  // c2go (#120 / v2): attach `!c2go.elem.type !{!"<RecName>", i64 N}`
+  // when this aggregate copy is over a c2go_struct (or array of them).
+  // EmitAggregateCopy is the path for `*dst = *src` whole-struct
+  // assignment and `dst[i] = src[i]` array-element assignment — both
+  // need to route to runtime.typedmemmove if the struct carries
+  // managed pointer fields, otherwise GC sees no write barrier and
+  // misses the moved pointers. CGBuiltin attaches the same metadata
+  // for explicit `memcpy(...)` source-level calls; this path covers
+  // the implicit struct-assignment lowerings.
+  //
+  // §A2 (typeinfo emission moved to CGC2GoTypeInfo): the key is the
+  // record's AST name only — the same RecName that
+  // `CodeGenModule::emitC2GoTypeinfo` uses when naming
+  // `@c2go.typeinfo.<RecName>`, so C2GoMemcpyTyping's name-based
+  // lookup connects metadata → global without further translation.
+  //
+  // The memcpy's byte length is operand 2 (`@llvm.memcpy(dst, src, len,
+  // isvol)`); for an `N`-element array copy that length is
+  // `N * sizeof(element)`, so the shared helper recovers ElemCount == N
+  // from a pointer to the (array-stripped) element record type.
+  {
+    QualType BaseElemTy = getContext().getBaseElementType(Ty);
+    CGM.attachC2GoElemTypeMetadata(
+        Inst, getContext().getPointerType(BaseElemTy), /*ByteLenArgIdx=*/2);
+  }
+
   // Determine the metadata to describe the position of any padding in this
   // memcpy, as well as the TBAA tags for the members of the struct, in case
   // the optimizer wishes to expand it in to scalar memory operations.

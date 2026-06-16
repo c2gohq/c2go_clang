@@ -24,6 +24,10 @@
 #include "ConstantEmitter.h"
 #include "PatternInit.h"
 #include "TargetInfo.h"
+#include "clang/AST/ASTContext.h"
+#include "clang/AST/Attr.h"
+#include "clang/AST/Decl.h"
+#include "clang/AST/Expr.h"
 #include "clang/AST/OSLog.h"
 #include "clang/AST/StmtVisitor.h"
 #include "clang/Basic/DiagnosticFrontend.h"
@@ -3180,12 +3184,34 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
   case Builtin::BI__builtin_va_start:
   case Builtin::BI__va_start:
   case Builtin::BI__builtin_c23_va_start:
-  case Builtin::BI__builtin_va_end:
+  case Builtin::BI__builtin_va_end: {
+    // c2go §2.3: va_list (`ap`) is a void* holding a void** cursor over the
+    // caller-packed argptrs array. va_start(ap, last) == (ap = __c2go_va);
+    // va_end is a no-op. No llvm.va_start/va_end intrinsic (which would lower
+    // to a platform AAPCS va_list init / register-save-area walk).
+    if (C2GoVarArgParam) {
+      bool IsStart = BuiltinID != Builtin::BI__builtin_va_end;
+      Address VAListAddr =
+          BuiltinID == Builtin::BI__va_start
+              ? Address(EmitScalarExpr(E->getArg(0)), Int8PtrTy,
+                        getPointerAlign())
+              : EmitVAListRef(E->getArg(0));
+      if (IsStart) {
+        // Load the synthetic `void** __c2go_va` parameter (the cursor base)
+        // and store it as the va_list value.
+        Address VaParamAddr = GetAddrOfLocalVar(C2GoVarArgParam);
+        llvm::Value *Cursor = Builder.CreateLoad(VaParamAddr, "c2go.va.base");
+        Builder.CreateStore(
+            Cursor, VAListAddr.withElementType(Cursor->getType()));
+      }
+      return RValue::get(nullptr);
+    }
     EmitVAStartEnd(BuiltinID == Builtin::BI__va_start
                        ? EmitScalarExpr(E->getArg(0))
                        : EmitVAListRef(E->getArg(0)).emitRawPointer(*this),
                    BuiltinID != Builtin::BI__builtin_va_end);
     return RValue::get(nullptr);
+  }
   case Builtin::BI__builtin_va_copy: {
     Value *DstPtr = EmitVAListRef(E->getArg(0)).emitRawPointer(*this);
     Value *SrcPtr = EmitVAListRef(E->getArg(1)).emitRawPointer(*this);
@@ -4470,6 +4496,9 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
                         0);
     auto *I = Builder.CreateMemMove(Dest, Src, SizeVal, false);
     addInstToNewSourceAtom(I, nullptr);
+    // c2go (#120): bcopy(src, dst, n) — dst is 2nd arg.
+    CGM.attachC2GoElemTypeMetadata(I, E->getArg(1)->IgnoreImpCasts()->getType(),
+                                   /*ByteLenArgIdx=*/2);
     return RValue::get(nullptr);
   }
 
@@ -4484,6 +4513,9 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
     EmitArgCheck(TCK_Load, Src, E->getArg(1), 1);
     auto *I = Builder.CreateMemCpy(Dest, Src, SizeVal, false);
     addInstToNewSourceAtom(I, nullptr);
+    // c2go (#120): route managed-dst memcpy through runtime.typedmemmove.
+    CGM.attachC2GoElemTypeMetadata(I, E->getArg(0)->IgnoreImpCasts()->getType(),
+                                   /*ByteLenArgIdx=*/2);
     if (BuiltinID == Builtin::BImempcpy ||
         BuiltinID == Builtin::BI__builtin_mempcpy)
       return RValue::get(Builder.CreateInBoundsGEP(
@@ -4523,6 +4555,9 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
     Value *SizeVal = llvm::ConstantInt::get(Builder.getContext(), Size);
     auto *I = Builder.CreateMemCpy(Dest, Src, SizeVal, false);
     addInstToNewSourceAtom(I, nullptr);
+    // c2go (#120): same typed routing for fortified __memcpy_chk.
+    CGM.attachC2GoElemTypeMetadata(I, E->getArg(0)->IgnoreImpCasts()->getType(),
+                                   /*ByteLenArgIdx=*/2);
     return RValue::get(Dest, *this);
   }
 
@@ -4550,6 +4585,9 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
     Value *SizeVal = llvm::ConstantInt::get(Builder.getContext(), Size);
     auto *I = Builder.CreateMemMove(Dest, Src, SizeVal, false);
     addInstToNewSourceAtom(I, nullptr);
+    // c2go (#120): same typed routing for fortified __memmove_chk.
+    CGM.attachC2GoElemTypeMetadata(I, E->getArg(0)->IgnoreImpCasts()->getType(),
+                                   /*ByteLenArgIdx=*/2);
     return RValue::get(Dest, *this);
   }
 
@@ -4571,6 +4609,9 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
     EmitArgCheck(TCK_Load, Src, E->getArg(1), 1);
     auto *I = Builder.CreateMemMove(Dest, Src, SizeVal, false);
     addInstToNewSourceAtom(I, nullptr);
+    // c2go (#120): see memcpy case above.
+    CGM.attachC2GoElemTypeMetadata(I, E->getArg(0)->IgnoreImpCasts()->getType(),
+                                   /*ByteLenArgIdx=*/2);
     return RValue::get(Dest, *this);
   }
   case Builtin::BImemset:

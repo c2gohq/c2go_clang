@@ -353,6 +353,11 @@ public:
   /// Save Parameter Decl for coroutine.
   llvm::SmallVector<const ParmVarDecl *, 4> FnArgs;
 
+  /// c2go §2.3: for a c2go variadic function definition, the synthetic
+  /// trailing `void** __c2go_va` parameter holding the caller-packed argptrs
+  /// cursor base. va_start reads it; null for non-variadic / non-c2go funcs.
+  const ImplicitParamDecl *C2GoVarArgParam = nullptr;
+
   // Holds coroutine data if the current function is a coroutine. We use a
   // wrapper to manage its lifetime, so that we don't have to define CGCoroData
   // in this header.
@@ -4405,6 +4410,12 @@ public:
   void EmitStoreThroughExtVectorComponentLValue(RValue Src, LValue Dst);
   void EmitStoreThroughGlobalRegLValue(RValue Src, LValue Dst);
 
+  // #214 — removed EmitC2GoScheme2UnionBarrierIfNeeded. The
+  // `_c2go_union_write_barrier` emit path was the wrong substitute for
+  // §A4 step 2 any-subtype IR rewrite (task #215) and for non-union
+  // structs needed no barrier at all (managed alloca has precise GC
+  // bitmap). See CGExpr.cpp's pre-EmitBinaryOperatorLValue comment.
+
   /// EmitStoreThroughBitfieldLValue - Store Src into Dst with same constraints
   /// as EmitStoreThroughLValue.
   ///
@@ -5506,6 +5517,14 @@ public:
                     AbstractCallee AC = AbstractCallee(),
                     unsigned ParamsToSkip = 0,
                     EvaluationOrder Order = EvaluationOrder::Default);
+
+  /// c2go §2.3: rewrite the trailing variadic actuals in \p Args (everything
+  /// after the first \p NumFixed named args) into the void** tagged argument
+  /// pack: store each vararg into a fixed entry-block alloca slot, build a
+  /// `void* argptrs[N]` array pointing at those slots, and replace the trailing
+  /// args with a single arg holding the array's base pointer. No SP movement —
+  /// all storage is fixed-size entry-block allocas folded into the frame.
+  void EmitC2GoVarArgPack(CallArgList &Args, unsigned NumFixed);
 
   /// EmitPointerWithAlignment - Given an expression with a pointer type,
   /// emit the value and compute our best estimate of the alignment of the

@@ -30,6 +30,7 @@
 #include "clang/AST/DeclObjC.h"
 #include "clang/AST/DeclOpenACC.h"
 #include "clang/AST/DeclOpenMP.h"
+#include "clang/AST/RecordLayout.h"
 #include "clang/Basic/CodeGenOptions.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/CodeGen/CGFunctionInfo.h"
@@ -40,7 +41,9 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/IR/Type.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include <optional>
 
 using namespace clang;
@@ -48,6 +51,216 @@ using namespace CodeGen;
 
 static_assert(clang::Sema::MaximumAlignment <= llvm::Value::MaximumAlignment,
               "Clang max alignment greater than what LLVM supports?");
+
+namespace {
+
+// c2go §B2 phase 1: a "managed pointer" is a pointer whose canonical pointee
+// type is a `c2go_struct`-attributed RecordDecl and is not explicitly opted
+// out via `c2go_unmanaged` at the field level (field-level overrides do not
+// apply to plain pointer variables; this helper handles only the type-based
+// determination). Returns the pointee RecordDecl if managed, otherwise null.
+//
+// Coverage is intentionally narrow for phase 1: plain `T *` where T is a
+// `c2go_struct`. Pointer-to-pointer, pointer-to-array, unions, and other
+// composite carriers are skipped — they're not yet on the GC-tracking radar
+// and will be revisited when §B3 stackmaps catch up.
+static const clang::RecordDecl *getC2GoManagedPointee(clang::QualType QT) {
+  if (QT.isNull() || !QT->isPointerType())
+    return nullptr;
+  clang::QualType Pointee = QT->getPointeeType();
+  if (Pointee.isNull())
+    return nullptr;
+  Pointee = Pointee.getCanonicalType();
+  const clang::RecordType *RT = Pointee->getAs<clang::RecordType>();
+  if (!RT)
+    return nullptr;
+  const clang::RecordDecl *RD = RT->getDecl();
+  if (!RD || !RD->hasAttr<clang::C2GoStructAttr>())
+    return nullptr;
+  return RD;
+}
+
+// Attach `!c2go.ptr.managed` metadata to a freshly-emitted alloca. The
+// metadata payload is a single MDString naming the pointee RecordDecl —
+// for §B3 stackmap emission, this lets the IR pass map each managed slot
+// back to its Go-runtime typeinfo without re-walking the AST.
+//
+// For anonymous record pointees we fall back to the literal "c2go.anon".
+// §A3 (anonymous record naming) will eventually plug in synthesised names
+// here; the two tasks land in parallel and use the same metadata schema.
+static void attachC2GoManagedPtrMetadata(llvm::Value *AllocaPtr,
+                                         const clang::RecordDecl *RD) {
+  auto *AI = llvm::dyn_cast_or_null<llvm::AllocaInst>(AllocaPtr);
+  if (!AI || !RD)
+    return;
+  llvm::LLVMContext &Ctx = AI->getContext();
+  llvm::StringRef Name = RD->getName();
+  llvm::Metadata *Ops[] = {
+      llvm::MDString::get(Ctx, Name.empty() ? llvm::StringRef("c2go.anon")
+                                            : Name),
+  };
+  AI->setMetadata(llvm::c2go::kPtrManagedMD, llvm::MDNode::get(Ctx, Ops));
+}
+
+// c2go #282/#287: tag any pointer-typed local slot with `!c2go.ptr.slot`
+// (no payload). The C2GoSafepoint pass marks these slots in the FUNCDATA
+// locals pointer-map so Go's copystack RELOCATES the pointer when the
+// goroutine stack moves — fixing the dangling-`&local` bug (an `unmanaged`
+// C pointer to a stack object would otherwise not be relocated). Distinct
+// from `c2go.ptr.managed` (which additionally carries Go typeinfo for GC
+// tracing); a managed pointer slot may carry both. Sound because copystack's
+// range check (stack.go) only relocates values inside the moving stack, and
+// GC's findObject silently ignores non-Go-heap pointers (stack / libc).
+static void attachC2GoPtrSlotMetadata(llvm::Value *AllocaPtr) {
+  auto *AI = llvm::dyn_cast_or_null<llvm::AllocaInst>(AllocaPtr);
+  if (!AI)
+    return;
+  AI->setMetadata(llvm::c2go::kPtrSlotMD,
+                  llvm::MDNode::get(AI->getContext(), {}));
+}
+
+// c2go #312: does the C type `QT` have a pointer covering byte `Byte`
+// (relative to the start of QT)? Recurses into structs/arrays/unions. For a
+// union, ANY member with a pointer at `Byte` counts (a union word "has a
+// pointer" if some alternative makes it one). PtrSize is 8 on aarch64.
+static bool c2goTypeHasPtrAtByte(const clang::ASTContext &Ctx,
+                                 clang::QualType QT, uint64_t Byte,
+                                 uint64_t PtrSize) {
+  QT = QT.getCanonicalType();
+  if (QT.isNull())
+    return false;
+  if (QT->isPointerType())
+    return Byte < PtrSize; // pointer occupies bytes [0, PtrSize)
+  if (const auto *AT = Ctx.getAsConstantArrayType(QT)) {
+    uint64_t ESz = Ctx.getTypeSizeInChars(AT->getElementType()).getQuantity();
+    if (ESz == 0)
+      return false;
+    return c2goTypeHasPtrAtByte(Ctx, AT->getElementType(), Byte % ESz, PtrSize);
+  }
+  if (const auto *RT = QT->getAs<clang::RecordType>()) {
+    const clang::RecordDecl *RD = RT->getDecl()->getDefinition();
+    if (!RD)
+      return false;
+    const clang::ASTRecordLayout &RL = Ctx.getASTRecordLayout(RD);
+    unsigned FieldNo = 0;
+    for (const clang::FieldDecl *F : RD->fields()) {
+      uint64_t FOff = RL.getFieldOffset(FieldNo) / 8; // bits -> bytes
+      uint64_t FSz = Ctx.getTypeSizeInChars(F->getType()).getQuantity();
+      // Unions: all members start at offset 0, so each member is checked
+      // independently; ANY pointer hit wins.
+      if (Byte >= FOff && Byte < FOff + FSz &&
+          c2goTypeHasPtrAtByte(Ctx, F->getType(), Byte - FOff, PtrSize))
+        return true;
+      ++FieldNo;
+    }
+    return false;
+  }
+  return false; // scalar non-pointer
+}
+
+// c2go #312 (conservative v0): collect byte offsets (relative to the alloca
+// origin, accumulated through `Base`) of UNION-AMBIGUOUS pointer words.
+//
+// A union word at byte-offset O is "ambiguous" iff some member of the union
+// has a pointer at O AND some member does not (a shorter member that doesn't
+// reach O, or a non-pointer member at O). The static FUNCDATA $1 locals mask
+// must NOT mark such words: at -O2 SQLite's `yy_reduce` stores an integer
+// (e.g. `store i64 9`) into the `YYMINORTYPE` union word that the all-PCs
+// static mask would mark "pointer", so copystack reads 0x9 as a stack pointer
+// and aborts ("bad pointer in frame ... yy_reduce ... 0x9").
+//
+// SOUNDNESS: this is conservative UNDER-marking. It is safe only when the
+// union word never holds a pointer INTO the movable goroutine stack --
+// copystack skips non-stack pointers, and SQLite's parser unions hold only
+// heap / source-text pointers, never `&stack_local`, and SQLite uses the C
+// heap (not the Go GC heap). It is NOT generally sound for arbitrary C
+// (`u.ptr = &local;` followed by stack growth would drop a relocatable stack
+// pointer). The fully-sound per-PC marking is tracked as #313.
+//
+// Recurses into nested structs/arrays so unions buried inside aggregates are
+// covered (SQLite's `yyParser` has a `yyStackEntry[]` array, each element of
+// which carries a `YYMINORTYPE` union).
+static void
+c2goCollectAmbiguousUnionWords(const clang::ASTContext &Ctx, clang::QualType QT,
+                               uint64_t Base, uint64_t PtrSize,
+                               llvm::SmallVectorImpl<uint64_t> &Out) {
+  QT = QT.getCanonicalType();
+  if (QT.isNull() || QT->isPointerType())
+    return; // pointer leaves are unambiguous; scalars carry no pointer
+
+  if (const auto *AT = Ctx.getAsConstantArrayType(QT)) {
+    uint64_t ESz = Ctx.getTypeSizeInChars(AT->getElementType()).getQuantity();
+    uint64_t Count = AT->getSize().getZExtValue();
+    for (uint64_t I = 0; I < Count; ++I)
+      c2goCollectAmbiguousUnionWords(Ctx, AT->getElementType(), Base + I * ESz,
+                                     PtrSize, Out);
+    return;
+  }
+
+  const auto *RT = QT->getAs<clang::RecordType>();
+  if (!RT)
+    return;
+  const clang::RecordDecl *RD = RT->getDecl()->getDefinition();
+  if (!RD)
+    return;
+  const clang::ASTRecordLayout &RL = Ctx.getASTRecordLayout(RD);
+
+  if (RD->isUnion()) {
+    uint64_t USz = Ctx.getTypeSizeInChars(QT).getQuantity();
+    // For each pointer-sized word the union spans, classify it as ambiguous
+    // iff some member has a pointer there and some member does not.
+    for (uint64_t W = 0; W + PtrSize <= USz; W += PtrSize) {
+      bool SomePtr = false, SomeNonPtr = false;
+      for (const clang::FieldDecl *F : RD->fields()) {
+        // Each union member starts at offset 0 within the union.
+        if (c2goTypeHasPtrAtByte(Ctx, F->getType(), W, PtrSize))
+          SomePtr = true;
+        else
+          SomeNonPtr = true;
+      }
+      if (SomePtr && SomeNonPtr)
+        Out.push_back(Base + W);
+    }
+    // Recurse into members so a union NESTED inside a union member's struct
+    // is still classified relative to its own absolute offset.
+    for (const clang::FieldDecl *F : RD->fields())
+      c2goCollectAmbiguousUnionWords(Ctx, F->getType(), Base, PtrSize, Out);
+    return;
+  }
+
+  unsigned FieldNo = 0;
+  for (const clang::FieldDecl *F : RD->fields()) {
+    uint64_t FOff = RL.getFieldOffset(FieldNo) / 8; // bits -> bytes
+    c2goCollectAmbiguousUnionWords(Ctx, F->getType(), Base + FOff, PtrSize, Out);
+    ++FieldNo;
+  }
+}
+
+// c2go #312: if the local's type is or contains a union, attach
+// `!c2go.union.ambig.words` -- a list of i64 byte offsets (relative to the
+// alloca) of union-ambiguous pointer words -- so the backend's locals-map
+// emitter (c2goMarkPtrFieldBits) skips marking them. No metadata is attached
+// when there are no ambiguous words (no perturbation of non-union locals).
+static void attachC2GoUnionAmbigMetadata(const clang::ASTContext &Ctx,
+                                         llvm::Value *AllocaPtr,
+                                         clang::QualType Ty) {
+  auto *AI = llvm::dyn_cast_or_null<llvm::AllocaInst>(AllocaPtr);
+  if (!AI)
+    return;
+  uint64_t PtrSize = Ctx.getTypeSizeInChars(Ctx.VoidPtrTy).getQuantity();
+  llvm::SmallVector<uint64_t, 8> Words;
+  c2goCollectAmbiguousUnionWords(Ctx, Ty, /*Base=*/0, PtrSize, Words);
+  if (Words.empty())
+    return;
+  llvm::LLVMContext &LCtx = AI->getContext();
+  llvm::Type *I64 = llvm::Type::getInt64Ty(LCtx);
+  llvm::SmallVector<llvm::Metadata *, 8> Ops;
+  for (uint64_t W : Words)
+    Ops.push_back(llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(I64, W)));
+  AI->setMetadata(llvm::c2go::kUnionAmbigWordsMD, llvm::MDNode::get(LCtx, Ops));
+}
+
+} // end anonymous namespace
 
 void CodeGenFunction::EmitDecl(const Decl &D, bool EvaluateConditionDecl) {
   switch (D.getKind()) {
@@ -1604,6 +1817,26 @@ CodeGenFunction::EmitAutoVarAlloca(const VarDecl &D) {
                                  allocaAlignment, D.getName(),
                                  /*ArraySize=*/nullptr, &AllocaAddr);
 
+      // c2go §B2 phase 1: tag locals that hold a managed pointer with
+      // `!c2go.ptr.managed` metadata, so that downstream §B3 stackmap
+      // emission can identify which stack slots reference GC-tracked
+      // Go-runtime memory. Only active under -fc2go.
+      if (getLangOpts().C2GoMode && !isEscapingByRef) {
+        if (const RecordDecl *RD = getC2GoManagedPointee(Ty))
+          attachC2GoManagedPtrMetadata(AllocaAddr.getPointer(), RD);
+        // #282/#287: also tag every pointer-typed local so copystack
+        // relocates it (a `T* p = &stackLocal` must survive a stack move).
+        if (Ty->isPointerType())
+          attachC2GoPtrSlotMetadata(AllocaAddr.getPointer());
+        // #312: tag aggregate locals that contain a union with the set of
+        // union-ambiguous pointer-word offsets so the backend's static
+        // locals mask skips them (a union word that is a ptr in one member
+        // and an int in another must not be marked "pointer" at all PCs).
+        if (Ty->isAggregateType())
+          attachC2GoUnionAmbigMetadata(getContext(), AllocaAddr.getPointer(),
+                                       Ty);
+      }
+
       // Don't emit lifetime markers for MSVC catch parameters. The lifetime of
       // the catch parameter starts in the catchpad instruction, and we can't
       // insert code in those basic blocks.
@@ -2750,6 +2983,13 @@ void CodeGenFunction::EmitParmDecl(const VarDecl &D, ParamValue Arg,
       // Otherwise, create a temporary to hold the value.
       DeclPtr = CreateMemTemp(Ty, getContext().getDeclAlign(&D),
                               D.getName() + ".addr", &AllocaPtr);
+      // c2go §B2 phase 1: a parameter of managed-pointer type gets the same
+      // metadata as a local alloca — its `.addr` slot also holds a Go-tracked
+      // pointer for the duration of the function body.
+      if (getLangOpts().C2GoMode) {
+        if (const RecordDecl *RD = getC2GoManagedPointee(Ty))
+          attachC2GoManagedPtrMetadata(AllocaPtr.getPointer(), RD);
+      }
     }
     DoStore = true;
   }

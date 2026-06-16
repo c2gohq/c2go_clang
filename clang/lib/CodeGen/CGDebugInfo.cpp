@@ -1809,6 +1809,11 @@ static unsigned getDwarfCC(CallingConv CC) {
     CC_VLS_CASE(65536)
 #undef CC_VLS_CASE
     return llvm::dwarf::DW_CC_LLVM_RISCVVLSCall;
+  case CC_GoABI0:
+  case CC_C2GoInternal:
+    // No dedicated DWARF tag for Go ABI0 / c2go internal abi0 yet; fall back to
+    // "normal" (0). v1 can request DW_CC_LLVM_GoABI0.
+    return 0;
   }
   return 0;
 }

@@ -82,3 +82,197 @@ std::string mapC2GoType(QualType QT, const ASTContext &Ctx, bool IsUnmanaged) {
   return "uintptr";
 }
 
+std::string buildC2GoGoSig(const FunctionDecl *FD, const ASTContext &Ctx) {
+  bool RetUnmanaged = FD->hasAttr<C2GoUnmanagedAttr>();
+  std::string Out = "func " + FD->getNameAsString() + "(";
+  bool First = true;
+  // Q4 fix: prefer canonical (first / prototype) decl's parameter names —
+  // those are what the user wrote in the header for downstream consumers.
+  // Fall back to the current decl's (definition's) param name only if the
+  // canonical decl has no usable identifier at that slot (e.g. K&R-style
+  // prototype with unnamed parameters).
+  const FunctionDecl *NameSrc = FD->getCanonicalDecl();
+  auto getParmName = [&](unsigned I) -> std::string {
+    if (NameSrc && I < NameSrc->getNumParams())
+      if (const ParmVarDecl *P = NameSrc->getParamDecl(I))
+        if (P->getIdentifier())
+          return P->getNameAsString();
+    if (I < FD->getNumParams())
+      if (const ParmVarDecl *P = FD->getParamDecl(I))
+        if (P->getIdentifier())
+          return P->getNameAsString();
+    return "_";
+  };
+  unsigned Idx = 0;
+  for (auto *PVD : FD->parameters()) {
+    if (!First) Out += ", ";
+    First = false;
+    std::string ArgName = getParmName(Idx++);
+    bool ParmUnmanaged = PVD->hasAttr<C2GoUnmanagedAttr>();
+    Out += ArgName + " " + mapC2GoType(PVD->getType(), Ctx, ParmUnmanaged);
+  }
+  Out += ")";
+  std::string Ret = mapC2GoType(FD->getReturnType(), Ctx, RetUnmanaged);
+  if (!Ret.empty()) Out += " " + Ret;
+  return Out;
+}
+
+void emitC2GoStructMeta(llvm::Module &M, const RecordDecl *RD,
+                        const ASTContext &Ctx) {
+  if (!RD || !RD->isCompleteDefinition())
+    return;
+  if (!RD->hasAttr<C2GoStructAttr>())
+    return;
+  std::string Name = getStableRecordName(RD, Ctx);
+  if (Name.empty())
+    return;
+  // Make sure the base `c2go.struct.<X>` marker NamedMD exists (downstream
+  // consumers iterate Module::named_metadata() looking for that prefix).
+  // CodeGenTypes::ConvertRecordDeclType emits this lazily, but only for
+  // records actually used by-value in IR; we need it for all c2go_structs.
+  std::string BaseName = (llvm::c2go::kStructMDPrefix + Name).str();
+  M.getOrInsertNamedMetadata(BaseName);
+
+  std::string MetaName = BaseName + ".meta";
+  llvm::NamedMDNode *NMD = M.getOrInsertNamedMetadata(MetaName);
+  if (NMD->getNumOperands() != 0)
+    return; // idempotent: keep the first writer's view
+
+  llvm::LLVMContext &LCtx = M.getContext();
+  llvm::Type *I64 = llvm::Type::getInt64Ty(LCtx);
+
+  llvm::StringRef ManagedStr =
+      RD->hasAttr<C2GoUnmanagedAttr>() ? "unmanaged" : "managed";
+
+  llvm::StringRef SchemeStr = "not_applicable";
+  int64_t PtrOff = -1;
+  if (RD->isUnion() && isC2GoVariantUnion(RD)) {
+    // §3.9 / T3 — convert-to-struct; the precise layout is carried by the
+    // .godef metadata, not a scheme/ptr-offset pair.
+    SchemeStr = "variant";
+  } else if (RD->isUnion()) {
+    auto Class = classifyC2GoUnion(RD, Ctx);
+    switch (Class.Scheme) {
+    case C2GoUnionScheme::Scheme1:
+      SchemeStr = "scheme1";
+      PtrOff = (int64_t)Class.PointerOffsetBytes;
+      break;
+    case C2GoUnionScheme::Scheme2:
+      SchemeStr = "scheme2";
+      break;
+    case C2GoUnionScheme::NotApplicable:
+      SchemeStr = "not_applicable";
+      break;
+    }
+  }
+
+  std::string Linkname;
+  if (const auto *LN = RD->getAttr<C2GoLinknameAttr>())
+    Linkname = LN->getName().str();
+
+  llvm::Metadata *Ops[4] = {
+      llvm::MDString::get(LCtx, ManagedStr),
+      llvm::MDString::get(LCtx, SchemeStr),
+      llvm::ConstantAsMetadata::get(llvm::ConstantInt::getSigned(I64, PtrOff)),
+      llvm::MDString::get(LCtx, Linkname),
+  };
+  NMD->addOperand(llvm::MDNode::get(LCtx, Ops));
+  // 2026-06-16: scheme2 unions are now a hard error (§3.9) — no
+  // per-alternative `union_alts` / `union_alts_go_type` MD to emit.
+}
+
+void emitC2GoFuncManifest(llvm::Module &M, llvm::StringRef CName,
+                          const llvm::json::Object &Sym) {
+  if (CName.empty())
+    return;
+  std::string MDName = (llvm::c2go::kFuncMDPrefix + CName).str();
+  llvm::NamedMDNode *NMD = M.getOrInsertNamedMetadata(MDName);
+  if (NMD->getNumOperands() != 0)
+    return; // idempotent: keep the first writer's view
+
+  llvm::LLVMContext &LCtx = M.getContext();
+  llvm::Type *I1 = llvm::Type::getInt1Ty(LCtx);
+  llvm::Type *I32 = llvm::Type::getInt32Ty(LCtx);
+
+  auto getStr = [&](llvm::StringRef Key) -> llvm::Metadata * {
+    if (auto S = Sym.getString(Key))
+      return llvm::MDString::get(LCtx, *S);
+    return llvm::MDString::get(LCtx, "");
+  };
+  auto getBool = [&](llvm::StringRef Key) -> llvm::Metadata * {
+    bool V = Sym.getBoolean(Key).value_or(false);
+    return llvm::ConstantAsMetadata::get(
+        llvm::ConstantInt::get(I1, V ? 1 : 0));
+  };
+  auto getI32 = [&](llvm::StringRef Key) -> llvm::Metadata * {
+    int64_t V = Sym.getInteger(Key).value_or(0);
+    return llvm::ConstantAsMetadata::get(
+        llvm::ConstantInt::get(I32, (uint64_t)V, /*isSigned=*/true));
+  };
+
+  // c_entry is stored as a presence-only boolean in the JSON (writer
+  // sets `Sym["c_entry"] = true` only for `main`). entry_sig is a
+  // string ("void" | "argc_argv" | "argc_argv_envp" | "unknown"),
+  // emitted only when c_entry is true; absent otherwise.
+  llvm::Metadata *Ops[14] = {
+      /* 0 name           */ getStr("name"),
+      /* 1 go_sig         */ getStr("go_sig"),
+      /* 2 kind           */ getStr("kind"),
+      /* 3 managed        */ getBool("managed"),
+      /* 4 go_name        */ getStr("go_name"),
+      /* 5 abi            */ getStr("abi"),
+      /* 6 asm_symbol     */ getStr("asm_symbol"),
+      /* 7 argsize        */ getI32("argsize"),
+      /* 8 needs_linkname */ getBool("needs_linkname"),
+      /* 9 is_variadic    */ getBool("is_variadic"),
+      /* 10 has_float     */ getBool("has_float"),
+      /* 11 has_aggregate */ getBool("has_aggregate"),
+      /* 12 c_entry       */ getBool("c_entry"),
+      /* 13 entry_sig     */ getStr("entry_sig"),
+  };
+  NMD->addOperand(llvm::MDNode::get(LCtx, Ops));
+}
+
+void emitC2GoStructGoDef(llvm::Module &M, const RecordDecl *RD,
+                         const ASTContext &Ctx, llvm::StringRef GoDef) {
+  if (!RD || GoDef.empty())
+    return;
+  std::string Name = getStableRecordName(RD, Ctx);
+  if (Name.empty())
+    return;
+  std::string MDName =
+      (llvm::c2go::kStructMDPrefix + Name + ".godef").str();
+  llvm::NamedMDNode *NMD = M.getOrInsertNamedMetadata(MDName);
+  if (NMD->getNumOperands() != 0)
+    return;
+  llvm::LLVMContext &LCtx = M.getContext();
+  llvm::Metadata *Op = llvm::MDString::get(LCtx, GoDef);
+  NMD->addOperand(llvm::MDNode::get(LCtx, Op));
+}
+
+uint64_t computeC2GoArgSize(const FunctionDecl *FD, const ASTContext &Ctx) {
+  const uint64_t RegSize =
+      Ctx.getTargetInfo().getPointerWidth(LangAS::Default) / 8;
+  auto alignUp = [](uint64_t Off, uint64_t Align) {
+    if (Align == 0) Align = 1;
+    return (Off + Align - 1) & ~(Align - 1);
+  };
+  auto Place = [&](QualType QT, uint64_t &Cur) {
+    QT = QT.getCanonicalType();
+    if (QT->isVoidType()) return;
+    uint64_t Sz = Ctx.getTypeSizeInChars(QT).getQuantity();
+    uint64_t Al = Ctx.getTypeAlignInChars(QT).getQuantity();
+    Cur = alignUp(Cur, Al);
+    Cur += Sz;
+  };
+  uint64_t Total = 0;
+  for (auto *PVD : FD->parameters())
+    Place(PVD->getType(), Total);
+  Total = alignUp(Total, RegSize);
+  Place(FD->getReturnType(), Total);
+  Total = alignUp(Total, RegSize);
+  return Total;
+}
+
+} // namespace c2go
+} // namespace clang

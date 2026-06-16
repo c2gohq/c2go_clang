@@ -1633,7 +1633,11 @@ Value *ScalarExprEmitter::EmitScalarConversion(Value *Src, QualType SrcType,
   if (auto DstPT = dyn_cast<llvm::PointerType>(DstTy)) {
     // The source value may be an integer, or a pointer.
     if (isa<llvm::PointerType>(SrcTy))
-      return Src;
+      // c2go (GC-S4): a managed addrspace(1) pointer converting to a
+      // default-AS pointer (or vice versa) needs an addrspacecast, not a
+      // bare reuse of the source value. With opaque pointers this is a no-op
+      // for same-AS conversions, so it is safe in the general case too.
+      return Builder.CreatePointerBitCastOrAddrSpaceCast(Src, DstTy, "conv");
 
     assert(SrcType->isIntegerType() && "Not ptr->ptr or int->ptr conversion?");
     // First, convert to the correct width so that we control the kind of
@@ -1649,6 +1653,17 @@ Value *ScalarExprEmitter::EmitScalarConversion(Value *Src, QualType SrcType,
   if (isa<llvm::PointerType>(SrcTy)) {
     // Must be an ptr to int cast.
     assert(isa<llvm::IntegerType>(DstTy) && "not ptr->int?");
+    // c2go v15 §3.5 D4: managed AS(1) ptr -> integer uses `ptrtoaddr` (drops
+    // provenance, matching the c2go safepoint contract). See CK_PointerToIntegral
+    // for the matching design rationale.
+    if (CGF.getLangOpts().C2GoMode && SrcTy->getPointerAddressSpace() == 1) {
+      llvm::Type *AddrTy =
+          CGF.CGM.getDataLayout().getAddressType(CGF.getLLVMContext(), 1);
+      llvm::Value *Addr = Builder.CreatePtrToAddr(Src, "conv.addr");
+      if (AddrTy != DstTy)
+        return Builder.CreateIntCast(Addr, DstTy, /*isSigned=*/false, "conv");
+      return Addr;
+    }
     return Builder.CreatePtrToInt(Src, DstTy, "conv");
   }
 
@@ -2562,9 +2577,15 @@ Value *ScalarExprEmitter::VisitCastExpr(CastExpr *CE) {
       return CGF.CGM.getTargetCodeGenInfo().performAddrSpaceCast(
           CGF, Src, E->getType().getAddressSpace(), DstTy);
 
+    // c2go (GC-S4): a managed pointer is lowered to addrspace(1) purely in
+    // CodeGen (no AST LangAS), so a CK_BitCast can legitimately cross AS1<->AS0
+    // here. The final pointer cast below uses CreatePointerBitCastOrAddrSpaceCast
+    // so an addrspacecast is emitted when the address spaces differ; the old
+    // "must be a same-AS bitcast" invariant no longer holds for c2go.
     assert(
         (!SrcTy->isPtrOrPtrVectorTy() || !DstTy->isPtrOrPtrVectorTy() ||
-         SrcTy->getPointerAddressSpace() == DstTy->getPointerAddressSpace()) &&
+         SrcTy->getPointerAddressSpace() == DstTy->getPointerAddressSpace() ||
+         CGF.getLangOpts().C2GoMode) &&
         "Address-space cast must be used to convert address spaces");
 
     if (CGF.SanOpts.has(SanitizerKind::CFIUnrelatedCast)) {
@@ -2607,6 +2628,13 @@ Value *ScalarExprEmitter::VisitCastExpr(CastExpr *CE) {
           CGF.getDebugInfo()->addHeapAllocSiteMetadata(CI, PointeeType,
                                                        CE->getExprLoc());
       }
+
+      // In CGO mode, when a call to malloc/calloc/realloc is cast to a
+      // pointer to a CGO struct, tag the call with the inferred allocation
+      // target type. The later LLVM C2GoMallocReplacement pass reads this
+      // metadata to pick the right type-info argument for runtime.mallocgc.
+      if (CGF.getLangOpts().C2GoMode)
+        CGF.CGM.attachC2GoAllocTargetMetadata(CI, DestTy);
     }
 
     // If Src is a fixed vector and Dst is a scalable vector, and both have the
@@ -2687,7 +2715,13 @@ Value *ScalarExprEmitter::VisitCastExpr(CastExpr *CE) {
       return EmitLoadOfLValue(DestLV, CE->getExprLoc());
     }
 
-    llvm::Value *Result = Builder.CreateBitCast(Src, DstTy);
+    // c2go (GC-S4): use an AS-aware cast so a managed addrspace(1) pointer
+    // converting to/from a default-AS pointer (e.g. void*) emits an
+    // addrspacecast rather than an invalid bitcast.
+    llvm::Value *Result =
+        (SrcTy->isPtrOrPtrVectorTy() && DstTy->isPtrOrPtrVectorTy())
+            ? Builder.CreatePointerBitCastOrAddrSpaceCast(Src, DstTy)
+            : Builder.CreateBitCast(Src, DstTy);
     return CGF.authPointerToPointerCast(Result, E->getType(), DestTy);
   }
   case CK_AddressSpaceConversion: {
@@ -2855,7 +2889,27 @@ Value *ScalarExprEmitter::VisitCastExpr(CastExpr *CE) {
     }
 
     PtrExpr = CGF.authPointerToPointerCast(PtrExpr, E->getType(), DestTy);
-    return Builder.CreatePtrToInt(PtrExpr, ConvertType(DestTy));
+    llvm::Type *DestLLVMTy = ConvertType(DestTy);
+    // c2go v15 §3.5 D4: managed AS(1) ptr -> integer drops AS1 tracking and
+    // does not preserve provenance — emit `ptrtoaddr` (non-capturing address
+    // extract) instead of `ptrtoint`. The integer carries no GC discriminator,
+    // so the pointee cannot be relocated across a safepoint; the warning at
+    // SemaCast warn_c2go_managed_ptrtoint enforces that contract at source
+    // level. `ptrtoaddr` Verifier requires DestTy == AS address width, so
+    // emit to the AS1 address type first then trunc/zext to the user's type.
+    if (CGF.getLangOpts().C2GoMode &&
+        PtrExpr->getType()->isPointerTy() &&
+        PtrExpr->getType()->getPointerAddressSpace() == 1 &&
+        DestLLVMTy->isIntegerTy()) {
+      llvm::Type *AddrTy = CGF.CGM.getDataLayout().getAddressType(
+          CGF.getLLVMContext(), 1);
+      llvm::Value *Addr = Builder.CreatePtrToAddr(PtrExpr, "conv.addr");
+      if (AddrTy != DestLLVMTy)
+        return Builder.CreateIntCast(Addr, DestLLVMTy, /*isSigned=*/false,
+                                     "conv");
+      return Addr;
+    }
+    return Builder.CreatePtrToInt(PtrExpr, DestLLVMTy);
   }
   case CK_ToVoid: {
     CGF.EmitIgnoredExpr(E);
@@ -5181,6 +5235,43 @@ Value *ScalarExprEmitter::EmitCompare(const BinaryOperator *E,
           RHS = Builder.CreateStripInvariantGroup(RHS);
       }
 
+      // c2go #406: a managed-record pointer is lowered to addrspace(1) at the
+      // type level (CodeGenTypes::ConvertType), but the *address* of a managed-
+      // typed global (`&gOther` where `gOther` is `struct N`) comes out of the
+      // GV in its declared default AS — `EmitLValue().getPointer()` does not
+      // re-cast it to the C type's AS. When one side is AS1 and the other AS0
+      // the ICmp asserts on operand-type mismatch (Instructions.h:1183). Sema
+      // already validated the two pointee types are equality-compatible (both
+      // are pointer-to-managed-record), so unify here with addrspacecast in the
+      // direction of the non-default AS — mirroring the existing AS1↔AS1 path
+      // (which trivially type-matches) and the CK_BitCast `AS1↔AS0` carve-out
+      // at CGExprScalar:2718. Null literals adopt AS in Sema and never reach
+      // this branch with a non-matching AS, so this only fires on the
+      // pointer/pointer case.
+      if (CGF.getLangOpts().C2GoMode &&
+          LHS->getType()->isPointerTy() && RHS->getType()->isPointerTy() &&
+          LHS->getType()->getPointerAddressSpace() !=
+              RHS->getType()->getPointerAddressSpace()) {
+        unsigned LHSAS = LHS->getType()->getPointerAddressSpace();
+        unsigned RHSAS = RHS->getType()->getPointerAddressSpace();
+        // c2go #441: only the {AS0, AS1} mismatch is a legitimate c2go-managed
+        // shape (one side is `ptr addrspace(1)` from a managed pointer, the
+        // other side is `ptr` from a managed-record GV address or a
+        // non-managed pointer). Any other AS combination has no documented
+        // semantic — silently bridging it would either lose managed-ness or
+        // forge it. Trap so we surface the gap instead of miscompiling.
+        assert(((LHSAS == 0 && RHSAS == 1) || (LHSAS == 1 && RHSAS == 0)) &&
+               "c2go #441: unexpected non-default address space in pointer "
+               "compare; only AS0<->AS1 mismatch is supported");
+        if (LHSAS == 0 && RHSAS == 1)
+          LHS = Builder.CreateAddrSpaceCast(LHS, RHS->getType(), "cmp.ascast");
+        else if (LHSAS == 1 && RHSAS == 0)
+          RHS = Builder.CreateAddrSpaceCast(RHS, LHS->getType(), "cmp.ascast");
+        else
+          llvm_unreachable("c2go #441: unsupported address-space pair in "
+                           "pointer compare");
+      }
+
       Result = Builder.CreateICmp(UICmpOpc, LHS, RHS, "cmp");
     }
 
@@ -5788,6 +5879,26 @@ VisitAbstractConditionalOperator(const AbstractConditionalOperator *E) {
       assert(!RHS && "LHS and RHS types must match");
       return nullptr;
     }
+    // c2go #442: same AS0<->AS1 mismatch as the compare path (#406/#441) —
+    // a `?:` whose arms are a managed-pointer load (AS1) and a managed-record
+    // GV address (`&gOther` => AS0) reaches the select with mismatched
+    // pointer types. Sema validated the pointee types so canonicalise to AS1.
+    if (CGF.getLangOpts().C2GoMode &&
+        LHS->getType()->isPointerTy() && RHS->getType()->isPointerTy() &&
+        LHS->getType()->getPointerAddressSpace() !=
+            RHS->getType()->getPointerAddressSpace()) {
+      unsigned LHSAS = LHS->getType()->getPointerAddressSpace();
+      unsigned RHSAS = RHS->getType()->getPointerAddressSpace();
+      assert(((LHSAS == 0 && RHSAS == 1) || (LHSAS == 1 && RHSAS == 0)) &&
+             "c2go #442: unexpected non-default address space in `?:` arm; "
+             "only AS0<->AS1 mismatch is supported");
+      if (LHSAS == 0 && RHSAS == 1)
+        LHS = Builder.CreateAddrSpaceCast(LHS, RHS->getType(), "cond.ascast");
+      else if (LHSAS == 1 && RHSAS == 0)
+        RHS = Builder.CreateAddrSpaceCast(RHS, LHS->getType(), "cond.ascast");
+      else
+        llvm_unreachable("c2go #442: unsupported address-space pair in `?:`");
+    }
     return Builder.CreateSelect(CondV, LHS, RHS, "cond");
   }
 
@@ -5846,6 +5957,36 @@ VisitAbstractConditionalOperator(const AbstractConditionalOperator *E) {
     return RHS;
   if (!RHS)
     return LHS;
+
+  // c2go #442: PHI-shape `?:` (non-cheap arms) has the same AS0<->AS1
+  // mismatch as the select-shape path above. The PHI requires both incoming
+  // values to share a type, so insert the addrspacecast in the arm block,
+  // before its terminating branch (kept as the last instruction of the
+  // block so it dominates the use in the PHI).
+  if (CGF.getLangOpts().C2GoMode &&
+      LHS->getType()->isPointerTy() && RHS->getType()->isPointerTy() &&
+      LHS->getType()->getPointerAddressSpace() !=
+          RHS->getType()->getPointerAddressSpace()) {
+    unsigned LHSAS = LHS->getType()->getPointerAddressSpace();
+    unsigned RHSAS = RHS->getType()->getPointerAddressSpace();
+    assert(((LHSAS == 0 && RHSAS == 1) || (LHSAS == 1 && RHSAS == 0)) &&
+           "c2go #442: unexpected non-default address space in PHI `?:` arm; "
+           "only AS0<->AS1 mismatch is supported");
+    auto InsertAscastBeforeTerm = [&](llvm::Value *&V, llvm::BasicBlock *BB,
+                                     llvm::Type *DstTy) {
+      llvm::Instruction *Term = BB->getTerminator();
+      assert(Term && "c2go #442: arm block has no terminator");
+      llvm::IRBuilder<>::InsertPointGuard Guard(Builder);
+      Builder.SetInsertPoint(Term);
+      V = Builder.CreateAddrSpaceCast(V, DstTy, "cond.ascast");
+    };
+    if (LHSAS == 0 && RHSAS == 1)
+      InsertAscastBeforeTerm(LHS, LHSBlock, RHS->getType());
+    else if (LHSAS == 1 && RHSAS == 0)
+      InsertAscastBeforeTerm(RHS, RHSBlock, LHS->getType());
+    else
+      llvm_unreachable("c2go #442: unsupported address-space pair in PHI `?:`");
+  }
 
   // Create a PHI node for the real part.
   llvm::PHINode *PN = Builder.CreatePHI(LHS->getType(), 2, "cond");

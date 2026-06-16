@@ -19,6 +19,8 @@
 #include "CGRecordLayout.h"
 #include "TargetInfo.h"
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/Attr.h"
+#include "clang/AST/C2GoUtil.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclObjC.h"
 #include "clang/AST/Expr.h"
@@ -27,9 +29,34 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
+#include <functional>
 
 using namespace clang;
 using namespace CodeGen;
+
+// c2go (GC-S4): when enabled, a pointer whose pointee is a c2go_struct-managed
+// record is lowered to addrspace(1), giving the Go-managed-heap-pointer
+// discriminator that survives optimization (consumed by the "c2go-gc"
+// GCStrategy + RewriteStatepointsForGC, see GC design). Default ON (2026-06-01);
+// disable with -mllvm -c2go-managed-addrspace=0 for diagnostic regression only.
+static llvm::cl::opt<bool> C2GoManagedAddrSpace(
+    "c2go-managed-addrspace", llvm::cl::Hidden, llvm::cl::init(true),
+    llvm::cl::desc("c2go: lower pointers to c2go_struct-managed records to "
+                   "addrspace(1) (GC discriminator)"));
+
+// True when PointeeTy's canonical type is a c2go_struct-managed record. Mirrors
+// getC2GoManagedPointee in CGDecl.cpp (the GC-root-tracking criterion).
+static bool isC2GoManagedRecordPointee(QualType PointeeTy) {
+  if (PointeeTy.isNull())
+    return false;
+  const auto *RT = PointeeTy.getCanonicalType()->getAs<RecordType>();
+  if (!RT)
+    return false;
+  const RecordDecl *RD = RT->getDecl();
+  return RD && RD->hasAttr<C2GoStructAttr>();
+}
 
 CodeGenTypes::CodeGenTypes(CodeGenModule &cgm)
     : CGM(cgm), Context(cgm.getContext()), TheModule(cgm.getModule()),
@@ -620,6 +647,9 @@ llvm::Type *CodeGenTypes::ConvertType(QualType T) {
     const ReferenceType *RTy = cast<ReferenceType>(Ty);
     QualType ETy = RTy->getPointeeType();
     unsigned AS = getTargetAddressSpace(ETy);
+    if (C2GoManagedAddrSpace && Context.getLangOpts().C2GoMode &&
+        isC2GoManagedRecordPointee(ETy))
+      AS = 1;
     ResultType = llvm::PointerType::get(getLLVMContext(), AS);
     break;
   }
@@ -627,6 +657,9 @@ llvm::Type *CodeGenTypes::ConvertType(QualType T) {
     const PointerType *PTy = cast<PointerType>(Ty);
     QualType ETy = PTy->getPointeeType();
     unsigned AS = getTargetAddressSpace(ETy);
+    if (C2GoManagedAddrSpace && Context.getLangOpts().C2GoMode &&
+        isC2GoManagedRecordPointee(ETy))
+      AS = 1;
     ResultType = llvm::PointerType::get(getLLVMContext(), AS);
     break;
   }
@@ -832,6 +865,190 @@ llvm::StructType *CodeGenTypes::ConvertRecordDeclType(const RecordDecl *RD) {
   // Layout fields.
   std::unique_ptr<CGRecordLayout> Layout = ComputeRecordLayout(RD, Ty);
   CGRecordLayouts[Key] = std::move(Layout);
+
+  // Mark CGO struct types in the module so downstream passes can recognize
+  // them. The named metadata node's presence is the signal; its operands
+  // list the byte offsets of any cgo_noscan fields, in
+  // (offset_in_bytes, size_in_bytes) pairs, so the pass can clear those
+  // ranges from the GC bitmap.
+  if (RD->hasAttr<C2GoStructAttr>()) {
+    llvm::LLVMContext &Ctx = Ty->getContext();
+    llvm::Module &M = CGM.getModule();
+    // c2go §A3: derive the named-metadata key from the AST's stable name
+    // (`c2go.anon.<hash>` for truly anonymous records). This matches the
+    // typeinfo global `@c2go.typeinfo.<RecName>` produced by emitC2GoTypeinfo
+    // and the `c2go.elem.type` metadata key emitted by CGExprAgg/CGBuiltin
+    // — all three downstream consumers (LLVM passes, Go binding, GC bitmap)
+    // now agree on a single name for an anonymous record. Fall back to the
+    // legacy pointer-hex form only when no stable name can be produced
+    // (defensive — would indicate an invalid RD).
+    std::string StableName = c2go::getStableRecordName(RD, Context);
+    std::string MetadataName =
+        !StableName.empty()
+            ? (llvm::c2go::kStructMDPrefix + StableName).str()
+            : (llvm::c2go::kStructMDPrefix + "ptr_" +
+               llvm::utohexstr(reinterpret_cast<uintptr_t>(Ty), true))
+                  .str();
+    llvm::NamedMDNode *NMD = M.getOrInsertNamedMetadata(MetadataName);
+    if (NMD->getNumOperands() == 0) {
+      llvm::SmallVector<llvm::Metadata *, 8> NoScanOps;
+      const ASTRecordLayout &RL = Context.getASTRecordLayout(RD);
+      llvm::Type *I64 = llvm::Type::getInt64Ty(Ctx);
+      unsigned FieldNo = 0;
+      for (FieldDecl *F : RD->fields()) {
+        if (F->hasAttr<C2GoUnmanagedAttr>()) {
+          uint64_t OffsetBits = RL.getFieldOffset(FieldNo);
+          uint64_t OffsetBytes = OffsetBits / 8;
+          uint64_t SizeBytes =
+              Context.getTypeSizeInChars(F->getType()).getQuantity();
+          NoScanOps.push_back(llvm::ConstantAsMetadata::get(
+              llvm::ConstantInt::get(I64, OffsetBytes)));
+          NoScanOps.push_back(llvm::ConstantAsMetadata::get(
+              llvm::ConstantInt::get(I64, SizeBytes)));
+        }
+        ++FieldNo;
+      }
+      NMD->addOperand(llvm::MDNode::get(Ctx, NoScanOps));
+
+      // c2go §D2 phase 2/3: also emit a sibling named metadata listing
+      // every named field's (offset, fieldname). The AArch64 AsmPrinter
+      // consults this in Plan 9 emission mode to rewrite LDR/STR
+      // immediate offsets into symbolic `<Rec>_<Field>` references
+      // (matched against the `go_asm.h` symbols Go emits for the
+      // c2gobind-generated struct). Anonymous / unnamed fields are
+      // skipped — the symbolic form requires a name.
+      //
+      // Phase 3 extension: for any field whose type is itself a
+      // c2go-managed (or plain) record, recursively emit *flattened*
+      // (offset, "outerField+InnerRec_innerField") entries so accesses
+      // like `p->inner.y` (path-aware TBAA Offset=8, BaseType=Outer)
+      // can still be rewritten symbolically. The Plan 9 assembler
+      // accepts additive symbol expressions of the form
+      // `Outer_inner+Inner_y(R0)` — the exact form Go's runtime uses
+      // (`(g_sched+gobuf_sp)(R10)` etc.). At link time these resolve
+      // via Go's asmhdr-emitted `Outer_inner` and `Inner_y` defines.
+      if (!StableName.empty()) {
+        std::string FieldsMetadataName =
+            (llvm::c2go::kStructMDPrefix + StableName + ".fields").str();
+        llvm::NamedMDNode *FieldsNMD =
+            M.getOrInsertNamedMetadata(FieldsMetadataName);
+        if (FieldsNMD->getNumOperands() == 0) {
+          // Walk a (potentially nested) record, appending entries to
+          // FieldsNMD. `Prefix` is the chain of named outer fields
+          // joined with '.' visually but emitted as `outer+InnerRec_`
+          // segments — empty at the top level. `BaseOff` accumulates
+          // the absolute byte offset from the outermost record.
+          std::function<void(const RecordDecl *, uint64_t,
+                             llvm::StringRef)> emitFields =
+              [&](const RecordDecl *CurRD, uint64_t BaseOff,
+                  llvm::StringRef PathSym) {
+            const ASTRecordLayout &CurRL =
+                Context.getASTRecordLayout(CurRD);
+            unsigned FNo = 0;
+            for (FieldDecl *F : CurRD->fields()) {
+              if (!F->getIdentifier()) { ++FNo; continue; }
+              uint64_t OffBits = CurRL.getFieldOffset(FNo);
+              uint64_t OffBytes = BaseOff + (OffBits / 8);
+              // Build the symbol-name fragment used after the
+              // outermost `<StableName>_` prefix the AsmPrinter
+              // prepends. At depth 0 this is just the field name
+              // (`"inner"` → `Outer_inner`); at deeper levels we
+              // chain with the inner record's stable name:
+              // `"inner+Inner_y"` → `Outer_inner+Inner_y`.
+              std::string EntryName;
+              if (PathSym.empty())
+                EntryName = F->getName().str();
+              else {
+                EntryName = PathSym.str();
+                EntryName += '_';
+                EntryName += F->getName().str();
+              }
+              llvm::Metadata *Pair[2] = {
+                  llvm::ConstantAsMetadata::get(
+                      llvm::ConstantInt::get(I64, OffBytes)),
+                  llvm::MDString::get(Ctx, EntryName),
+              };
+              FieldsNMD->addOperand(llvm::MDNode::get(Ctx, Pair));
+
+              // Recurse into nested struct/union fields. Only when
+              // the field type names a record with a stable AST
+              // name (so Go's asmhdr will emit a matching
+              // `<InnerRec>_<innerfield>` symbol for the offsets
+              // we reference). Plain scalar / pointer / array
+              // fields don't recurse here — arrays of records
+              // would require per-element entries which the
+              // current Plan 9 indexed-addressing rewrite doesn't
+              // consume, so we leave them to phase 4.
+              const Type *FTU = F->getType()
+                                    .getCanonicalType()
+                                    .getTypePtrOrNull();
+              if (FTU) {
+                if (const auto *InnerRT = FTU->getAs<RecordType>()) {
+                  const RecordDecl *InnerRD =
+                      InnerRT->getDecl()->getDefinition();
+                  // Only recurse when the nested record is itself a
+                  // `c2go_struct` — only then does c2gobind emit a
+                  // matching Go-side type whose asmhdr will provide
+                  // the `<InnerRec>_<field>` symbol our additive
+                  // expression links against. Plain non-c2go inner
+                  // records (e.g. system C types) would generate
+                  // unresolved external references at link time, so
+                  // we skip them and let the AsmPrinter fall back to
+                  // the raw-byte offset for `outer->plain.field`.
+                  if (InnerRD && !InnerRD->isUnion() &&
+                      InnerRD->hasAttr<C2GoStructAttr>()) {
+                    std::string InnerStable =
+                        c2go::getStableRecordName(InnerRD, Context);
+                    if (!InnerStable.empty()) {
+                      // The Plan 9 form after the outermost
+                      // `<StableName>_` prefix becomes
+                      // `<currentEntry>+<InnerStable>_<innerfield>`.
+                      std::string NextPath = EntryName;
+                      NextPath += '+';
+                      NextPath += InnerStable;
+                      emitFields(InnerRD, OffBytes, NextPath);
+                    }
+                  }
+                }
+              }
+              ++FNo;
+            }
+          };
+          emitFields(RD, /*BaseOff=*/0, /*PathSym=*/llvm::StringRef());
+          // Tag the named metadata with the record's stable name as the
+          // last operand so consumers can disambiguate it from the
+          // primary `c2go.struct.<X>` no-scan list (same prefix, harder
+          // to filter at NamedMD iteration time). Stored as a single-
+          // operand MDNode `!{ !"<StableName>" }` so the parser can
+          // recognize it by shape.
+          // (For now: not strictly required — consumers look up by
+          // the exact metadata-name form. Keep this comment for the
+          // future MDNode-walking variant.)
+        }
+      }
+
+      // §A2: when the struct is Go-owner (carries `c2go_linkname`), record
+      // the linkname as a second operand so the LLVM C2GoMallocReplacement
+      // pass skips its default typeinfo emission for this struct — clang
+      // has already emitted only the external `@"type:<linkname>"` decl
+      // and any pass-side definition would conflict with the Go-side type.
+      if (const auto *LN = RD->getAttr<C2GoLinknameAttr>()) {
+        llvm::Metadata *LinknameOp =
+            llvm::MDString::get(Ctx, LN->getName());
+        NMD->addOperand(llvm::MDNode::get(Ctx, LinknameOp));
+      }
+    }
+
+    // c2go §A2: emit the Go-runtime typeinfo global (and its gcbitmap)
+    // straight from the AST. For C-owner structs this is a
+    // `linkonce_odr` definition; for Go-owner structs (those carrying
+    // `c2go_linkname`) it's just an external decl bridging to the
+    // Go-side `type:pkg.X` symbol. The LLVM C2GoMallocReplacement pass
+    // still runs but checks for an existing typeinfo global before
+    // emitting its own — keeps the legacy literal/anonymous path alive
+    // and avoids double-emit conflicts.
+    CGM.emitC2GoTypeinfo(RD);
+  }
 
   // If this struct blocked a FunctionType conversion, then recompute whatever
   // was derived from that.

@@ -28,6 +28,7 @@
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/ASTLambda.h"
 #include "clang/AST/Attr.h"
+#include "clang/AST/C2GoUtil.h"
 #include "clang/AST/DeclObjC.h"
 #include "clang/AST/InferAlloc.h"
 #include "clang/AST/NSAPI.h"
@@ -35,6 +36,7 @@
 #include "clang/AST/StmtVisitor.h"
 #include "clang/Basic/Builtins.h"
 #include "clang/Basic/CodeGenOptions.h"
+#include "clang/Basic/DiagnosticFrontend.h"
 #include "clang/Basic/Module.h"
 #include "clang/Basic/SourceManager.h"
 #include "llvm/ADT/STLExtras.h"
@@ -51,6 +53,7 @@
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/xxhash.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include "llvm/Transforms/Utils/SanitizerStats.h"
 
 #include <numeric>
@@ -3266,6 +3269,60 @@ static LValue EmitGlobalVarDeclLValue(CodeGenFunction &CGF,
                                       const Expr *E, const VarDecl *VD) {
   QualType T = E->getType();
 
+  // c2go: __c2go_typeinfo(T) synthesizes an implicit extern var whose
+  // AsmLabel is the RTTI descriptor symbol `c2go.typeinfo.<Name>` and whose
+  // originating RecordDecl is carried on the internal C2GoTypeInfoAttr
+  // (#385 — the VarDecl's C type is intentionally AS-neutral so Sema's
+  // D1-D4 managed-pointer predicates do not fire on it). Drive
+  // CGC2GoTypeInfo to emit the descriptor *definition* (so it is a
+  // locally-defined symbol, not a GOT-indirect extern — the Plan 9
+  // InstPrinter only rewrites the direct ADRP+ADD form), then reference it
+  // via CreateRuntimeVariable so the LLVM global keeps the PLAIN name (no
+  // '\01' user-label escape). That is the exact symbol CGC2GoTypeInfo
+  // defines and that the InstPrinter rewrites to `·_typeinfo_<Name>`.
+  if (VD->isImplicit()) {
+    if (const auto *AL = VD->getAttr<AsmLabelAttr>()) {
+      if (AL->getLabel().starts_with(llvm::c2go::kTypeinfoGVPrefix)) {
+        // c2go #392 — C2GoTypeInfoAttr is `InternalOnly`/`Spellings=[]`/
+        // `SemaHandler=0` (Attr.td:1395); the parser cannot produce it. The
+        // sole producer is Sema's `ActOnC2GoTypeInfo` (SemaExpr.cpp:16767)
+        // which `addAttr`s the AsmLabel `c2go.typeinfo.*` and the
+        // C2GoTypeInfoAttr in lock-step on the same implicit VarDecl. Seeing
+        // the AsmLabel without the carrier therefore violates a
+        // compiler-internal invariant — assert rather than silently dropping
+        // the descriptor `emitC2GoTypeinfo` call (which would leave the
+        // CreateRuntimeVariable reference dangling as a never-defined extern
+        // and trip the Plan 9 InstPrinter's direct-symbol expectation).
+        // Under NDEBUG the assert is gone, so the `else` branch reports a
+        // frontend error (DiagnosticFrontendKinds.td:
+        // `err_c2go_typeinfo_attr_missing`) and returns an Undef-backed
+        // LValue mirroring `EmitUnsupportedLValue` (CGExpr.cpp:1635). That
+        // way release builds never emit a dangling `c2go.typeinfo.<Name>`
+        // extern reference and the compilation terminates with a clear
+        // error instead of producing an unlinkable object.
+        const auto *TIA = VD->getAttr<C2GoTypeInfoAttr>();
+        assert(TIA && "c2go.typeinfo.* AsmLabel without C2GoTypeInfoAttr — "
+                      "Sema invariant violated (see Attr.td:1395, "
+                      "SemaExpr.cpp ActOnC2GoTypeInfo)");
+        if (TIA) {
+          CGF.CGM.emitC2GoTypeinfo(TIA->getRecord());
+          llvm::Type *I8Ty = llvm::Type::getInt8Ty(CGF.getLLVMContext());
+          llvm::Constant *G = CGF.CGM.CreateRuntimeVariable(I8Ty, AL->getLabel());
+          CharUnits Align = CGF.getContext().getDeclAlign(VD);
+          Address Addr(G, I8Ty, Align);
+          return CGF.MakeAddrLValue(Addr, T, AlignmentSource::Decl);
+        }
+        CGF.CGM.getDiags().Report(VD->getLocation(),
+                                  diag::err_c2go_typeinfo_attr_missing);
+        llvm::Type *ElTy = CGF.ConvertType(T);
+        return CGF.MakeAddrLValue(
+            Address(llvm::UndefValue::get(CGF.DefaultPtrTy), ElTy,
+                    CharUnits::One()),
+            T);
+      }
+    }
+  }
+
   // If it's thread_local, emit a call to its wrapper function instead.
   if (VD->getTLSKind() == VarDecl::TLS_Dynamic &&
       CGF.CGM.getCXXABI().usesThreadWrapperFunction(VD))
@@ -5626,6 +5683,22 @@ LValue CodeGenFunction::EmitLValueForField(LValue base, const FieldDecl *field,
 
   unsigned RecordCVR = base.getVRQualifiers();
   if (rec->isUnion()) {
+    // c2go §3.9 / T3 — a `c2go_variant` union is laid out as a struct whose
+    // slots are partitioned by GC class. Redirect the member access to its
+    // converted-struct byte offset: `(StructA*)((uint8*)&u + pos)->field`.
+    // (For a plain union pos is 0 for every member, so this is a no-op there.)
+    if (getLangOpts().C2GoMode && c2go::isC2GoVariantUnion(rec)) {
+      auto VL = c2go::computeC2GoVariantLayout(rec, getContext());
+      unsigned Idx = field->getFieldIndex();
+      if (VL.Valid && Idx < VL.FieldStructOffsets.size()) {
+        uint64_t Pos = VL.FieldStructOffsets[Idx];
+        if (Pos != 0) {
+          Address i8addr = addr.withElementType(Int8Ty);
+          i8addr = Builder.CreateConstInBoundsGEP(i8addr, Pos, field->getName());
+          addr = i8addr;
+        }
+      }
+    }
     // For unions, there is no pointer adjustment.
     if (CGM.getCodeGenOpts().StrictVTablePointers &&
         hasAnyVptr(FieldType, getContext()))
@@ -6397,6 +6470,19 @@ CGCallee CodeGenFunction::EmitCallee(const Expr *E) {
   return callee;
 }
 
+// #214 — removed `_c2go_union_write_barrier` emit (was Round 1 P0 #1+#3,
+// scheme2 union + non-union p->m=v cases). Wrong direction: scheme2 union
+// should go through §A4 step 2 any-subtype IR rewrite (task #215); non-
+// union c2go_struct managed-ptr stores are already covered by the
+// precise GC bitmap (alloca has !c2go.ptr.managed metadata + stackmap).
+// At SQLite scale, 1233 of these CALLs were unresolved cross-pkg refs
+// that ballooned the Go linker symbol table to 16 GB.
+//
+// Re-introduction guidance: if a future barrier path is genuinely
+// needed, give it (a) a contract-correct name (not "union_write_barrier"
+// when it covers non-union too) and (b) a real Go-side implementation
+// linking to `runtime.gcWriteBarrier1` — not a NO-OP placeholder.
+
 LValue CodeGenFunction::EmitBinaryOperatorLValue(const BinaryOperator *E) {
   // Comma expressions just emit their LHS then their RHS as an l-value.
   if (E->getOpcode() == BO_Comma) {
@@ -6486,8 +6572,9 @@ LValue CodeGenFunction::EmitBinaryOperatorLValue(const BinaryOperator *E) {
       QualType DstType = E->getLHS()->getType();
       EmitBitfieldConversionCheck(Src, SrcType, Result, DstType,
                                   LV.getBitFieldInfo(), E->getExprLoc());
-    } else
+    } else {
       EmitStoreThroughLValue(RV, LV);
+    }
 
     if (getLangOpts().OpenMP)
       CGM.getOpenMPRuntime().checkAndEmitLastprivateConditional(*this,
@@ -6840,8 +6927,17 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
   EmitCallArgs(Args, dyn_cast<FunctionProtoType>(FnType), Arguments,
                E->getDirectCallee(), /*ParamsToSkip=*/0, Order);
 
+  // c2go §2.3: pack the trailing varargs into the void** tagged argument pack
+  // before arranging the (now non-variadic) call. This must run before
+  // arrangeFreeFunctionCall so the FunctionInfo matches the rewritten Args.
+  if (CGM.usesC2GoVoidPtrVararg(FnType, TargetDecl)) {
+    unsigned NumFixed =
+        cast<FunctionProtoType>(FnType)->getNumParams();
+    EmitC2GoVarArgPack(Args, NumFixed);
+  }
+
   const CGFunctionInfo &FnInfo = CGM.getTypes().arrangeFreeFunctionCall(
-      Args, FnType, /*ChainCall=*/Chain);
+      Args, FnType, /*ChainCall=*/Chain, TargetDecl);
 
   if (ResolvedFnInfo)
     *ResolvedFnInfo = &FnInfo;
@@ -6869,6 +6965,31 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
       if (SanOpts.has(SanitizerKind::AllocToken)) {
         // Set !alloc_token metadata.
         EmitAllocToken(LocalCallOrInvoke, E);
+      }
+    }
+  }
+
+  // c2go (#120): emit `!c2go.elem.type` per-call metadata for calls to
+  // c2go-libc's Memcpy / Memmove stubs. The C2GoMemcpyTyping pass reads
+  // this and routes calls whose dst element-type is a managed struct
+  // through runtime.typedmemmove (write-barrier-aware), while byte
+  // blobs fall through to @llvm.memcpy / @llvm.memmove intrinsics.
+  if (LocalCallOrInvoke && E->getNumArgs() >= 1) {
+    if (auto *FD = dyn_cast_or_null<FunctionDecl>(TargetDecl)) {
+      if (auto *LN = FD->getAttr<C2GoLinknameAttr>()) {
+        StringRef Name = LN->getName();
+        bool IsMemcpy = Name == "github.com/c2go_project/c2go_libc.Memcpy" ||
+                        Name == "github.com/c2go_project/c2go_libc.Memmove";
+        if (IsMemcpy) {
+          // The c2go-libc Memcpy/Memmove stub is `(dst, src, n)`, so the
+          // byte length is operand 2. attachC2GoElemTypeMetadata uses the
+          // §A3 stable record name, so anonymous c2go records get their
+          // synthesized key instead of being silently dropped.
+          const Expr *DstArg = E->getArg(0)->IgnoreImpCasts();
+          if (auto *MC = llvm::dyn_cast<llvm::CallInst>(LocalCallOrInvoke))
+            CGM.attachC2GoElemTypeMetadata(MC, DstArg->getType(),
+                                           /*ByteLenArgIdx=*/2);
+        }
       }
     }
   }
