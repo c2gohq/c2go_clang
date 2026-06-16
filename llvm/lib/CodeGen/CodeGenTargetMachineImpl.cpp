@@ -26,6 +26,7 @@
 #include "llvm/MC/MCInstPrinter.h"
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCObjectWriter.h"
+#include "llvm/MC/MCPlan9AsmStreamer.h"
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSubtargetInfo.h"
@@ -178,10 +179,10 @@ CodeGenTargetMachineImpl::createMCStreamer(raw_pwrite_stream &Out,
 
   switch (FileType) {
   case CodeGenFileType::AssemblyFile: {
+    unsigned AsmVariant =
+        Options.MCOptions.OutputAsmVariant.value_or(MAI.getAssemblerDialect());
     std::unique_ptr<MCInstPrinter> InstPrinter(getTarget().createMCInstPrinter(
-        getTargetTriple(),
-        Options.MCOptions.OutputAsmVariant.value_or(MAI.getAssemblerDialect()),
-        MAI, MII, MRI));
+        getTargetTriple(), AsmVariant, MAI, MII, MRI));
     for (StringRef Opt : Options.MCOptions.InstPrinterOptions)
       if (!InstPrinter->applyTargetSpecificCLOption(Opt))
         return createStringError("invalid InstPrinter option '" + Opt + "'");
@@ -194,6 +195,44 @@ CodeGenTargetMachineImpl::createMCStreamer(raw_pwrite_stream &Out,
     std::unique_ptr<MCAsmBackend> MAB(
         getTarget().createMCAsmBackend(STI, MRI, Options.MCOptions));
     auto FOut = std::make_unique<formatted_raw_ostream>(Out);
+
+    // c2go Phase E v0+1 step 4: when OutputAsmVariant=2 we want a
+    // Plan 9 (Go assembler) syntax streamer that emits TEXT/GLOBL
+    // directives instead of `.section`/`.globl`. The Plan 9
+    // InstPrinter (variant=2) is already in InstPrinter; pair it
+    // with our MCPlan9AsmStreamer.
+    if (AsmVariant == 2) {
+      if (!InstPrinter) {
+        return make_error<StringError>(
+            "Plan 9 InstPrinter (asm-variant=2) is not registered for "
+            "this target; currently AArch64 and X86 support it",
+            inconvertibleErrorCode());
+      }
+      // MCPlan9AsmStreamer holds the MCCodeEmitter and dispatches:
+      //   1. Plan 9 InstPrinter's tryPrintInst (via the
+      //      MCPlan9SymbolicPrinter interface — same object as
+      //      InstPrinter, accessed through a separate base class).
+      //   2. Raw-byte WORD/BYTE fallback via the held MCCodeEmitter
+      //      when the InstPrinter misses AND the encoded bytes have
+      //      no fixups.
+      //   3. PLAN9-ERROR fail-loud when the InstPrinter missed AND
+      //      the encoded bytes have fixups (symbol-bearing
+      //      instruction not yet translated — would otherwise be a
+      //      silent zero-offset miscompile).
+      if (!MCE)
+        MCE.reset(getTarget().createMCCodeEmitter(MII, Context));
+      MCPlan9SymbolicPrinter *SymPrinter = InstPrinter->getPlan9SymbolicPrinter();
+      if (!SymPrinter) {
+        return make_error<StringError>(
+            "Plan 9 InstPrinter does not implement MCPlan9SymbolicPrinter",
+            inconvertibleErrorCode());
+      }
+      AsmStreamer.reset(new MCPlan9AsmStreamer(
+          Context, std::move(FOut), std::move(InstPrinter), SymPrinter,
+          std::move(MCE)));
+      break;
+    }
+
     MCStreamer *S = getTarget().createAsmStreamer(
         Context, std::move(FOut), std::move(InstPrinter), std::move(MCE),
         std::move(MAB));

@@ -13,12 +13,15 @@
 #ifndef LLVM_CODEGEN_MACHINEFRAMEINFO_H
 #define LLVM_CODEGEN_MACHINEFRAMEINFO_H
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/CodeGen/Register.h"
 #include "llvm/CodeGen/TargetFrameLowering.h"
 #include "llvm/Support/Alignment.h"
 #include "llvm/Support/Compiler.h"
 #include <cassert>
+#include <string>
 #include <vector>
 
 namespace llvm {
@@ -347,6 +350,13 @@ private:
   /// Size of the UnsafeStack Frame
   uint64_t UnsafeStackSize = 0;
 
+  // c2go §B2 phase 2.5 / GC Approach B (#330) C2GoSpillSlotTags moved to
+  // AArch64FunctionInfo in #375 slice 3: the tag map is produced by the
+  // AArch64-specific storeRegToStackSlot override (#426 piggyback; was
+  // TII::recordPointerSpillSlot before #426) and consumed only by AArch64
+  // passes — keeping it on the target-independent MachineFrameInfo was a
+  // layering violation.
+
 public:
   explicit MachineFrameInfo(Align StackAlignment, bool StackRealignable,
                             bool ForcedRealign)
@@ -542,6 +552,13 @@ public:
            "Invalid Object Idx!");
     Objects[ObjectIdx + NumFixedObjects].Alloca = nullptr;
   }
+
+  // c2go §B2 phase 2.5 / GC Approach B (#330) setC2GoSpillSlotTag /
+  // getC2GoSpillSlotTag / getC2GoSpillSlotTags moved to AArch64FunctionInfo
+  // in #375 slice 3. Producers (AArch64InstrInfo::storeRegToStackSlot —
+  // piggybacked in #426) and consumers (C2GoFrameEmitter,
+  // AArch64C2GoPtrSlotLivenessPass, AArch64AsmPrinter) go through the
+  // target-specific MachineFunctionInfo.
 
   /// Return the assigned stack offset of the specified object
   /// from the incoming stack pointer.

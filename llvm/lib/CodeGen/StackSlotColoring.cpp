@@ -62,6 +62,7 @@ STATISTIC(NumDead,       "Number of trivially dead stack accesses eliminated");
 namespace {
 
 class StackSlotColoring {
+  MachineFunction *MF = nullptr;
   MachineFrameInfo *MFI = nullptr;
   const TargetInstrInfo *TII = nullptr;
   LiveStacks *LS = nullptr;
@@ -140,11 +141,31 @@ class StackSlotColoring {
   // Assignments - Color to intervals mapping.
   SmallVector<ColorAssignmentInfo, 16> Assignments;
 
+  // c2go (#492): per-color LOGICAL c2go type tag = the value class actually
+  // assigned to each color so far. Seeded from the physical M2 spill tags,
+  // overwritten on each fresh-color assignment in ColorSlot. ColorSlot's
+  // TagsCompatible consults THIS instead of the physical-slot tag, which can be
+  // a STALE "ptr" left by a ptr interval that got recolored elsewhere — a scalar
+  // fresh-color would otherwise leave that stale tag and let a later ptr FI share
+  // the color (TagsCompatible seeing "ptr"), over-marking the scalar. Empty for
+  // non-c2go targets (the TII tag hooks are no-ops), so ColorSlot is unchanged.
+  SmallVector<std::string, 16> C2GoColorTags;
+
+  // c2go (#492): STABLE snapshot of each FI's ORIGINAL c2go type tag, taken
+  // before the coloring loop and NEVER mutated. ColorSlot reads its current
+  // FI's tag (LiTag) and seeds C2GoColorTags from here, so neither the share
+  // decision nor the fresh-color logical-tag set ever reads the mutable
+  // physical tag map (which an earlier interval could contaminate by picking a
+  // not-yet-processed FI's index as its color). The end-of-coloring recompute
+  // also reads this. Empty for non-c2go targets.
+  SmallVector<std::string, 16> C2GoOrigTags;
+
 public:
   StackSlotColoring(MachineFunction &MF, LiveStacks *LS,
                     MachineBlockFrequencyInfo *MBFI, SlotIndexes *Indexes)
-      : MFI(&MF.getFrameInfo()), TII(MF.getSubtarget().getInstrInfo()), LS(LS),
-        MBFI(MBFI), Indexes(Indexes) {}
+      : MF(&MF), MFI(&MF.getFrameInfo()),
+        TII(MF.getSubtarget().getInstrInfo()), LS(LS), MBFI(MBFI),
+        Indexes(Indexes) {}
   bool run(MachineFunction &MF);
 
 private:
@@ -317,11 +338,38 @@ int StackSlotColoring::ColorSlot(LiveInterval *li) {
   uint8_t StackID = MFI->getStackID(FI);
 
   if (!DisableSharing) {
+    // c2go (#330): never merge a pointer-tagged spill slot with an untagged
+    // one. The per-PC Go locals pointer map can only describe ONE typing per
+    // physical slot — merging a "ptr" slot with a plain i64 spill leaves
+    // copystack rewriting an integer at the PC where the untagged value is
+    // live (observed crash in SQLite -O2 `deep`/`all`: `runtime: bad pointer
+    // in frame sqlitepkg.resolveExprStep ... 0x3 / 0x5 / 0x80`). Two "ptr"
+    // tags can still share — each PC's content is some live pointer, which
+    // copystack handles uniformly. Gated to c2go-mode (any tag present
+    // implies c2go).
+    // #375 slice 3: spill-slot tags went to AArch64FunctionInfo behind a TII
+    // virtual; default is empty StringRef for non-c2go targets.
+    // #426: virtual renamed to generic getStackSlotTypeTag.
+    // c2go (#492): the current FI's tag for the share decision must be its STABLE
+    // original (C2GoOrigTags), NOT the mutable physical map — an earlier interval
+    // (processed by weight, not FI order) could have fresh-picked THIS FI's index
+    // as its color and written "ptr" into the physical map, contaminating the read
+    // and misclassifying a scalar as a pointer.
+    StringRef LiTag = StringRef(C2GoOrigTags[FI]);
+    auto TagsCompatible = [&](int OtherFI) -> bool {
+      // c2go (#492): compare the color's LOGICAL tag (C2GoColorTags = the value
+      // class actually assigned to it so far), NOT the physical-slot tag which
+      // may be a STALE "ptr" left by a ptr interval that was recolored elsewhere.
+      // Trusting the stale physical tag here would let a scalar FI and a ptr FI
+      // share one color (over-marking the scalar). Non-c2go: C2GoColorTags is
+      // all-empty, so this is identical to the old physical-tag comparison.
+      return StringRef(C2GoColorTags[OtherFI]) == LiTag;
+    };
 
     // Check if it's possible to reuse any of the used colors.
     Color = UsedColors[StackID].find_first();
     while (Color != -1) {
-      if (!Assignments[Color].overlaps(li)) {
+      if (!Assignments[Color].overlaps(li) && TagsCompatible(Color)) {
         Share = true;
         ++NumEliminated;
         break;
@@ -342,6 +390,20 @@ int StackSlotColoring::ColorSlot(LiveInterval *li) {
     Color = NextColors[StackID];
     UsedColors[StackID].set(Color);
     NextColors[StackID] = AllColors[StackID].find_next(NextColors[StackID]);
+
+    // c2go (#492): record this FI's STABLE original tag (C2GoOrigTags) as the
+    // color's LOGICAL tag, overwriting any stale tag inherited from a ptr
+    // interval that was recolored away — so a scalar taking such a color resets
+    // it to "" and a later ptr FI's TagsCompatible won't wrongly share it.
+    //
+    // We deliberately do NOT write the physical tag map here. The previous
+    // `setStackSlotTypeTag(Color, LiTag)` (#330 finding 1: propagate the M2 tag
+    // onto the fresh color so M5's per-PC liveness sees it) is REMOVED — the
+    // end-of-coloring recompute from the final SlotMapping (in ColorSlots) is now
+    // the authoritative physical write, and a mid-loop physical write would
+    // contaminate the original tag a not-yet-processed FI later reads as its own
+    // LiTag (round-2 finding). #375 slice 3 / #426: tag channel via TII.
+    C2GoColorTags[Color] = C2GoOrigTags[FI];
   }
 
   assert(MFI->getStackID(Color) == MFI->getStackID(FI));
@@ -371,6 +433,21 @@ bool StackSlotColoring::ColorSlots(MachineFunction &MF) {
   SmallVector<SmallVector<int, 4>, 16> RevMap(NumObjs);
   BitVector UsedColors(NumObjs);
 
+  // c2go (#492): snapshot the ORIGINAL per-FI c2go type tags (set by M2 /
+  // AArch64InstrInfo::storeRegToStackSlot before this pass) BEFORE ColorSlot
+  // mutates the tag map via fresh-color propagation. We re-derive each
+  // physical color's tag from the final SlotMapping below so that a slot's
+  // tag matches the value class that actually ends up living in it — neither
+  // over- nor under-marked. Empty for non-c2go targets (the TII tag hooks are
+  // no-ops there), so the recompute loop is a no-op and codegen is identical.
+  C2GoOrigTags.assign(NumObjs, std::string());
+  for (unsigned FI = 0; FI < NumObjs; ++FI)
+    C2GoOrigTags[FI] = std::string(TII->getStackSlotTypeTag(MF, FI));
+  // c2go (#492): seed the per-color logical-tag map from the true physical tags
+  // so ColorSlot's TagsCompatible starts correct; ColorSlot overwrites each
+  // entry on fresh-color assignment as intervals are colored below.
+  C2GoColorTags = C2GoOrigTags;
+
   LLVM_DEBUG(dbgs() << "Color spill slot intervals:\n");
   bool Changed = false;
   for (LiveInterval *li : SSIntervals) {
@@ -382,6 +459,43 @@ bool StackSlotColoring::ColorSlots(MachineFunction &MF) {
     SlotWeights[NewSS] += li->weight();
     UsedColors.set(NewSS);
     Changed |= (SS != NewSS);
+  }
+
+  // c2go (#492): recompute every physical color's c2go type tag from the
+  // FINAL SlotMapping. A spill FI's tag must describe the value class that
+  // actually lives in its physical slot post-coloring. The fresh-color path
+  // (ColorSlot) could leave a STALE "ptr" tag on a color number whose
+  // original ptr interval was relocated elsewhere while a scalar spill now
+  // occupies that physical slot — M5/LowerSTATEPOINT would then mark the
+  // scalar as a pointer in the Go locals map and copystack would relocate it
+  // ("runtime: bad pointer in frame ..." — SQLite -O2 selectExpander offset
+  // 96 held the Expr constant 0x18=24 at a safepoint). A naive unconditional
+  // clear, conversely, would DROP a still-live ptr slot's tag (under-mark).
+  //
+  // The exact rule: a physical color's tag is the union (OR) of the ORIGINAL
+  // tags of every FI that maps onto it. FIs sharing a color went through the
+  // TagsCompatible-gated REUSE path, so their original tags already agree;
+  // the OR is the safe, order-independent way to combine them. We first clear
+  // each touched color, then OR in each mapped FI's snapshot tag, so a color
+  // whose original ptr interval moved away (no ptr FI maps back) ends up
+  // untagged, while a color a ptr value still lands on stays "ptr".
+  //
+  // Gated to c2go: C2GoOrigTags is all-empty for non-c2go targets (the TII tag
+  // hooks are no-ops there), so every clear/set is empty-over-empty — codegen
+  // is byte-identical.
+  //
+  // Scope: this canonicalizes the tag of every color a spill FI MAPS ONTO — the
+  // live colors M5 / the AsmPrinter locals map actually consult. A ptr-tagged FI
+  // that maps away and is not itself a final color may retain a stale physical
+  // tag, but such FIs are dead / allocation-filtered by those consumers and
+  // never reach the emitted locals pointer map.
+  for (unsigned FI = 0; FI < NumObjs; ++FI)
+    if (SlotMapping[FI] >= 0)
+      TII->setStackSlotTypeTag(MF, SlotMapping[FI], "");
+  for (unsigned FI = 0; FI < NumObjs; ++FI) {
+    int NewFI = SlotMapping[FI];
+    if (NewFI >= 0 && !C2GoOrigTags[FI].empty())
+      TII->setStackSlotTypeTag(MF, NewFI, C2GoOrigTags[FI]);
   }
 
   LLVM_DEBUG(dbgs() << "\nSpill slots after coloring:\n");

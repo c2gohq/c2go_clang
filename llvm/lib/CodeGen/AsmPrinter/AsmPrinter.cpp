@@ -4786,7 +4786,12 @@ void AsmPrinter::emitStackMaps() {
       NeedsDefault = true;
     }
 
-  if (NeedsDefault)
+  // c2go Phase 1: Plan 9 streamer emits stackmap info as inline
+  // FUNCDATA/PCDATA + RODATA gclocals symbols. The default binary
+  // `__llvm_stackmaps` section is meaningless to the Go runtime and
+  // would route through MCPlan9AsmStreamer's data path as a stray
+  // GLOBL+DATA blob — suppress it entirely.
+  if (NeedsDefault && !OutStreamer->isPlan9AsmStreamer())
     SM.serializeToStackMapSection();
 }
 

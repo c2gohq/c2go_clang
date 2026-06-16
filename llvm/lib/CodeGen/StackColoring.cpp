@@ -39,13 +39,18 @@
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/PseudoSourceValueManager.h"
 #include "llvm/CodeGen/SlotIndexes.h"
+#include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetOpcodes.h"
+#include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/CodeGen/WinEHFuncInfo.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/Use.h"
 #include "llvm/IR/Value.h"
 #include "llvm/InitializePasses.h"
@@ -55,6 +60,7 @@
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include <algorithm>
 #include <cassert>
 #include <limits>
@@ -95,6 +101,131 @@ STATISTIC(NumMarkerSeen,  "Number of lifetime markers found.");
 STATISTIC(StackSpaceSaved, "Number of bytes saved due to merging slots.");
 STATISTIC(StackSlotMerged, "Number of stack slot merged.");
 STATISTIC(EscapedAllocas, "Number of allocas that escaped the lifetime region");
+STATISTIC(C2GoSlotMergeBlocked,
+          "Number of stack-slot merges blocked by c2go pointer-typing "
+          "(managed tag or #305 pointer-bearing classification)");
+
+namespace {
+// c2go §B2 phase 2: classify a frame-index by its source alloca's
+// `!c2go.ptr.managed` metadata so the stack-coloring merger can avoid
+// fusing slots whose Go-side typing differs.
+//
+// Returns one of:
+//   ""             — no alloca / unmanaged (any non-c2go local, e.g. int).
+//   "<tag>"        — managed pointer whose pointee record name is <tag>
+//                    (matches the MDString attached by clang in CGDecl).
+//
+// Compatibility rule for merging:
+//   * Both "" (unmanaged + unmanaged) → may merge freely.
+//   * Same non-empty tag → may merge (slot type identical from GC's view).
+//   * Anything else (managed↔unmanaged, or managed-A↔managed-B) → blocked.
+static StringRef getC2GoManagedTag(const AllocaInst *AI) {
+  if (!AI)
+    return StringRef();
+  if (auto *MD = AI->getMetadata(llvm::c2go::kPtrManagedMD)) {
+    if (MD->getNumOperands() > 0) {
+      if (auto *MS = dyn_cast<MDString>(MD->getOperand(0).get()))
+        return MS->getString();
+    }
+  }
+  return StringRef();
+}
+
+// c2go §B2 phase 2.5: look up the managed-pointer tag for a frame index.
+// Primary source is the backing alloca's `!c2go.ptr.managed` metadata
+// (phase 2). When the slot has no alloca — typically a RegAlloc-introduced
+// spill slot — we fall back to the target's spill-tag channel exposed via
+// `TargetInstrInfo::getStackSlotTypeTag` (#426 rename from
+// getC2GoSpillSlotTag; storage stays on target-specific MachineFunctionInfo,
+// currently only AArch64FunctionInfo). Non-c2go targets keep the default
+// no-op which returns an empty tag — bit-for-bit unchanged.
+static StringRef getC2GoSlotTag(const MachineFunction *MF,
+                                const MachineFrameInfo *MFI, int Slot) {
+  if (const AllocaInst *AI = MFI->getObjectAllocation(Slot)) {
+    StringRef Tag = getC2GoManagedTag(AI);
+    if (!Tag.empty())
+      return Tag;
+    // Alloca exists but has no c2go metadata → genuinely unmanaged.
+    return StringRef();
+  }
+  if (!MF)
+    return StringRef();
+  return MF->getSubtarget().getInstrInfo()->getStackSlotTypeTag(*MF, Slot);
+}
+
+// c2go #305: only c2go-mode modules carry per-PC GC stackmaps whose slot
+// typing must survive stack coloring; the gate keeps NON-c2go targets (and
+// -O0, which never runs this merge loop's blocking) bit-for-bit unchanged.
+// Without it, the `isPointerTy()` arm below would match ordinary C/C++
+// pointer locals and regress upstream stack coloring.
+static bool isC2GoMode(const MachineFunction *MF) {
+  if (!MF)
+    return false;
+  return MF->getFunction().getParent()->getModuleFlag(llvm::c2go::kGoabiModuleFlag) != nullptr;
+}
+
+// c2go #305: local mirror of C2GoSafepoint's `collectPointerFieldOffsets`
+// (llvm/lib/Transforms/C2Go/C2GoSafepoint.cpp). We only need to know WHETHER
+// an aggregate contains any pointer field, so we short-circuit on the first
+// hit instead of collecting every offset.
+static bool aggregateHasPointerField(Type *Ty, const DataLayout &DL) {
+  if (Ty->isPointerTy())
+    return true;
+  if (auto *ST = dyn_cast<StructType>(Ty)) {
+    for (unsigned I = 0, N = ST->getNumElements(); I < N; ++I)
+      if (aggregateHasPointerField(ST->getElementType(I), DL))
+        return true;
+    return false;
+  }
+  if (auto *AT = dyn_cast<ArrayType>(Ty))
+    return aggregateHasPointerField(AT->getElementType(), DL);
+  return false;
+}
+
+// c2go #305: classify a frame index as "pointer-bearing" — i.e. a slot the
+// per-PC GC stackmap may mark as holding a pointer (scalar pointer slots and
+// aggregates with pointer fields). This MUST stay byte-for-byte equivalent to
+// C2GoSafepoint's slot/aggregate selection (`collectPtrSlotAllocas` +
+// `collectPointerFieldOffsets` over `getAllocatedType()`); if the predicates
+// diverge, a divergent slot could be merged with a non-pointer slot and the
+// stackmap would mark garbage as a pointer (the 0x7e bug).
+static bool isC2GoPtrBearingSlot(const MachineFrameInfo *MFI, int Slot,
+                                 const DataLayout &DL) {
+  const AllocaInst *AI = MFI->getObjectAllocation(Slot);
+  if (!AI)
+    return false;
+  Type *Ty = AI->getAllocatedType();
+  // collectPtrSlotAllocas: scalar pointer slot, or explicitly tagged slot,
+  // or managed pointer slot.
+  if (Ty->isPointerTy() || AI->getMetadata(llvm::c2go::kPtrSlotMD) ||
+      AI->getMetadata(llvm::c2go::kPtrManagedMD))
+    return true;
+  // Aggregate path: a struct/array local with any pointer field.
+  return aggregateHasPointerField(Ty, DL);
+}
+
+static bool areC2GoSlotsCompatibleForMerge(const MachineFunction *MF,
+                                           const MachineFrameInfo *MFI,
+                                           int SlotA, int SlotB) {
+  // Existing managed-tag rule (always active in c2go mode; a no-op elsewhere
+  // because non-c2go allocas carry no `c2go.ptr.managed` metadata).
+  StringRef TA = getC2GoSlotTag(MF, MFI, SlotA);
+  StringRef TB = getC2GoSlotTag(MF, MFI, SlotB);
+  if (TA != TB)
+    return false;
+
+  // #305: in c2go mode, also forbid merging a pointer-bearing slot with a
+  // non-pointer-bearing one (the per-PC stackmap can only describe one of
+  // them). Gated so non-c2go targets see zero change.
+  if (isC2GoMode(MF)) {
+    const DataLayout &DL = MF->getFunction().getParent()->getDataLayout();
+    if (isC2GoPtrBearingSlot(MFI, SlotA, DL) !=
+        isC2GoPtrBearingSlot(MFI, SlotB, DL))
+      return false;
+  }
+  return true;
+}
+} // end anonymous namespace
 
 //===----------------------------------------------------------------------===//
 //                           StackColoring Pass
@@ -1321,6 +1452,17 @@ bool StackColoring::run(MachineFunction &Func) {
         // Objects with different stack IDs cannot be merged.
         if (MFI->getStackID(FirstSlot) != MFI->getStackID(SecondSlot))
           continue;
+
+        // c2go §B2 phase 2: respect `!c2go.ptr.managed` tagging. Two
+        // alloca-backed slots may only be coalesced when the GC will read
+        // them with the same type — i.e. both unmanaged, or both managed
+        // and tagged with the same pointee record. Mixing breaks §B3.1
+        // stackmaps (a slot would be GC-typed in one half and bytes in the
+        // other), so we forfeit the space saving in that case.
+        if (!areC2GoSlotsCompatibleForMerge(MF, MFI, FirstSlot, SecondSlot)) {
+          ++C2GoSlotMergeBlocked;
+          continue;
+        }
 
         LiveInterval *First = &*Intervals[FirstSlot];
         LiveInterval *Second = &*Intervals[SecondSlot];

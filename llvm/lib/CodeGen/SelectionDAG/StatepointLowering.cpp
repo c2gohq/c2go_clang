@@ -344,11 +344,20 @@ static std::pair<SDValue, SDNode *> lowerCallFromStatepointLoweringInfo(
 
   bool HasDef = !SI.CLI.RetTy->isVoidTy();
   if (HasDef) {
-    if (CallEnd->getOpcode() == ISD::LOAD)
+    // Walk the chain backwards through the return-value extraction nodes to
+    // reach the CALLSEQ_END. A return value is materialized either by
+    // CopyFromReg (register return) or by a LOAD from a stack slot (return by
+    // reference / large return). The c2go GoABI0 stack-return ABI additionally
+    // re-materializes SP (CopyFromReg of the stack pointer) between the result
+    // LOAD and the CALLSEQ_END so it can address the result slot with a
+    // negative offset past the popped outgoing-arg block (AArch64 LowerCall,
+    // #125). So the general shape is an arbitrary chain of LOAD / CopyFromReg
+    // nodes terminating at CALLSEQ_END; iterate through all of them via the
+    // chain operand (operand 0 for both node kinds) rather than handling only a
+    // single LOAD or a pure CopyFromReg run.
+    while (CallEnd->getOpcode() == ISD::LOAD ||
+           CallEnd->getOpcode() == ISD::CopyFromReg)
       CallEnd = CallEnd->getOperand(0).getNode();
-    else
-      while (CallEnd->getOpcode() == ISD::CopyFromReg)
-        CallEnd = CallEnd->getOperand(0).getNode();
   }
 
   assert(CallEnd->getOpcode() == ISD::CALLSEQ_END && "expected!");

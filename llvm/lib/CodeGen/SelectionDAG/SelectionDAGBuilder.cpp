@@ -10789,6 +10789,11 @@ void SelectionDAGBuilder::populateCallLoweringInfo(
       .setIsPatchPoint(IsPatchPoint)
       .setIsPreallocated(
           Call->countOperandBundlesOfType(LLVMContext::OB_preallocated) != 0);
+  // This overload of setCallee does not set CLI.CB (the statepoint operand
+  // layout differs from a real call), but ABI-relevant call-site attributes
+  // were propagated onto the wrapping gc.statepoint by RS4GC. Carry them so
+  // targets can read attribute-keyed ABI decisions via hasCallSiteFnAttr().
+  CLI.CallSiteAttrs = Call->getAttributes();
 }
 
 /// Add a stack map intrinsic call's live variable operands to a stackmap

@@ -1785,6 +1785,20 @@ public:
                                     const MachineBasicBlock *MBB,
                                     const MachineFunction &MF) const;
 
+  /// Optional per-spill-slot type tag accessors used by target-independent
+  /// stack-coloring passes to avoid merging slots that hold differently-
+  /// typed values (e.g. a pointer-typed spill vs an integer-typed spill).
+  /// Tags live on the target's MachineFunctionInfo; targets that do not
+  /// opt in return an empty tag and silently ignore writes. The producer
+  /// side is the target's storeRegToStackSlot override (writes a tag when
+  /// the spilled value is type-classified). Default: no-op.
+  virtual StringRef getStackSlotTypeTag(const MachineFunction &MF,
+                                        int StackSlot) const {
+    return StringRef();
+  }
+  virtual void setStackSlotTypeTag(MachineFunction &MF, int StackSlot,
+                                   StringRef Tag) const {}
+
   /// Measure the specified inline asm to determine an approximation of its
   /// length.
   virtual unsigned getInlineAsmLength(

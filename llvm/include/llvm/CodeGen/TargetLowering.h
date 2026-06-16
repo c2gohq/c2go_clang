@@ -4786,6 +4786,14 @@ public:
     SelectionDAG &DAG;
     SDLoc DL;
     const CallBase *CB = nullptr;
+    /// Call-site attributes of the IR call being lowered. Mirrors CB's
+    /// attributes when CB is set, but is ALSO populated for statepoint-wrapped
+    /// calls — where CB is deliberately left null (the gc.statepoint operand
+    /// layout differs from a real call) yet the original call's attributes
+    /// have been propagated onto the statepoint (RS4GC legalizeCallAttributes).
+    /// Targets that key an ABI decision off a call-site attribute must read it
+    /// via hasCallSiteFnAttr so the decision survives the RS4GC rewrite.
+    AttributeList CallSiteAttrs;
     SmallVector<ISD::OutputArg, 32> Outs;
     SmallVector<SDValue, 32> OutVals;
     SmallVector<ISD::InputArg, 32> Ins;
@@ -4872,8 +4880,16 @@ public:
       Args = std::move(ArgsList);
 
       CB = &Call;
+      CallSiteAttrs = Call.getAttributes();
 
       return *this;
+    }
+
+    /// Query a call-site function attribute, honoring statepoint-wrapped calls
+    /// (see CallSiteAttrs). Prefer this over CB->hasFnAttr() for attributes that
+    /// drive ABI decisions, since CB is null for statepoint lowering.
+    bool hasCallSiteFnAttr(StringRef Kind) const {
+      return CallSiteAttrs.hasFnAttr(Kind);
     }
 
     CallLoweringInfo &setInRegister(bool Value = true) {
