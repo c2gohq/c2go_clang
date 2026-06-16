@@ -16,6 +16,7 @@
 #include "X86BaseInfo.h"
 #include "X86IntelInstPrinter.h"
 #include "X86MCAsmInfo.h"
+#include "X86Plan9InstPrinter.h"
 #include "X86TargetStreamer.h"
 #include "llvm-c/Visibility.h"
 #include "llvm/ADT/APInt.h"
@@ -476,6 +477,13 @@ static MCInstPrinter *createX86MCInstPrinter(const Triple &T,
     return new X86ATTInstPrinter(MAI, MII, MRI);
   if (SyntaxVariant == 1)
     return new X86IntelInstPrinter(MAI, MII, MRI);
+  if (SyntaxVariant == 2)
+    // c2go Wave Y Track C: Plan 9 (Go assembler) syntax for X86.
+    // Selected via OutputAsmVariant=2 in MCTargetOptions, set by clang's
+    // `-fc2go-emit-plan9-asm` (target-agnostic plumbing already in place
+    // from the AArch64 path). Production X86 builds keep this branch
+    // unreached unless the per-module `c2go.x86-leaf-abi` flag is ON.
+    return new X86Plan9InstPrinter(MAI, MII, MRI);
   return nullptr;
 }
 
