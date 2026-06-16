@@ -1808,6 +1808,12 @@ def C2GoManagedAS1 : DiagGroup<"c2go-managed-as1">;
 def C2GoManagedPtrToInt : DiagGroup<"c2go-managed-ptrtoint">;
 // c2go v15 §3.5 D5: union overlay mixing managed and unmanaged fields.
 def C2GoManagedOverlay : DiagGroup<"c2go-managed-overlay">;
+// c2go v15 §3.5/§v15 D5 (task T9): storing a pointer into a managed-ptr
+// field through an unmanaged pointer — no write barrier is emitted on this
+// path (the slot is not provably GC-managed), so it is a warning, not an
+// error. Programmer assumes responsibility (same contract as uintptr_t).
+def C2GoManagedFieldViaUnmanaged
+    : DiagGroup<"c2go-managed-field-via-unmanaged">;
 // c2go #472 (Wave J): storing &local into a c2go-managed heap-rooted
 // pointer field escapes the stack frame; the heap object outlives the
 // stack and the GC will trip on a dangling pointer if scanned post-return.

@@ -2087,6 +2087,33 @@ public:
   /// VisContext - Manages the stack for \#pragma GCC visibility.
   void *VisContext; // Really a "PragmaVisStack*"
 
+  /// C2GoPragmaEntry — one frame on the c2go pragma stack (v15). Tracks the
+  /// `#pragma c2go managed(N) push` location plus the flag bitmask N that
+  /// controls which worlds default to managed inside the region.
+  struct C2GoPragmaEntry {
+    SourceLocation Loc;
+    unsigned Flags; // bitmask: Ptr=2, Record=4
+    // NOTE (#268): the func bit (value 1) is DEPRECATED/INERT. The function
+    // world is now decided entirely by #290 (default CC_C2GoInternal +
+    // c2go_extern/c2go_managed CC attributes), so funcManaged() had zero
+    // consumers and was removed. `managed(1)` still parses (Flags=1) but,
+    // with neither Ptr (2) nor Record (4) set, it is a no-op region — exactly
+    // its prior runtime behavior. Do not reuse value 1 for a new bit.
+    enum : unsigned { Ptr = 2, Record = 4 };
+    /// ptr bit: unannotated pointers in scope (incl. struct fields) default
+    /// to managed; otherwise unmanaged.
+    bool ptrManaged() const { return Flags & Ptr; }
+    /// record bit: run conservative struct/union world inference in scope.
+    bool recordAnalyze() const { return Flags & Record; }
+  };
+
+  /// C2GoStack - currently active `#pragma c2go managed(N) push` regions
+  /// (v15). The top frame's Flags drive: record analysis (Record bit) and
+  /// the default pointer world for unannotated pointers/fields (Ptr bit).
+  /// The func bit (1) is deprecated/inert (#268). An empty stack means
+  /// fully unmanaged (`managed(0)`).
+  SmallVector<C2GoPragmaEntry, 4> C2GoStack;
+
   /// This an attribute introduced by \#pragma clang attribute.
   struct PragmaAttributeEntry {
     SourceLocation Loc;
@@ -4381,6 +4408,65 @@ public:
 
   ASTContext::CXXRecordDeclRelocationInfo
   CheckCXX2CRelocatable(const clang::CXXRecordDecl *D);
+
+  /// validateC2GoStructFeatures - Validate c2go struct features and emit
+  /// diagnostics for unsupported constructs like bitfields, packed, etc.
+  void validateC2GoStructFeatures(RecordDecl *RD);
+
+  /// analyzeC2GoStruct - Validate the c2go_struct marker on a RecordDecl.
+  /// Called once during ActOnTagFinishDefinition. Returns true when the
+  /// record carries the attribute (so the caller knows to run
+  /// validateC2GoStructFeatures); false otherwise, possibly after emitting
+  /// a diagnostic about an unmarked hybrid that touches a c2go record.
+  bool analyzeC2GoStruct(RecordDecl *RD);
+
+  /// `#pragma c2go managed(N) push` / `pop` (v15) -- a region between push
+  /// and pop applies the flag bitmask N (Ptr=2, Record=4; the func bit 1 is
+  /// deprecated/inert, #268) as the default managed worlds inside it. Nested
+  /// push works like a stack; pop only unwinds one level. Mis-paired pop emits
+  /// a diagnostic.
+  void ActOnPragmaC2GoPush(SourceLocation PragmaLoc, unsigned Flags);
+  void ActOnPragmaC2GoPop(SourceLocation PragmaLoc);
+
+  /// Apply any pending #pragma c2go push state to a freshly completed
+  /// record. Called from ActOnTagFinishDefinition before validation.
+  void AddPragmaC2GoAttribute(RecordDecl *RD);
+
+  /// c2go v15 §3.5 D1/D2/D3 helpers: AS1 (c2go_managed) ↔ unmanaged-pointer
+  /// interconversion check. A managed pointer carries the Go-managed-heap
+  /// discriminator (AS1); silently dropping it to `void *` / unmanaged `T *`
+  /// breaks RS4GC root tracking. Sema rejects the implicit cases (store /
+  /// return / call argument); the in-source escape hatch is an explicit
+  /// `(__attribute__((c2go_managed)) T *)` cast back to managed.
+  bool c2goTypeIsManagedPtr(QualType Ty) const;
+  bool c2goTypeDropsManaged(QualType Ty) const;
+  bool c2goExprIsExplicitManagedCast(const Expr *E) const;
+
+  /// c2go v15 §3.5 D1 store hook. Diagnoses storing a c2go_managed pointer
+  /// RHS into an unmanaged pointer LHS (drops the AS1 GC discriminator).
+  /// Used by both assignment (CheckAssignmentOperands) and initialization
+  /// (SemaInit SK_CAssignment) paths; call/return paths have their own
+  /// dedicated diagnostics (err_c2go_managed_to_unmanaged_call/return).
+  void checkC2GoManagedToUnmanagedStore(QualType LHSType, Expr *RHSExpr,
+                                        SourceLocation Loc);
+
+  /// c2go v15 §3.5.1 D4 (Rule G, task T4) cross-managed-type hook. Diagnoses
+  /// converting a c2go_managed pointer to a *different* managed pointer type
+  /// whose GC pointer layout (gcdata) is not prefix-compatible. Exempt: a
+  /// (managed) void* bridge and structural prefix-embedding. Shared by the
+  /// assignment/init store path and the explicit C-style cast path.
+  void checkC2GoManagedCrossTypeCast(QualType DestType, Expr *SrcExpr,
+                                     SourceLocation Loc);
+
+  /// c2go #472 (Wave J): warn when storing `&local` (address of an
+  /// automatic / parameter VarDecl in the current function) into a
+  /// heap-rooted c2go-managed pointer field — the heap object outlives
+  /// the stack frame and the GC will trip on a dangling pointer if
+  /// scanned post-return. Shared by CheckAssignmentOperands and the
+  /// SemaInit SK_CAssignment path. Default-ON warning
+  /// (-Wc2go-managed-stack-escape).
+  void checkC2GoManagedStoreOfLocalAddr(Expr *LHSExpr, Expr *RHSExpr,
+                                        SourceLocation Loc);
 
   void ActOnTagFinishSkippedDefinition(SkippedDefinitionContext Context);
 
@@ -7569,6 +7655,16 @@ public:
                                   ParsedType ParsedArgTy,
                                   ArrayRef<OffsetOfComponent> Components,
                                   SourceLocation RParenLoc);
+
+  // c2go: __c2go_typeinfo(type) — resolves the managed record type's
+  // Go-runtime `*_type` RTTI pointer. Synthesizes (and caches) an extern var
+  // whose emitted symbol is the descriptor global `c2go.typeinfo.<Name>` and
+  // returns `&<that var>` as a `const void *`. CodeGen drives CGC2GoTypeInfo
+  // to define the descriptor and the Plan 9 InstPrinter rewrites the address
+  // into a load of c2gobind's per-type `·_typeinfo_<Name>` indirection var.
+  ExprResult ActOnC2GoTypeInfo(Scope *S, SourceLocation BuiltinLoc,
+                               SourceLocation TypeLoc, ParsedType ParsedArgTy,
+                               SourceLocation RParenLoc);
 
   // __builtin_choose_expr(constExpr, expr1, expr2)
   ExprResult ActOnChooseExpr(SourceLocation BuiltinLoc, Expr *CondExpr,

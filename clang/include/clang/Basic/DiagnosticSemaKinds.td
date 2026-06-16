@@ -2217,6 +2217,16 @@ def select_special_member_kind : TextSubstitution<
 def note_member_declared_at : Note<"member is declared here">;
 def note_ivar_decl : Note<"instance variable is declared here">;
 def note_bitfield_decl : Note<"bit-field is declared here">;
+
+// c2go struct diagnostics
+def err_c2go_struct_union_type : Error<
+  "union %0 cannot be marked as c2go_struct -- only struct types are supported">;
+def err_c2go_struct_packed : Error<
+  "c2go_struct %0 cannot use the 'packed' attribute (Go has no packed layout)">;
+def err_c2go_struct_aligned : Error<
+  "c2go_struct %0 cannot use custom alignment attributes">;
+def err_c2go_struct_field_aligned : Error<
+  "c2go_struct %0 cannot have member %1 with custom alignment attributes">;
 // c2go §3.9 / task T3: c2go_variant is the opt-in "variant container" marker;
 // the convert-to-struct representation only makes sense for a union (which can
 // hold one of several alternatives). Mirrors err_c2go_struct_union_type.
@@ -2237,6 +2247,83 @@ def err_c2go_variant_nested_scan_ptr : Error<
   "packed/misaligned pointer, or a flexible/VLA member). Give each scannable "
   "pointer its own consistent, pointer-aligned word, or split the offending "
   "member out of the union">;
+// c2go v15 §3.1 / §9.2 (task T6): an *unmanaged* (POD, no typeinfo) record
+// that holds a scannable data pointer (any non-function pointer field,
+// directly or through an embedded record) still has its pointer words
+// conservatively force-scanned by the Go GC ("unsafe.Pointer" over-retain).
+// That conservative scan can only find a pointer that sits at a naturally
+// aligned word boundary; packed / custom alignment shifts the pointer off
+// the word grid so it would be missed (GC misses a live pointer -> use-
+// after-free). Unlike a managed c2go_struct (whose precise per-type gcdata
+// bitmap honours packing, hence only a warning), an unmanaged record has no
+// gcdata at all, so packing a scannable pointer is rejected outright.
+def err_c2go_unmanaged_struct_packed : Error<
+  "record %0 holds a scannable pointer and cannot use the 'packed' attribute: "
+  "the Go GC conservatively force-scans the pointer word, which must stay "
+  "naturally aligned (packing would shift it off the word grid and the GC "
+  "would miss the live pointer). Remove 'packed', or store the value as a "
+  "non-pointer handle (uintptr_t) if it never holds a GC-heap pointer">;
+def err_c2go_unmanaged_struct_aligned : Error<
+  "record %0 holds a scannable pointer and cannot use custom alignment "
+  "attributes: the Go GC conservatively force-scans the pointer word, which "
+  "must stay naturally aligned">;
+def err_c2go_unmanaged_struct_field_aligned : Error<
+  "record %0 holds a scannable pointer and cannot give member %1 custom "
+  "alignment: the Go GC conservatively force-scans the pointer word, which "
+  "must stay naturally aligned">;
+// #210: demoted variants — emit when c2go-mode-tolerant pipelines are
+// in use (clang typeinfo emitter uses ASTRecordLayout which honours
+// packed/aligned, and c2gobind v0.3+ emits matching byte padding).
+// DiagGroup defined inline at first reference is the convention used
+// elsewhere in this file (e.g. ImplicitConvFloatingToBoolean).
+def warn_c2go_struct_packed : Warning<
+  "c2go_struct %0 uses 'packed' layout; c2gobind must emit matching "
+  "byte-padded Go fields (verify with --pkg=...)">,
+  InGroup<DiagGroup<"c2go-layout-packed">>;
+def warn_c2go_struct_aligned : Warning<
+  "c2go_struct %0 uses custom alignment; c2gobind must emit matching "
+  "[N]byte padding to preserve the C-side layout">,
+  InGroup<DiagGroup<"c2go-layout-aligned">>;
+def warn_c2go_struct_field_aligned : Warning<
+  "c2go_struct %0 field %1 has custom alignment; c2gobind must emit "
+  "matching [N]byte padding before this field">,
+  InGroup<DiagGroup<"c2go-layout-field-aligned">>;
+def err_c2go_struct_embedded_in_plain : Error<
+  "embedding c2go_struct %0 by value inside non-c2go_struct %1 leaks "
+  "managed pointers from the Go GC; mark %1 with __attribute__((c2go_struct)) "
+  "or use a pointer field instead">;
+def warn_c2go_struct_ptr_in_plain : Warning<
+  "field of type pointer to c2go_struct %0 inside non-c2go_struct %1 "
+  "is not scanned by the Go GC; the pointee may be reclaimed prematurely. "
+  "Mark %1 with __attribute__((c2go_struct)) if its lifetime should track "
+  "the pointee, or annotate the field with __attribute__((c2go_unmanaged)) "
+  "if the pointer's lifetime is managed elsewhere">,
+  InGroup<DiagGroup<"c2go-unmanaged-pointer">>;
+// c2go v15 §v15 D5 (task T9): no write barrier is emitted on this path (the
+// store's slot is reached through an unmanaged pointer and stays in AS0, so
+// C2GoWriteBarriers::storeNeedsBarrier returns false), and the barrier's
+// precondition (slot is GC-managed memory) cannot be established through an
+// unmanaged pointer. Demoted from Error to Warning: the programmer assumes
+// responsibility (same contract as uintptr_t). The fix is still to re-enter
+// the managed world (managed handle or (c2go_managed) cast).
+def warn_c2go_managed_field_via_unmanaged : Warning<
+  "storing into managed-pointer field %0 through an unmanaged pointer: "
+  "no GC write barrier is emitted here (an unmanaged pointer is not "
+  "guaranteed to point to GC-managed memory). Use a managed pointer to mutate "
+  "managed fields -- declare the handle managed, or cast via "
+  "'(__attribute__((c2go_managed)) T *)'">,
+  InGroup<C2GoManagedFieldViaUnmanaged>;
+// c2go v15 §3.3 step 3 / §3.5.1 D6 (task T5): a record explicitly marked
+// __attribute__((c2go_unmanaged)) must not contain a managed-pointer field
+// (directly or through an embedded record). An unmanaged record gets no Go
+// typeinfo / gcdata, so any managed pointer it holds would be invisible to
+// the GC and could be reclaimed out from under it.
+def err_c2go_unmanaged_record_has_managed_field : Error<
+  "record %0 is marked '__attribute__((c2go_unmanaged))' but contains a "
+  "c2go_managed pointer field; an unmanaged record has no Go GC typeinfo, "
+  "so the managed pointer would be untracked. Remove the c2go_unmanaged "
+  "marker (let it become a managed record), or annotate the offending "
+  "field(s) with __attribute__((c2go_unmanaged))">;
 // c2go v15 §3.5 AS1 interconversion (D1/D2/D3): managed-pointer -> void* /
 // unmanaged-pointer drops the Go-managed-heap discriminator, so storing it
 // into an unmanaged location, returning it as void*, or passing it to an
