@@ -76,6 +76,28 @@ bool RetCC_AArch64_Arm64EC_CFGuard_Check(unsigned ValNo, MVT ValVT, MVT LocVT,
                                          CCValAssign::LocInfo LocInfo,
                                          ISD::ArgFlagsTy ArgFlags, Type *OrigTy,
                                          CCState &State);
+bool CC_AArch64_GoABI0(unsigned ValNo, MVT ValVT, MVT LocVT,
+                       CCValAssign::LocInfo LocInfo, ISD::ArgFlagsTy ArgFlags,
+                       Type *OrigTy, CCState &State);
+bool RetCC_AArch64_GoABI0(unsigned ValNo, MVT ValVT, MVT LocVT,
+                          CCValAssign::LocInfo LocInfo,
+                          ISD::ArgFlagsTy ArgFlags, Type *OrigTy,
+                          CCState &State);
+// c2go private register convention (optimization layer for NOSPLIT
+// leaf / near-leaf internal functions). Implements Go's ABIInternal
+// register-assignment on arm64 (R0-R15 integer, F0-F15 FP). Defined as
+// hand-written CCAssignFns (not .td) because the recursive aggregate
+// decomposition with "all-or-nothing per top-level arg" semantics is
+// not expressible in the table-gen DSL. See AArch64CallingConvention.cpp
+// and clang/docs/c2go_design.md §2.0.1 / §4.2.
+bool CC_AArch64_C2GoABIInternal(unsigned ValNo, MVT ValVT, MVT LocVT,
+                                CCValAssign::LocInfo LocInfo,
+                                ISD::ArgFlagsTy ArgFlags, Type *OrigTy,
+                                CCState &State);
+bool RetCC_AArch64_C2GoABIInternal(unsigned ValNo, MVT ValVT, MVT LocVT,
+                                   CCValAssign::LocInfo LocInfo,
+                                   ISD::ArgFlagsTy ArgFlags, Type *OrigTy,
+                                   CCState &State);
 } // namespace llvm
 
 #endif

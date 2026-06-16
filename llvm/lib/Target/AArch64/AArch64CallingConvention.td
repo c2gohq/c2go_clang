@@ -347,6 +347,72 @@ def CC_AArch64_Win64_CFGuard_Check : CallingConv<[
   CCIfType<[i64], CCAssignToReg<[X15]>>
 ]>;
 
+// c2go GoABI0 calling convention (Phase B): all arguments and all
+// return values are passed on the caller's stack frame. No register
+// passing. Matches Go's stack-based ABI0 layout so c2go_extern
+// functions and call sites to Go-runtime linkname targets can
+// interoperate with `cmd/asm`-assembled Plan 9 .s and Go-emitted
+// ABI0 entries.
+//
+// On arm64, Go's ABI0 frame layout reserves an 8-byte slot at the
+// start of the caller's outgoing-arg block for the callee's saved
+// LR (`MOVD.W R30, -framesize(RSP)` in Go-emitted wrappers stores LR
+// at sp+0 of the callee's new frame). Args start at offset 8.
+//
+// Phase B handles this by letting the LLVM FrameLowering inject the
+// `STP X29, X30` save into the caller's outgoing-arg frame, AND the
+// CC analysis below by accounting for the 8-byte LR slot via the
+// `arg_offset = 8` initial allocation done in LowerCall (see
+// AArch64ISelLowering.cpp). The TD here describes only argument
+// LAYOUT — actual slot placement uses the CCState that LowerCall
+// pre-bumps.
+//
+// Slot rules (consistent with Go ABI0 stack frame):
+//   - i1/i8/i16/i32   → 4-byte slot, 4-byte align (Go zero-extends)
+//   - i64 / pointer   → 8-byte slot, 8-byte align
+//   - f32             → 4-byte slot
+//   - f64             → 8-byte slot
+//   - larger (vector / f128 / composite > 8 bytes): pass indirect via
+//     pointer.
+let Entry = 1 in
+def CC_AArch64_GoABI0 : CallingConv<[
+  CCIfType<[i1, i8, i16, i32], CCAssignToStack<4, 4>>,
+  CCIfType<[i64, iPTR],        CCAssignToStack<8, 8>>,
+  CCIfType<[f32],              CCAssignToStack<4, 4>>,
+  CCIfType<[f64],              CCAssignToStack<8, 8>>,
+  // Composites and SIMD: pass indirect via a stack-slot pointer.
+  CCIfType<[f128, v2i64, v4i32, v8i16, v16i8, v4f32, v2f64, v8f16, v8bf16],
+           CCPassIndirect<i64>>,
+  CCCustom<"CC_AArch64_Custom_Block">
+]>;
+
+// RetCC: results live on the caller's stack frame, after the
+// incoming-args block. This is the Go ABI0 contract — Go's
+// ABI0-to-ABIInternal wrappers (emitted by `cmd/asm`) read result
+// values from the stack frame, not from X0. Returning a value via
+// X0 here would silently produce a corrupt result when the call
+// crosses the ABI boundary.
+//
+// CCAssignToStack works for incoming args (LowerFormalArguments) but
+// the result path (LowerReturn / LowerCallResult) requires custom
+// LLVM lowering to materialize stack-relative loads and stores, NOT
+// available via .td alone. See AArch64TargetLowering for the
+// LowerCall override that consumes this CC.
+let Entry = 1 in
+def RetCC_AArch64_GoABI0 : CallingConv<[
+  CCIfType<[i1, i8, i16, i32], CCAssignToStack<4, 4>>,
+  CCIfType<[i64, iPTR],        CCAssignToStack<8, 8>>,
+  CCIfType<[f32],              CCAssignToStack<4, 4>>,
+  CCIfType<[f64],              CCAssignToStack<8, 8>>,
+  CCIfType<[f128, v2i64, v4i32, v8i16, v16i8, v4f32, v2f64, v8f16, v8bf16],
+           CCPassIndirect<i64>>,
+  // Symmetric with CC_AArch64_GoABI0 (378-386): result aggregates that arrive
+  // as consecutive-reg blocks on the parameter side must take the matching
+  // block path on the return side, or the caller reads result slots at
+  // misaligned offsets when a boundary function returns a composite.
+  CCCustom<"CC_AArch64_Custom_Block">
+]>;
+
 let Entry = 1 in
 def CC_AArch64_Arm64EC_CFGuard_Check : CallingConv<[
   CCIfType<[i64], CCAssignToReg<[X11, X10, X9]>>
