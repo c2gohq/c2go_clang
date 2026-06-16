@@ -38,10 +38,12 @@
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/IR/DebugLoc.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/Module.h"
 #include "llvm/MC/MCDwarf.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -141,6 +143,37 @@ INITIALIZE_PASS(X86CallFrameOptimizationLegacy, DEBUG_TYPE,
 bool X86CallFrameOptimizationImpl::isLegal(MachineFunction &MF) {
   if (NoX86CFOpt.getValue())
     return false;
+
+  // c2go #298 Wave AJ.1 — bail out in c2go-mode. This pass rewrites
+  // sequence `SUBQ $N,%rsp; MOVQ <arg>,N(%rsp); CALL` into `PUSHQ <arg>;
+  // CALL` to save 1-byte-per-arg in code size on -O2+. It then sets
+  // `X86MachineFunctionInfo::HasPushSequences=true` which makes
+  // `X86FrameLowering::hasReservedCallFrame` return false, switching the
+  // call-frame model from "reserve outgoing args block in the prologue"
+  // to "ADJCALLSTACKDOWN/UP + PUSHQ per arg". That model is incompatible
+  // with the Plan-9 `.s` framesize contract: `obj6.go` (cmd/internal/obj/
+  // x86/obj6.go:887-928) tracks deltasp on `APUSHQ` (+8) and `AADJSP`
+  // (the SUBQ pseudo) but does NOT subtract back when the LLVM emit
+  // `ADDQ $N,%rsp` (which is a raw instruction sweeping the
+  // ADJCALLSTACKUP, not an AADJSP-equivalent). At `RET` time deltasp
+  // ends up = total PUSHQ bytes ≠ declared `$framesize` → `asm:
+  // unbalanced PUSH/POP`. Forcing reserved-CF (no PUSH outgoing-args)
+  // lets the stager publish the correct frame size and obj6.go reinject
+  // the SP adjustment + RBP save the X86MCInstLower suppressed in
+  // Plan-9 mode (see X86MCInstLower.cpp:2603-2608).
+  //
+  // Scope: gated on the module-level `c2go.goabi` flag and the per-
+  // function bucket (internal `c2go-argsize` or boundary `c2go-boundary`),
+  // mirroring X86C2GoFrameMetaStager's gate. Non-c2go X86 modules and
+  // runtime helpers living alongside c2go code are unaffected.
+  if (const Module *M = MF.getFunction().getParent()) {
+    if (M->getModuleFlag(llvm::c2go::kGoabiModuleFlag)) {
+      const Function &F = MF.getFunction();
+      if (F.hasFnAttribute("c2go-argsize") ||
+          F.hasFnAttribute("c2go-boundary"))
+        return false;
+    }
+  }
 
   // We can't encode multiple DW_CFA_GNU_args_size or DW_CFA_def_cfa_offset
   // in the compact unwind encoding that Darwin uses. So, bail if there

@@ -12,6 +12,7 @@
 
 #include "X86FrameLowering.h"
 #include "MCTargetDesc/X86MCTargetDesc.h"
+#include "X86C2GoFrameEmitter.h"
 #include "X86InstrBuilder.h"
 #include "X86InstrInfo.h"
 #include "X86MachineFunctionInfo.h"
@@ -1586,6 +1587,16 @@ static bool isOpcodeRep(unsigned Opcode) {
 
 void X86FrameLowering::emitPrologue(MachineFunction &MF,
                                     MachineBasicBlock &MBB) const {
+  // c2go #298 Wave AB.2: c2go-mode internal GoABIInternal callees use a
+  // hand-rolled Plan-9 prologue (mirror of AArch64's c2go::emitC2GoPrologue
+  // dispatch in AArch64FrameLowering::emitPrologue). When the helper
+  // returns true it has fully owned the prologue emission for this MF —
+  // the standard X86 prologue below must be bypassed. The triple-gate
+  // (c2go.goabi flag + Triple::isX86 + CC=C2GoABIInternal) lives inside
+  // the helper itself so non-c2go and non-flipped functions fall through
+  // to the standard path with byte-identical SysV output.
+  if (llvm::c2go::emitX86C2GoPrologue(MF, MBB))
+    return;
   assert(&STI == &MF.getSubtarget<X86Subtarget>() &&
          "MF used frame lowering for wrong subtarget");
   MachineBasicBlock::iterator MBBI = MBB.begin();
@@ -2406,6 +2417,11 @@ static bool isTailCallOpcode(unsigned Opc) {
 
 void X86FrameLowering::emitEpilogue(MachineFunction &MF,
                                     MachineBasicBlock &MBB) const {
+  // c2go #298 Wave AB.2 mirror of the prologue dispatch above. The helper
+  // returns true when it has owned epilogue emission for this MF; the
+  // standard X86 epilogue below must be bypassed in that case.
+  if (llvm::c2go::emitX86C2GoEpilogue(MF, MBB))
+    return;
   const MachineFrameInfo &MFI = MF.getFrameInfo();
   X86MachineFunctionInfo *X86FI = MF.getInfo<X86MachineFunctionInfo>();
   MachineBasicBlock::iterator Terminator = MBB.getFirstTerminator();

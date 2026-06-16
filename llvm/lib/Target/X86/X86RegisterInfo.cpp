@@ -28,14 +28,29 @@
 #include "llvm/CodeGen/TileShapeInfo.h"
 #include "llvm/CodeGen/VirtRegMap.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 
 using namespace llvm;
+
+// c2go #298 Wave AL.1 — file-local helper: returns true when the
+// MachineFunction lives in a c2go-mode module (`c2go.goabi` module flag
+// present). Mirrors X86C2GoFrameEmitter.cpp's `isX86C2GoMode` (which is
+// anonymous-namespace static there to avoid linker collision with the
+// AArch64 free function); we keep a second copy here rather than promote
+// it to a shared header because (a) only two TUs currently need this
+// check and (b) Wave AB header §5 already tracks "lift to
+// `llvm/Transforms/C2Go/C2GoModeQuery.h` once a third caller appears".
+static bool isX86C2GoModeRI(const llvm::MachineFunction &MF) {
+  return MF.getFunction().getParent()->getModuleFlag(
+             llvm::c2go::kGoabiModuleFlag) != nullptr;
+}
 
 #define GET_REGINFO_TARGET_DESC
 #include "X86GenRegisterInfo.inc"
@@ -258,6 +273,42 @@ X86RegisterInfo::getCalleeSavedRegs(const MachineFunction *MF) const {
   if (MF->getFunction().hasFnAttribute("no_callee_saved_registers"))
     return CSR_NoRegs_SaveList;
 
+  // c2go #298 Wave AM.1 — GoABI0 boundary functions in a c2go-mode
+  // module save no general-purpose CSRs themselves (callers spill what
+  // they need across calls — the Wave AL.1 BLOCKER-1 typeinfo-reuse
+  // fix, modeled by the lockstep mask flip in `getCallPreservedMask`
+  // below), with ONE exception: RBP. Go's amd64 ABI keeps BP
+  // callee-saved as the frame-pointer chain register — obj6.go injects
+  // `PUSHQ BP; MOVQ SP, BP` ahead of the frame SUB whenever its
+  // predicate `!NOFRAME && !(autoffset == 0 && !hasCall)` fires
+  // (cmd/internal/obj/x86/obj6.go:621-635), and NOFRAME/$0 leaves
+  // never touch BP at all. The truthful SaveList is therefore
+  // CSR_64_NoneRegs (= {RBP}, the preserve_none CC set), NOT
+  // CSR_NoRegs.
+  //
+  // Wave AL.1 returned CSR_NoRegs here, which (via the lockstep mask)
+  // declared RBP call-clobbered too. That engaged the X86-only
+  // spillFPBP machinery: X86ISelLoweringCall.cpp:2936 set
+  // FPClobberedByCall on every c2go call, and PEI's spillFPBP →
+  // checkInterferedAccess loud-failed `error: Interference usage of
+  // base pointer/frame pointer.` on any call-sequence interval
+  // containing a frame-index access — i.e. on essentially every
+  // production amd64 c2go function with outgoing stack args plus a
+  // cross-call spill (stress.c stress_init -O0, stress_run/-O2 set,
+  // sqlite-min.c -O0/-O2). `hasBasePointer(MF)` was false for ALL of
+  // them (fixed-size 8-aligned frame objects only — no VLA / realign /
+  // preallocated), so Wave AL's "hasBasePointer=true corner" framing
+  // did not cover the real production root: the RBP bit in the mask.
+  //
+  // CC gate: only `CallingConv::GoABI0` callees get the flip. The
+  // leaf C2GoABIInternal CC (Wave X Track A, opt-in second gate
+  // `c2go.x86-leaf-abi`) keeps the default SysV SaveList — flipping it
+  // here would break the precolored EBX/ECX register-passing locked
+  // by `c2go-abiinternal-reglower.ll`. Its call-preserved mask IS
+  // flipped below (Wave AL GPT round-2 Fix 3).
+  if (isX86C2GoModeRI(*MF) && CC == CallingConv::GoABI0)
+    return CSR_64_NoneRegs_SaveList;
+
   switch (CC) {
   case CallingConv::GHC:
   case CallingConv::HiPE:
@@ -386,6 +437,48 @@ X86RegisterInfo::getCallPreservedMask(const MachineFunction &MF,
   bool HasSSE = Subtarget.hasSSE1();
   bool HasAVX = Subtarget.hasAVX();
   bool HasAVX512 = Subtarget.hasAVX512();
+
+  // c2go #298 Wave AM.1 — GoABI0 / C2GoABIInternal callees in
+  // c2go-mode preserve exactly {RBP} (CSR_64_NoneRegs, lockstep with
+  // the SaveList flip in `getCalleeSavedRegs`). Callers must not keep
+  // anything else live in a GPR across the call (the Wave AL.1
+  // BLOCKER-1 typeinfo-reuse fix: RBX/R12-R15 are truthfully
+  // call-clobbered), but RBP IS preserved — obj6.go's injected BP
+  // push/pop (or a NOFRAME leaf never touching BP) plus the AM.1 RBP
+  // reserved-pin in `getReservedRegs` below make that contract real
+  // for both c2go function kinds.
+  //
+  // Wave AL.1 returned CSR_NoRegs_RegMask here, declaring RBP
+  // call-clobbered. X86ISelLoweringCall.cpp:2936 then marked
+  // FPClobberedByCall on every c2go call and PEI's spillFPBP /
+  // checkInterferedAccess loud-failed (`error: Interference usage of
+  // base pointer/frame pointer.`) across all production amd64
+  // workloads (stress.c + sqlite-min.c, -O0 and -O2) — see the
+  // `getCalleeSavedRegs` comment above for the full AM.1 real-root
+  // analysis. The AM.1 fix is this one-register difference:
+  // CSR_64_NoneRegs keeps RBP out of the clobber set, so spillFPBP
+  // never engages for c2go calls.
+  //
+  // CC parameter semantics — `CC` is the **callee** calling convention
+  // at the call site (TargetRegisterInfo.h:518-540: "registers
+  // preserved across the function call"; the mask is consumed by RA
+  // to determine which registers it can keep live across this CALL).
+  //
+  // c2go #298 Wave AL GPT round-2 Fix 3 — `C2GoABIInternal` mask also
+  // flipped. The leaf `C2GoABIInternal` CC (Wave X Track A) precolors
+  // i64 arguments into `C2GoIntRegList64 = {RAX, RBX, RCX, RDI, RSI,
+  // R8-R11}` (X86CallingConv.cpp:442-444). RBX is the second integer
+  // arg reg — when a GoABI0 caller in c2go-mode invokes a
+  // C2GoABIInternal leaf, the leaf clobbers RBX as part of normal
+  // ABI consumption. Without this mask flip, RegAlloc would consult
+  // the default SysV mask for the C2GoABIInternal callee (RBX/R12-R15
+  // preserved), keep a value live across the call in RBX, and the
+  // callee silently overwrites it on entry — silent miscompile that
+  // no test would catch (the symptom is purely a caller-side
+  // wrong-preserved-set bug).
+  if (isX86C2GoModeRI(MF) && (CC == CallingConv::GoABI0 ||
+                              CC == CallingConv::C2GoABIInternal))
+    return CSR_64_NoneRegs_RegMask;
 
   switch (CC) {
   case CallingConv::GHC:
@@ -595,6 +688,50 @@ BitVector X86RegisterInfo::getReservedRegs(const MachineFunction &MF) const {
       Reserved.set(*AI);
     for (MCRegAliasIterator AI(X86::R15, this, true); AI.isValid(); ++AI)
       Reserved.set(*AI);
+  }
+
+  // c2go #298 Wave AM.1 — pin RBP as RA-unallocatable in c2go GoABI0 /
+  // C2GoABIInternal functions. The CSR_64_NoneRegs SaveList / RegMask
+  // flips above declare "callee preserves RBP"; that promise must also
+  // hold for the function bodies LLVM compiles. In shapes where
+  // neither `TFI->hasFP(MF)` nor `FramePointerIsReserved(MF)` already
+  // reserves RBP (e.g. linux triples without frame-pointer=all, -O2
+  // leaves), RA could otherwise allocate RBP as scratch: a GoABI0 body
+  // would corrupt the Go frame-pointer chain obj6.go maintains, and a
+  // C2GoABIInternal NOSPLIT|NOFRAME leaf would clobber the caller's BP
+  // with no save/restore (its PEI CSR push/pop is FrameSetup-filtered
+  // on the Plan-9 .s path). The pin is idempotent with the hasFP /
+  // hasBasePointer marks above.
+  //
+  // Wave AL.1's broader pin ({RBX, R12-R15}, defense-in-depth for
+  // BLOCKER-1) is narrowed away by AM.1: with the call-preserved mask
+  // truthfully CSR_64_NoneRegs for both c2go CCs, RegAlloc already
+  // refuses to keep values live in RBX/R12-R15 across c2go calls. The
+  // pin only cost frame size — values NOT live across any call were
+  // also forced to spill (see c2go-plan9-asm-emit.ll framesize
+  // history: $16-8 → $64-8 under the pin → back to $16-8).
+  //
+  // BasePtr=RBX (X86RegisterInfo.cpp:79) residual corner — NOT
+  // refuted, only out of the production trigger set (Wave AM GPT
+  // round-1 finding 3): production c2go workloads never reach
+  // `hasBasePointer(MF)=true` (varsized / preallocated shapes
+  // loud-fail at ISel via the Wave AK Fix2 non-reserved-CF bailouts;
+  // #280 bans dynamic alloca at Sema). The one shape that bypasses
+  // those bailouts — stack realignment + opaque SP adjustment (see
+  // `CantUseSP`: SP-adjusting inline asm) — would keep
+  // hasReservedCallFrame=true yet set BPClobberedByCall (RBX is in
+  // the CSR_64_NoneRegs clobber set) and engage spillFPBP for BP.
+  // That remains an UNSUPPORTED corner: unreachable from c2go C
+  // source today, and if hit via hand-written IR it resolves to the
+  // spillFPBP machinery or its loud Interference diagnostic, not a
+  // silent miscompile. A BasePtr relocate off RBX is the eventual fix
+  // if a real producer ever appears (tracked in X86C2GoFrameEmitter.h
+  // §7 AK.1.followup-A).
+  if (Is64Bit && isX86C2GoModeRI(MF) &&
+      (MF.getFunction().getCallingConv() == CallingConv::GoABI0 ||
+       MF.getFunction().getCallingConv() == CallingConv::C2GoABIInternal)) {
+    for (const MCPhysReg &SubReg : subregs_inclusive(X86::RBP))
+      Reserved.set(SubReg);
   }
 
   assert(checkAllSuperRegsMarked(Reserved,

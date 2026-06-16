@@ -13,12 +13,15 @@
 #ifndef LLVM_LIB_TARGET_X86_X86MACHINEFUNCTIONINFO_H
 #define LLVM_LIB_TARGET_X86_X86MACHINEFUNCTIONINFO_H
 
+#include "X86C2GoFrameEmitter.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/CallingConvLower.h"
 #include "llvm/CodeGen/MIRYamlMapping.h"
 #include "llvm/CodeGen/MachineFunction.h"
+#include "llvm/MC/MCC2GoFunctionMetadata.h"
 #include "llvm/Support/YAMLTraits.h"
+#include <optional>
 #include <set>
 
 namespace llvm {
@@ -175,6 +178,31 @@ class X86MachineFunctionInfo : public MachineFunctionInfo {
   bool BPClobberedByCall = false;
   bool FPClobberedByInvoke = false;
   bool BPClobberedByInvoke = false;
+
+  /// c2go #298 Wave Z Track B: X86 mirror of `AArch64FunctionInfo::
+  /// AArch64C2GoFunctionState::StagedMeta` (#376 plumbing). Per-MF aggregate
+  /// of the Plan 9 TEXT-directive metadata (framesize / argsize / NOSPLIT bit
+  /// / pointer masks / stkobj table) computed by the X86 c2go producer
+  /// (frame-lowering / leaf-ABI pass — landed incrementally; this field is
+  /// the consumer-side hook) and republished into MCPlan9AsmStreamer by
+  /// `X86AsmPrinter::emitFunctionEntryLabel`. When this is `std::nullopt`,
+  /// the streamer's `emitLabel` falls through to the Stage-4 TU-local
+  /// `NOFRAME, $0` fallback — which is the current production behaviour
+  /// for every X86 function (the second `c2go.x86-leaf-abi` gate is OFF
+  /// by default and no X86 producer stages metadata yet). Once the
+  /// producer is wired (mirror of `AArch64::C2GoFrameEmitter`), Stage 1
+  /// `NOSPLIT|NOFRAME, $0-M` becomes reachable.
+  std::optional<C2GoFunctionMetadata> C2GoStagedMeta;
+
+  /// c2go #298 Wave AB.1 — X86 mirror of `AArch64FunctionInfo::
+  /// AArch64C2GoFunctionState::FI / FrameSize{,Valid}` (the cached pure-
+  /// function summary populated lazily by `getOrComputeC2GoFI(MF)` and the
+  /// "framesize the prologue actually published" used by the epilogue
+  /// emitter to undo the same SUB / ADD pair without relying on
+  /// `MFI.getStackSize()` as a side-channel).
+  std::optional<c2go::X86C2GoFrameInfo> C2GoFI;
+  uint64_t C2GoFrameSize = 0;
+  bool C2GoFrameSizeValid = false;
 
 private:
   /// ForwardedMustTailRegParms - A list of virtual and physical registers
@@ -346,6 +374,53 @@ public:
 
   bool getBPClobberedByInvoke() const { return BPClobberedByInvoke; }
   void setBPClobberedByInvoke(bool C) { BPClobberedByInvoke = C; }
+
+  /// c2go #298 Wave Z Track B / #376: producer-side staging of per-function
+  /// Plan 9 metadata to be republished into the MCPlan9AsmStreamer at the
+  /// X86AsmPrinter stage. Move-in: takes ownership of `M`. The consumer
+  /// (`X86AsmPrinter::emitFunctionEntryLabel`) calls `takeC2GoStagedMeta`
+  /// to extract and consume the value. Mirrors AArch64's
+  /// `setC2GoStagedMeta` / `hasC2GoStagedMeta` / `takeC2GoStagedMeta` API
+  /// exactly so cross-target code (e.g. the upcoming target-agnostic
+  /// `c2go::C2GoFrameInfo` Phase-2 producer) can dispatch uniformly.
+  void setC2GoStagedMeta(C2GoFunctionMetadata M) {
+    C2GoStagedMeta = std::move(M);
+  }
+  bool hasC2GoStagedMeta() const { return C2GoStagedMeta.has_value(); }
+  std::optional<C2GoFunctionMetadata> takeC2GoStagedMeta() {
+    std::optional<C2GoFunctionMetadata> R = std::move(C2GoStagedMeta);
+    C2GoStagedMeta.reset();
+    return R;
+  }
+
+  /// c2go #298 Wave AB.1 — lazy idempotent accessor for the cached
+  /// `c2go::X86C2GoFrameInfo`. First call runs
+  /// `c2go::computeX86C2GoFrameInfo(MF)`; later calls return the cached
+  /// value. Mirror of `AArch64FunctionInfo::getOrComputeC2GoFI` (same
+  /// const-ref return discipline so callers can't accidentally invalidate
+  /// the cache).
+  const c2go::X86C2GoFrameInfo &
+  getOrComputeC2GoFI(const MachineFunction &MF) {
+    if (!C2GoFI)
+      C2GoFI = c2go::computeX86C2GoFrameInfo(MF);
+    return *C2GoFI;
+  }
+
+  /// c2go #298 Wave AB.1 — "framesize the c2go prologue actually
+  /// published" channel used by the epilogue to undo the exact SUB / ADD
+  /// pair. Mirrors `AArch64FunctionInfo::hasC2GoFrameSize /
+  /// getC2GoFrameSize / setC2GoFrameSize` (same #438 fatal-on-missing
+  /// contract enforced inside `emitX86C2GoEpilogue` rather than the
+  /// accessor itself — getter asserts on read, matches AArch64 path).
+  bool hasC2GoFrameSize() const { return C2GoFrameSizeValid; }
+  uint64_t getC2GoFrameSize() const {
+    assert(C2GoFrameSizeValid && "c2go x86 frame size not set");
+    return C2GoFrameSize;
+  }
+  void setC2GoFrameSize(uint64_t Size) {
+    C2GoFrameSize = Size;
+    C2GoFrameSizeValid = true;
+  }
 };
 
 } // End llvm namespace
