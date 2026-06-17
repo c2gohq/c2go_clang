@@ -690,6 +690,26 @@ BitVector X86RegisterInfo::getReservedRegs(const MachineFunction &MF) const {
       Reserved.set(*AI);
   }
 
+  // c2go #298 (A1) — reserve R14 (Go `g`) and R15 (Go REGTMP) in EVERY
+  // c2go-mode function. Go amd64 (1.17+ regabi) keeps the goroutine pointer
+  // g in R14; the Go assembler/linker may also use R15 as a scratch when
+  // expanding pseudo-ops. LLVM must never allocate either, mirroring AArch64
+  // reserving X28=g / X27=REGTMP (AArch64RegisterInfo.cpp) and docs §2.2
+  // B5/B7 + §4.13.1. The CSR_64_NoneRegs clobber mask only stops values
+  // living *across* a call in these regs — it does NOT stop RA from using
+  // R14 as scratch inside a call-free region (which corrupts g for the next
+  // callee's morestack prologue) nor protect R15 from Go-asm clobbering, so
+  // the mask is not sufficient on its own. Gated on the c2go.goabi module
+  // flag (not the GoABI0/C2GoABIInternal CC) because g must be preserved in
+  // any function that runs under the Go runtime — including ABI0 wrappers
+  // and pre-CC-flip bodies.
+  if (Is64Bit && isX86C2GoModeRI(MF)) {
+    for (MCRegAliasIterator AI(X86::R14, this, true); AI.isValid(); ++AI)
+      Reserved.set(*AI);
+    for (MCRegAliasIterator AI(X86::R15, this, true); AI.isValid(); ++AI)
+      Reserved.set(*AI);
+  }
+
   // c2go #298 Wave AM.1 — pin RBP as RA-unallocatable in c2go GoABI0 /
   // C2GoABIInternal functions. The CSR_64_NoneRegs SaveList / RegMask
   // flips above declare "callee preserves RBP"; that promise must also
