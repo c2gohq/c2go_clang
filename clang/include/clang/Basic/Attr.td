@@ -1385,8 +1385,13 @@ def C2GoReturnType : InheritableAttr {
 // rename; remove after Phase A is complete. These are equivalent to
 // the new attributes but Sema will eventually warn about deprecation.
 def C2GoStruct : InheritableAttr {
-  let Spellings = [GNU<"c2go_struct">, CXX11<"clang", "c2go_struct">];
-  let Subjects = SubjectList<[Record], ErrorDiag>;
+  // Implicit-only: the internal managed-struct marker. It has NO source
+  // spelling — the former `c2go_struct` attribute was removed (§13 rename to
+  // c2go_managed); source code marks a managed struct with
+  // __attribute__((c2go_managed)) on the record. C2GoStructAttr is created via
+  // CreateImplicit from handleC2GoManagedAttr (c2go_managed on a record) and
+  // from managed push/pop propagation (AddPragmaC2GoAttribute).
+  let Spellings = [];
   let Documentation = [C2GoDocs];
   let LangOpts = [COnly];
 }

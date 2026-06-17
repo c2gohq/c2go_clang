@@ -6494,6 +6494,12 @@ static void handleC2GoManagedAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   if (!isa<RecordDecl>(D) && !isa<FieldDecl>(D) && !isa<ParmVarDecl>(D) &&
       !isa<FunctionDecl>(D) && !isa<VarDecl>(D))
     return;
+  // §13 rename: c2go_managed on a *record* is the managed-struct marker (the
+  // former c2go_struct). Stamp the internal C2GoStructAttr so the existing
+  // managed-struct machinery (typeinfo emission, world inference, manifest)
+  // applies; C2GoManagedAttr is kept too for the world-tracking reads.
+  if (isa<RecordDecl>(D) && !D->hasAttr<C2GoStructAttr>())
+    D->addAttr(C2GoStructAttr::CreateImplicit(S.Context, AL.getLoc()));
   D->addAttr(::new (S.Context) C2GoManagedAttr(S.Context, AL));
 }
 
@@ -7544,9 +7550,6 @@ ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D, const ParsedAttr &AL,
     break;
   case ParsedAttr::AT_GoLinkname:
     handleGoLinknameAttr(S, D, AL);
-    break;
-  case ParsedAttr::AT_C2GoStruct:
-    handleSimpleAttribute<C2GoStructAttr>(S, D, AL);
     break;
   case ParsedAttr::AT_C2GoVariant:
     handleC2GoVariantAttr(S, D, AL);
