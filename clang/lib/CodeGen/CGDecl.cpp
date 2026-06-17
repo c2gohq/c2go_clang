@@ -2989,6 +2989,15 @@ void CodeGenFunction::EmitParmDecl(const VarDecl &D, ParamValue Arg,
       if (getLangOpts().C2GoMode) {
         if (const RecordDecl *RD = getC2GoManagedPointee(Ty))
           attachC2GoManagedPtrMetadata(AllocaPtr.getPointer(), RD);
+        // c2go (A2): also tag a plain pointer parameter's `.addr` slot with
+        // `!c2go.ptr.slot`, mirroring the local-variable path (above). A
+        // `void *p` parameter is spilled to this `.addr` slot; if it is live
+        // across a safepoint when the goroutine stack moves, copystack must
+        // relocate it, which it can only do when the slot is in the locals
+        // pointer-map. Managed-pointee params already get the (stronger)
+        // managed tag above; this covers the plain/unmanaged pointer params.
+        if (Ty->isPointerType())
+          attachC2GoPtrSlotMetadata(AllocaPtr.getPointer());
       }
     }
     DoStore = true;
