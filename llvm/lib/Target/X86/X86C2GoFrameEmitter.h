@@ -252,11 +252,12 @@
 //         AFI->setC2GoSpillSlotTag (#426); the prologue ORs them into
 //         the body locals mask when M5 is disabled; M5 (per-PC live set)
 //         consumes them at the AsmPrinter STATEPOINT/STACKMAP lowering.
-//       * X86: NOT in scope for Wave AB-min (no X86 statepoint GC user
-//         today). The X86 MFI already has setC2GoStagedMeta but lacks
-//         C2GoSpillSlotTags / C2GoLiveSpillSlotsAtCall — Wave AB adds
-//         them ONLY when an X86 statepoint GC use case lands. Track in
-//         a follow-up issue; do NOT speculatively port the M5 pass.
+//       * X86: ported in #298 (A4). storeRegToStackSlot tags spill slots
+//         "ptr" via X86InstrInfo (x86C2GoIsPtrDerived def-chain classifier);
+//         C2GoSpillSlotTags / C2GoLiveSpillSlotsAtCall live on
+//         X86MachineFunctionInfo; X86C2GoPtrSlotLiveness (M5) computes the
+//         per-PC live set, consumed at X86MCInstLower STATEPOINT/STACKMAP
+//         lowering and converted through x86C2GoBitmapOffFromAnchor.
 //
 //   3.8 Variadic outgoing-call frame.
 //       * AArch64: AArch64C2GoFunctionState::HasVariadicOutgoingCall +

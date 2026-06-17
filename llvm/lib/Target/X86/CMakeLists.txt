@@ -30,6 +30,7 @@ set(sources
   X86AvoidTrailingCall.cpp
   X86C2GoFrameEmitter.cpp
   X86C2GoLeafABI.cpp
+  X86C2GoPtrSlotLiveness.cpp
   X86CallFrameOptimization.cpp
   X86CallingConv.cpp
   X86CmovConversion.cpp

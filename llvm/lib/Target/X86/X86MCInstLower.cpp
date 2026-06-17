@@ -55,6 +55,7 @@
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/Support/C2GoEmergencyFlag.h"
 #include "llvm/Target/TargetLoweringObjectFile.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/C2Go/C2GoProtocol.h"
@@ -944,6 +945,88 @@ static void c2goExpandDirectAllocaFields(const MachineFunction &MF,
   }
 }
 
+// c2go GC Approach B (#330) (X86 port, #298): OR-in the M5 per-call live
+// ptr-tagged spill slots onto `SpOffsets`, used by both LowerSTACKMAP
+// (lightweight @llvm.experimental.stackmap path) and LowerSTATEPOINT (RS4GC).
+// X86 mirror of `appendC2GoPtrSpillSlotOffsets` (AArch64AsmPrinter.cpp):
+//
+//   * M2 (X86InstrInfo::storeRegToStackSlot) tags every regalloc-spilled ptr
+//     slot; M5 (X86C2GoPtrSlotLivenessPass) computes per-PC liveness so each
+//     slot is marked ONLY at the safepoints where it actually holds a live
+//     pointer.
+//   * The pre-M5 fallback ("mark every ptr-tagged slot at every safepoint") is
+//     UNSOUND on workloads with spiller slot reuse; LowerSTACKMAP omits it
+//     (runs at -O0/-O1 where M5 is always available when spill tags exist);
+//     LowerSTATEPOINT keeps it (IncludeFallback) for bisecting M5 itself.
+//
+// X86 DIVERGENCE from AArch64 (THE key port difference): AArch64 pushes the RAW
+// `getFrameIndexReference` SP-offset (its locals map is anchored verbatim at
+// SP). X86 frames are RBP-vs-RSP and the locals bitmap is in the obj6.go
+// post-prologue-SP coordinate — so each FI's `getFrameIndexReference` result
+// (which answers RBP-relative on the framed hasFP path, RSP-relative
+// otherwise) MUST be converted through `x86C2GoBitmapOffFromAnchor`, EXACTLY
+// like the explicit-gc-operand path above. A raw SP offset would land in the
+// wrong bitmap word. FAIL-CLOSED: an FI that cannot resolve to a valid anchor
+// (FrameReg neither RSP nor RBP, or the converter returns nullopt) is
+// `report_fatal_error`'d rather than silently dropped — a dropped live ptr
+// slot is a copystack-relocation miss (dangling pointer).
+static void appendC2GoPtrSpillSlotOffsets(const MachineFunction &MF,
+                                          const MachineInstr &MI,
+                                          SmallVectorImpl<int64_t> &SpOffsets,
+                                          bool IncludeFallback) {
+  if (llvm::c2go::isC2GoDisabled("spill-tags"))
+    return;
+  const MachineFrameInfo &MFI = MF.getFrameInfo();
+  const auto *X86FI = MF.getInfo<X86MachineFunctionInfo>();
+  const TargetFrameLowering *TFL = MF.getSubtarget().getFrameLowering();
+  const uint64_t FrameSize = MFI.getStackSize();
+  const bool FrameUsesFP = TFL->hasFP(MF);
+  auto AddSlot = [&](int FI) {
+    if (FI < MFI.getObjectIndexBegin() || FI >= MFI.getObjectIndexEnd() ||
+        MFI.isDeadObjectIndex(FI) || MFI.getObjectAllocation(FI))
+      return;
+    Register FrameReg;
+    StackOffset FIOff = TFL->getFrameIndexReference(MF, FI, FrameReg);
+    // FAIL-CLOSED. A live ptr spill slot anchored to neither RSP nor RBP means
+    // the function uses the X86 BASE POINTER (RBX) — dynamic stack realignment
+    // PLUS dynamic allocas (X86FrameLowering::getFrameIndexReference →
+    // getBaseRegister()). x86C2GoBitmapOffFromAnchor has no RBX case, and the
+    // existing explicit-gc-operand paths (c2goExpandDirectAllocaFields, the
+    // funcdata2 matcher) merely `continue` past such slots — i.e. the ENTIRE
+    // X86 c2go locals bitmap silently under-marks base-pointer frames today.
+    // For an M5-tracked live ptr slot, silently dropping it is a copystack
+    // relocation miss (dangling pointer), so we abort loudly rather than
+    // corrupt. (Base-pointer c2go frames are an unsupported configuration
+    // pending its own coordinate-conversion case — flagged for the
+    // orchestrator; see this function's header.)
+    if (FrameReg != X86::RSP && FrameReg != X86::RBP)
+      report_fatal_error("c2go GC-B (X86): live ptr spill slot uses the base "
+                         "pointer (RBX) anchor — base-pointer frames are not "
+                         "yet supported by the c2go locals bitmap");
+    std::optional<int64_t> BitOff = x86C2GoBitmapOffFromAnchor(
+        FrameSize, FrameUsesFP, FrameReg == X86::RSP, FIOff.getFixed());
+    if (!BitOff)
+      report_fatal_error("c2go GC-B (X86): live ptr spill slot did not resolve "
+                         "to a valid locals-bitmap coordinate (FP anchor on a "
+                         "frameless / no-FP TEXT — should be unreachable)");
+    SpOffsets.push_back(*BitOff);
+  };
+  if (X86FI->isC2GoPtrSlotLivenessValid()) {
+    // M5 path: only the FIs M5 marked live at THIS call MI.
+    for (int FI : X86FI->getC2GoLiveSpillSlotsAtCall(&MI))
+      AddSlot(FI);
+  } else if (IncludeFallback) {
+    // Pre-M5 fallback (UNSOUND on workloads with spiller slot reuse — kept only
+    // for bisecting M5 itself, gated by `-c2go-disable=spill-tags`): mark every
+    // ptr-tagged slot.
+    for (const auto &KV : X86FI->getC2GoSpillSlotTags()) {
+      if (KV.second != "ptr")
+        continue;
+      AddSlot(KV.first);
+    }
+  }
+}
+
 namespace llvm {
 namespace c2go {
 // Defined in X86AsmPrinter.cpp; backs the `-x86-c2go-funcdata2` cl::opt
@@ -1101,10 +1184,16 @@ void X86AsmPrinter::LowerSTATEPOINT(const MachineInstr &MI,
     // produced all-zero locals bitmaps on every framed function — the amd64
     // ascast validator=0 / SIGBUS@copystack root.
     //
-    // X86 also does NOT yet have an analogue of `appendC2GoPtrSpillSlotOff-
-    // sets` (M5 spill-slot ptr-tag OR-in lives on AArch64FunctionInfo).
-    // Tracked separately under #298 follow-ups; here we forward only the
-    // explicit gc-live operands plus per-PC alloca field expansion.
+    // c2go GC Approach B (#330) Milestone 5 (X86 port, #298): in addition to
+    // the explicit gc-live operands + per-PC alloca field expansion below, we
+    // OR-in the M5 per-call live ptr-tagged spill slots (regalloc-spilled
+    // pointers that are never STATEPOINT operands). M2 tags such slots in
+    // X86InstrInfo::storeRegToStackSlot; M5 (X86C2GoPtrSlotLivenessPass)
+    // computes per-PC liveness. See `appendC2GoPtrSpillSlotOffsets` above —
+    // it converts each live FI to the same locals-bitmap coordinate via
+    // x86C2GoBitmapOffFromAnchor (NOT a raw RSP offset). The call sits just
+    // before `recordC2GoStackmapSite`. Mirror of the AArch64 LowerSTATEPOINT
+    // OR-in (AArch64AsmPrinter.cpp:2290).
     const uint64_t C2GoFrameSize = MF->getFrameInfo().getStackSize();
     const bool C2GoFrameUsesFP =
         MF->getSubtarget().getFrameLowering()->hasFP(*MF);
@@ -1167,6 +1256,14 @@ void X86AsmPrinter::LowerSTATEPOINT(const MachineInstr &MI,
         }
       }
     }
+    // c2go GC Approach B (#330) M5 (X86 port, #298): OR-in derived/interior ptr
+    // spill slots that RS4GC misses (it tracks only base allocas, not
+    // `&s.field` / `&buf[k]`). M2 tags such slots in storeRegToStackSlot; M5
+    // computes per-PC liveness. IncludeFallback=true keeps the unsound pre-M5
+    // marking available for bisecting M5 itself (gated by
+    // `-c2go-disable=spill-tags`). Mirror of AArch64AsmPrinter.cpp:2296.
+    appendC2GoPtrSpillSlotOffsets(*MF, MI, SpOffsets,
+                                  /*IncludeFallback=*/true);
     Plan9->recordC2GoStackmapSite(SpOffsets);
   }
   if (unsigned PatchBytes = SOpers.getNumPatchBytes()) {
@@ -1419,10 +1516,12 @@ void X86AsmPrinter::LowerSTACKMAP(const MachineInstr &MI) {
   // recordStackMap just parsed into CSInfos.back() and forward their byte
   // offsets to the Plan-9 streamer. The streamer interns them into a per-PC
   // pointer bitmap and emits `PCDATA $1, $<idx>` so Go runtime can resolve
-  // live ptr slots at this safepoint. Unlike AArch64, X86 does not yet have
-  // an analogue of `appendC2GoPtrSpillSlotOffsets` (M5 spill-slot ptr-tag
-  // OR-in lives on AArch64FunctionInfo) — that is tracked separately under
-  // #298 follow-ups; here we only forward the explicit stackmap operands.
+  // live ptr slots at this safepoint. In addition to the explicit stackmap
+  // operands, we OR-in the M5 per-call live ptr-tagged spill slots (anonymous
+  // regalloc spill slots that are never stackmap operands — M2-tagged "ptr" by
+  // X86InstrInfo::storeRegToStackSlot, made per-PC by X86C2GoPtrSlotLiveness).
+  // No fallback: the lightweight path runs at -O0/-O1 where M5 is always
+  // available when spill tags exist. Mirror of AArch64AsmPrinter.cpp:1928.
   if (OutStreamer->isPlan9AsmStreamer()) {
     auto *Plan9 = static_cast<MCPlan9AsmStreamer *>(OutStreamer.get());
     const auto &CSI = SM.getCSInfos().back();
@@ -1459,6 +1558,12 @@ void X86AsmPrinter::LowerSTACKMAP(const MachineInstr &MI) {
       if (BitOff)
         SpOffsets.push_back(*BitOff);
     }
+    // c2go GC Approach B (#330) M5 (X86 port, #298): OR-in the per-call live
+    // ptr-tagged spill slots. IncludeFallback=false — the lightweight stackmap
+    // path runs at -O0/-O1 where M5 is always available when spill tags exist.
+    // Mirror of AArch64AsmPrinter.cpp:1928.
+    appendC2GoPtrSpillSlotOffsets(*MF, MI, SpOffsets,
+                                  /*IncludeFallback=*/false);
     Plan9->recordC2GoStackmapSite(SpOffsets);
   }
   unsigned NumShadowBytes = MI.getOperand(1).getImm();

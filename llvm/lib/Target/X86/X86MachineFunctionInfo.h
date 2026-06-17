@@ -15,7 +15,9 @@
 
 #include "X86C2GoFrameEmitter.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/CodeGen/CallingConvLower.h"
 #include "llvm/CodeGen/MIRYamlMapping.h"
 #include "llvm/CodeGen/MachineFunction.h"
@@ -421,6 +423,72 @@ public:
     C2GoFrameSize = Size;
     C2GoFrameSizeValid = true;
   }
+
+  // ----- c2go GC Approach B (#330) Milestones M2/M5 (X86 port, #298) -------
+  // X86 mirror of `AArch64FunctionInfo::AArch64C2GoFunctionState`
+  // {SpillSlotTags, LiveSpillSlotsAtCall, PtrSlotLivenessValid}. The tags
+  // were relocated off MachineFrameInfo onto the per-target MFI (#375 slice
+  // 3 / #426); X86 carries its own copy so the target-independent
+  // StackColoring / StackSlotColoring `TagsCompatible` merge-guard (consumed
+  // through TII::getStackSlotTypeTag) and the X86 stackmap emitter
+  // (X86MCInstLower) can read the same source AArch64 uses.
+
+  /// c2go §B2 phase 2.5: associate \p Tag with the spill slot at \p
+  /// ObjectIdx. Producer is `X86InstrInfo::storeRegToStackSlot` (#426
+  /// piggyback) when the spilled vreg is pointer-derived. An empty \p Tag
+  /// removes any prior entry. Mirror of `AArch64FunctionInfo`.
+  void setC2GoSpillSlotTag(int ObjectIdx, StringRef Tag) {
+    if (Tag.empty()) {
+      C2GoSpillSlotTags.erase(ObjectIdx);
+      return;
+    }
+    C2GoSpillSlotTags[ObjectIdx] = Tag.str();
+  }
+  /// c2go §B2 phase 2.5: look up the managed-pointer tag for spill slot
+  /// \p ObjectIdx. Empty StringRef when the slot has no tag.
+  StringRef getC2GoSpillSlotTag(int ObjectIdx) const {
+    auto It = C2GoSpillSlotTags.find(ObjectIdx);
+    if (It == C2GoSpillSlotTags.end())
+      return StringRef();
+    return It->second;
+  }
+  /// c2go §B2 phase 2.5: read-only view of the entire spill-slot tag map.
+  /// Used by the X86 M5 liveness pass / X86MCInstLower fallback to enumerate
+  /// every managed-pointer spill slot.
+  const DenseMap<int, std::string> &getC2GoSpillSlotTags() const {
+    return C2GoSpillSlotTags;
+  }
+
+  /// c2go GC Approach B (#330) Milestone 5: record the live ptr-tagged spill
+  /// slots at \p Call (set populated by X86C2GoPtrSlotLivenessPass once per
+  /// call MI; the set already excludes slots DEAD at this PC).
+  void setC2GoLiveSpillSlotsAtCall(const MachineInstr *Call, ArrayRef<int> FIs) {
+    auto &V = C2GoLiveSpillSlotsAtCall[Call];
+    V.assign(FIs.begin(), FIs.end());
+  }
+  /// Get the live ptr-tagged spill slots at \p Call. Empty if no slots are
+  /// live there or M5 has not (yet) populated the map.
+  ArrayRef<int> getC2GoLiveSpillSlotsAtCall(const MachineInstr *Call) const {
+    auto It = C2GoLiveSpillSlotsAtCall.find(Call);
+    if (It == C2GoLiveSpillSlotsAtCall.end())
+      return {};
+    return It->second;
+  }
+  bool isC2GoPtrSlotLivenessValid() const { return C2GoPtrSlotLivenessValid; }
+  void setC2GoPtrSlotLivenessValid(bool V) { C2GoPtrSlotLivenessValid = V; }
+
+private:
+  /// c2go GC Approach B (#330) #375 slice 3 / #426 — per-slot managed-pointer
+  /// type tags ("ptr"). Mirror of AArch64FunctionInfo::...::SpillSlotTags.
+  DenseMap<int, std::string> C2GoSpillSlotTags;
+  /// c2go GC Approach B (#330) Milestone 5 — per-call live ptr-tagged spill
+  /// slots, keyed by the call MI. Mirror of LiveSpillSlotsAtCall.
+  DenseMap<const MachineInstr *, SmallVector<int, 4>> C2GoLiveSpillSlotsAtCall;
+  /// c2go GC Approach B (#330) Milestone 5 — set true by the M5 pass to tell
+  /// the X86 stackmap emitter to USE the per-PC LiveSpillSlotsAtCall instead
+  /// of the conservative all-PCs OR-in over SpillSlotTags. Mirror of
+  /// PtrSlotLivenessValid.
+  bool C2GoPtrSlotLivenessValid = false;
 };
 
 } // End llvm namespace

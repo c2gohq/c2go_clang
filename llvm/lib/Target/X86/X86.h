@@ -361,6 +361,15 @@ FunctionPass *createX86ArgumentStackSlotPass();
 FunctionPass *createX86C2GoFrameMetaStagerPass();
 void initializeX86C2GoFrameMetaStagerPass(PassRegistry &);
 
+/// c2go GC Approach B (#330) Milestone 5 (X86 port, #298): per-PC liveness of
+/// pointer-tagged spill slots. Faithful mirror of
+/// AArch64C2GoPtrSlotLivenessPass. Scheduled in
+/// `X86PassConfig::addPreEmitPass2` (after PEI / outliner / BB-sections);
+/// self-gates on the `c2go.goabi` module flag + the `-c2go-disable=
+/// ptrslot-liveness` emergency switch so non-c2go builds are byte-identical.
+FunctionPass *createX86C2GoPtrSlotLivenessPass();
+void initializeX86C2GoPtrSlotLivenessPass(PassRegistry &);
+
 void initializeCompressEVEXLegacyPass(PassRegistry &);
 void initializeX86FixupBWInstLegacyPass(PassRegistry &);
 void initializeFixupLEAsLegacyPass(PassRegistry &);

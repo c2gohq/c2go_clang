@@ -19,6 +19,8 @@
 #include "X86TargetMachine.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Sequence.h"
+#include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/LiveVariables.h"
@@ -44,6 +46,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetOptions.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include <atomic>
 #include <optional>
 
@@ -4783,6 +4786,189 @@ void X86InstrInfo::loadStoreTileReg(MachineBasicBlock &MBB,
   }
 }
 
+// c2go GC Approach B (#330) #426 (X86 port, #298): pointer-spill tagging
+// counter. Increments in storeRegToStackSlot when the spilled value is
+// GC-pointer-derived (gated on `c2go.goabi`, so non-c2go targets are
+// byte-identical). Dedicated DEBUG_TYPE so it does not pollute the file-wide
+// "x86-instr-info" bucket. Mirror of AArch64InstrInfo.cpp.
+#undef DEBUG_TYPE
+#define DEBUG_TYPE "x86-c2go"
+STATISTIC(NumX86C2GoPtrSpillSlots,
+          "c2go GC Approach B: pointer-tagged spill slots (#330, X86)");
+#undef DEBUG_TYPE
+#define DEBUG_TYPE "x86-instr-info"
+
+// c2go GC Approach B (#330) #375 slice 5 / #426 (X86 port, #298): recursive
+// def-chain classifier that decides whether a vreg holds a GC pointer at spill
+// time. Faithful mirror of AArch64's `c2goIsPtrDerived` (AArch64InstrInfo.cpp);
+// only the opcode set is rewritten for X86. Same soundness discipline:
+//
+//   * pointer ROOTS: address materialization from a frame index / global /
+//     constant-pool / jump-table / block-address — on X86 these fold into a
+//     single LEA addressing mode (LEA64r/LEA32r/LEA64_32r) whose operands carry
+//     the FI / GV / CPI / JTI / BA MachineOperand;
+//   * pointer-PRESERVING: COPY / MOV64rr / MOV32rr (reg-move), base+imm and
+//     base+index address arithmetic (LEA, ADD64ri*, ADD64rr) where the BASE is
+//     pointer-derived, OR-disjoint (aligned ptr + small offset, the X86
+//     analogue of AArch64 ORRXri+disjoint), CMOV of two ptr values, and a PHI
+//     of all-pointer incomings;
+//   * NOT propagated (would over-mark): SUB (pointer difference → int),
+//     compares, multiplies, non-disjoint OR/AND, and — critically — LOADs (the
+//     MIR carries no IR pointer-ness; under-marking here is SOUND, mirror of
+//     the AArch64 header rationale).
+//
+// The OR-across-defs direction (a split vreg whose chain leads back to a ptr
+// root via ANY def is marked) and the self-cycle → false rule (#370 integer
+// induction PHI fix) are preserved verbatim.
+static bool x86C2GoIsPtrDerived(Register Reg, const MachineRegisterInfo &MRI,
+                                unsigned Depth, SmallSet<Register, 16> &Seen) {
+  if (!Reg.isVirtual() || Depth > 24)
+    return false;
+  if (!Seen.insert(Reg).second)
+    // Self-cycle (typically an integer induction PHI back-edge). Conservatively
+    // do NOT propagate pointer-ness — see the AArch64 #370 bisect comment.
+    return false;
+
+  SmallVector<MachineInstr *, 4> Defs;
+  for (MachineInstr &D : MRI.def_instructions(Reg))
+    Defs.push_back(&D);
+  if (Defs.empty())
+    return false;
+
+  auto hasFrameIndexAddr = [](const MachineInstr &MI) {
+    for (const MachineOperand &MO : MI.operands())
+      if (MO.isFI())
+        return true;
+    return false;
+  };
+  auto hasGlobalAddr = [](const MachineInstr &MI) {
+    for (const MachineOperand &MO : MI.operands())
+      if (MO.isGlobal() || MO.isBlockAddress() || MO.isJTI() || MO.isCPI())
+        return true;
+    return false;
+  };
+
+  auto classifyDef = [&](MachineInstr *Def) -> bool {
+    auto operandPtrDerived = [&](unsigned OpIdx) -> bool {
+      if (OpIdx >= Def->getNumOperands())
+        return false;
+      const MachineOperand &MO = Def->getOperand(OpIdx);
+      return MO.isReg() && MO.getReg().isVirtual() &&
+             x86C2GoIsPtrDerived(MO.getReg(), MRI, Depth + 1, Seen);
+    };
+    switch (Def->getOpcode()) {
+    // Address materialization (LEA). On X86 `&fi`, `&global`, `&s.field`,
+    // `&buf[k]` all lower to an LEA whose addressing mode is
+    //   [BaseReg + ScaleAmt*IndexReg + Disp(+Seg)] (operands 1..5).
+    // A frame-index / global / CPI / JTI / BA in any operand makes it a ROOT;
+    // otherwise it is base+index arithmetic → pointer iff the BASE (the
+    // X86::AddrBaseReg operand, operand 1) is pointer-derived. The IndexReg is
+    // deliberately NOT consulted as a base (an int index added to a ptr base is
+    // still rooted at the base, mirroring AArch64 ADDXrr base-only).
+    case X86::LEA64r:
+    case X86::LEA64_32r:
+    case X86::LEA32r:
+      if (hasFrameIndexAddr(*Def) || hasGlobalAddr(*Def))
+        return true;
+      return operandPtrDerived(1 + X86::AddrBaseReg);
+
+    // base + immediate offset: pointer iff base (op 1) is pointer-derived.
+    case X86::ADD64ri32:
+    case X86::ADD64ri8:
+      return operandPtrDerived(1);
+
+    // base + index register: pointer iff base (op 1) is pointer-derived.
+    case X86::ADD64rr:
+      return operandPtrDerived(1);
+
+    // base | imm / base | reg ONLY when ISel/DAGCombiner marked the OR as
+    // disjoint (an aligned pointer + small offset where the bits don't overlap,
+    // the X86 analogue of AArch64 ORRXri+disjoint). WITHOUT the disjoint flag
+    // the OR is a general bitwise op (tag | flag) — treating it as ptr
+    // arithmetic over-marks an int slot, so we MUST under-mark. Mirror of the
+    // AArch64 ORRXri rationale (sqlitepkg `0x3` bad-pointer abort).
+    case X86::OR64ri32:
+    case X86::OR64ri8:
+      if (Def->getFlag(MachineInstr::Disjoint))
+        return operandPtrDerived(1);
+      return false;
+    case X86::OR64rr:
+      if (Def->getFlag(MachineInstr::Disjoint))
+        return operandPtrDerived(1) || operandPtrDerived(2);
+      return false;
+
+    // Register moves preserve pointer-ness.
+    case X86::MOV64rr:
+    case X86::MOV32rr:
+      return operandPtrDerived(1);
+    case TargetOpcode::COPY:
+      return operandPtrDerived(1);
+    case TargetOpcode::SUBREG_TO_REG:
+    case TargetOpcode::INSERT_SUBREG:
+      return operandPtrDerived(2);
+    case TargetOpcode::EXTRACT_SUBREG:
+      return operandPtrDerived(1);
+
+    // CMOV of two pointer-derived values is still a pointer. X86 CMOVxx has the
+    // form `dst = CMOVcc t, f, cond`; operands 1 and 2 are the two values.
+    case X86::CMOV64rr:
+      return operandPtrDerived(1) && operandPtrDerived(2);
+
+    // PHI: pointer iff EVERY incoming value is pointer-derived (sound: a mixed
+    // phi of ptr/int is not safely a pointer).
+    case TargetOpcode::PHI: {
+      bool Any = false;
+      for (unsigned I = 1, E = Def->getNumOperands(); I + 1 < E; I += 2) {
+        const MachineOperand &MO = Def->getOperand(I);
+        if (!MO.isReg() || !MO.getReg().isVirtual())
+          return false;
+        if (!x86C2GoIsPtrDerived(MO.getReg(), MRI, Depth + 1, Seen))
+          return false;
+        Any = true;
+      }
+      return Any;
+    }
+
+    // Deliberately do NOT propagate through LOADs: the MIR / MMO carry no IR
+    // pointer-ness, so marking a loaded integer would be unsound. Under-marking
+    // here is SOUND — a loaded pointer kept live across a call is either
+    // re-materialized (caught above) or held in a clang `c2go.ptr.slot` alloca
+    // (caught by the lightweight stackmap alloca-tracking path). Mirror of the
+    // AArch64 header rationale.
+    default:
+      return false;
+    }
+  }; // end classifyDef lambda
+
+  // Multi-def: OR across defs (a split vreg whose chain leads back to a ptr
+  // root via at least one def holds a pointer for that interval).
+  for (MachineInstr *D : Defs)
+    if (classifyDef(D))
+      return true;
+  return false;
+}
+
+bool X86InstrInfo::isC2GoPointerDerivedReg(
+    Register Reg, const MachineRegisterInfo &MRI) const {
+  SmallSet<Register, 16> Seen;
+  return x86C2GoIsPtrDerived(Reg, MRI, 0, Seen);
+}
+
+// c2go GC Approach B (#330) #375 slice 3 / #426 (X86 port, #298): TII
+// tag-channel overrides routing target-independent StackColoring /
+// StackSlotColoring through X86MachineFunctionInfo. Mirror of AArch64InstrInfo.
+StringRef X86InstrInfo::getStackSlotTypeTag(const MachineFunction &MF,
+                                            int StackSlot) const {
+  const auto *MFI = MF.getInfo<X86MachineFunctionInfo>();
+  return MFI->getC2GoSpillSlotTag(StackSlot);
+}
+
+void X86InstrInfo::setStackSlotTypeTag(MachineFunction &MF, int StackSlot,
+                                       StringRef Tag) const {
+  auto *MFI = MF.getInfo<X86MachineFunctionInfo>();
+  MFI->setC2GoSpillSlotTag(StackSlot, Tag);
+}
+
 void X86InstrInfo::storeRegToStackSlot(
     MachineBasicBlock &MBB, MachineBasicBlock::iterator MI, Register SrcReg,
     bool isKill, int FrameIdx, const TargetRegisterClass *RC,
@@ -4805,6 +4991,26 @@ void X86InstrInfo::storeRegToStackSlot(
     addFrameReference(BuildMI(MBB, MI, DebugLoc(), get(Opc)), FrameIdx)
         .addReg(SrcReg, getKillRegState(isKill))
         .setMIFlag(Flags);
+
+  // c2go GC Approach B (#330) #426 (X86 port, #298): classify the spilled value
+  // and, when pointer-derived, tag the spill slot on X86MachineFunctionInfo so
+  // the M5 per-PC liveness pass / locals pointer bitmap mark it. Gated on the
+  // `c2go.goabi` module flag — non-c2go translation units are byte-identical.
+  // Physical SrcRegs (CSR spills, RegAllocFast, scavenger) return false from
+  // the derivation walk because x86C2GoIsPtrDerived early-exits on
+  // !Reg.isVirtual(). Mirror of AArch64InstrInfo.cpp.
+  if (MF.getFunction().getParent()->getModuleFlag(
+          llvm::c2go::kGoabiModuleFlag) &&
+      SrcReg.isVirtual() && isC2GoPointerDerivedReg(SrcReg, MF.getRegInfo())) {
+    auto *X86FI = const_cast<MachineFunction &>(MF).getInfo<X86MachineFunctionInfo>();
+    if (X86FI->getC2GoSpillSlotTag(FrameIdx).empty()) {
+      X86FI->setC2GoSpillSlotTag(FrameIdx, "ptr");
+      ++NumX86C2GoPtrSpillSlots;
+      LLVM_DEBUG(dbgs() << "x86-c2go-gc-B: tagged spill slot fi=" << FrameIdx
+                        << " ptr (from " << printReg(SrcReg) << ") in "
+                        << MF.getName() << '\n');
+    }
+  }
 }
 
 void X86InstrInfo::loadRegFromStackSlot(MachineBasicBlock &MBB,

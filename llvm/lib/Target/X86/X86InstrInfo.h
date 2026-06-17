@@ -470,6 +470,16 @@ public:
       bool isKill, int FrameIndex, const TargetRegisterClass *RC, Register VReg,
       MachineInstr::MIFlag Flags = MachineInstr::NoFlags) const override;
 
+  // c2go GC Approach B (#330) #375 slice 3 / #426 (X86 port, #298):
+  // target-independent StackColoring / StackSlotColoring consult per-slot
+  // type tags through TII. X86 routes both accessors through
+  // X86MachineFunctionInfo. The producer side is piggybacked onto
+  // storeRegToStackSlot. Mirror of AArch64InstrInfo.
+  StringRef getStackSlotTypeTag(const MachineFunction &MF,
+                                int StackSlot) const override;
+  void setStackSlotTypeTag(MachineFunction &MF, int StackSlot,
+                           StringRef Tag) const override;
+
   void loadRegFromStackSlot(
       MachineBasicBlock &MBB, MachineBasicBlock::iterator MI, Register DestReg,
       int FrameIndex, const TargetRegisterClass *RC, Register VReg,
@@ -694,6 +704,13 @@ protected:
                              int FI) const override;
 
 private:
+  // c2go GC Approach B (#330) #375 slice 5 / #426 (X86 port, #298): classify a
+  // virtual register as pointer-derived for stack-slot GC marking. Sole caller
+  // is storeRegToStackSlot() (the c2go-mode pointer-spill tag producer). Mirror
+  // of AArch64InstrInfo::isC2GoPointerDerivedReg (X86-opcode classifier).
+  bool isC2GoPointerDerivedReg(Register Reg,
+                               const MachineRegisterInfo &MRI) const;
+
   /// This is a helper for convertToThreeAddress for 8 and 16-bit instructions.
   /// We use 32-bit LEA to form 3-address code by promoting to a 32-bit
   /// super-register and then truncating back down to a 8/16-bit sub-register.

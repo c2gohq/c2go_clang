@@ -150,6 +150,13 @@ extern "C" LLVM_C_ABI void LLVMInitializeX86Target() {
   // `X86PassConfig::addPreEmitPass2`. Self-gated on the `c2go.goabi` module
   // flag — non-c2go builds skip the body on the first MF.
   initializeX86C2GoFrameMetaStagerPass(PR);
+
+  // c2go GC Approach B (#330) Milestone 5 (X86 port, #298): register the X86
+  // per-PC pointer-slot liveness pass (port of AArch64C2GoPtrSlotLiveness).
+  // Wired into `X86PassConfig::addPreEmitPass2`. Self-gated on the `c2go.goabi`
+  // module flag inside the pass — non-c2go builds skip the body on the first
+  // MF. Emergency off-switch: `-c2go-disable=ptrslot-liveness`.
+  initializeX86C2GoPtrSlotLivenessPass(PR);
 }
 
 static std::unique_ptr<TargetLoweringObjectFile> createTLOF(const Triple &TT) {
@@ -709,6 +716,21 @@ void X86PassConfig::addPreEmitPass2() {
   // `TEXT name(SB), NOSPLIT|NOFRAME, $0-M`. Self-gates on the c2go.goabi
   // Module flag inside the pass so non-c2go builds are byte-identical.
   addPass(createX86C2GoFrameMetaStagerPass());
+
+  // c2go GC Approach B (#330) Milestone 5 (X86 port, #298): per-PC liveness of
+  // pointer-tagged spill slots. Must run AFTER PEI (so spill MIs carry
+  // FixedStackPSV in their MMOs) and AFTER the outliner / BB-sections (MI
+  // pointers stable for the AsmPrinter lookup), which is precisely what
+  // addPreEmitPass2 guarantees.
+  //
+  // GATING. TargetPassConfig::addPreEmitPass2 has no Module access (the pass
+  // pipeline is per-target-machine, not per-module). The pass therefore
+  // self-gates inside runOnMachineFunction on (1) the `-c2go-disable=
+  // ptrslot-liveness` emergency switch and (2) the `c2go.goabi` Module flag.
+  // For non-c2go modules runOnMachineFunction returns false on the first MF.
+  // Mirror of AArch64PassConfig::addPreEmitPass2 — see
+  // X86C2GoPtrSlotLiveness.cpp for the soundness invariant.
+  addPass(createX86C2GoPtrSlotLivenessPass());
 }
 
 bool X86PassConfig::addPostFastRegAllocRewrite() {
