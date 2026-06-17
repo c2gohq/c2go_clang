@@ -357,7 +357,19 @@ bool isC2GoVariantUnion(const RecordDecl *RD) {
   const RecordDecl *Def = RD->getDefinition();
   if (!Def || !Def->isUnion())
     return false;
-  return Def->hasAttr<C2GoVariantAttr>();
+  // Explicit opt-in.
+  if (Def->hasAttr<C2GoVariantAttr>())
+    return true;
+  // §3.9 invariant (2026-06-17): only the c2go_variant (convert-to-struct)
+  // representation can coexist with managed semantics. A *managed* union —
+  // marked c2go_managed / c2go_struct explicitly, or stamped by managed
+  // push/pop propagation (AddPragmaC2GoAttribute step 2 adds C2GoStructAttr to
+  // any record holding a managed pointer) — is therefore always represented as
+  // a c2go_variant struct: case (b) shared pointer slot converts layout-
+  // preserving; case (c) type-punning converts with growth (replacing the old
+  // hard error). A pointer-free managed union degenerates to the same opaque
+  // slab, so no extra "has scan pointer" guard is needed.
+  return Def->hasAttr<C2GoStructAttr>() || Def->hasAttr<C2GoManagedAttr>();
 }
 
 bool isInsideC2GoVariantUnion(const RecordDecl *RD) {

@@ -19106,7 +19106,13 @@ bool Sema::analyzeC2GoStruct(RecordDecl *RD) {
   // precisely — there is no overlay, so the managed/unmanaged-mix warning and
   // the "pointer-to-c2go_struct inside a non-c2go_struct" warning below do not
   // apply (the converted struct gives the pointee a precisely-scanned slot).
-  const bool IsVariantUnion = RD->isUnion() && RD->hasAttr<C2GoVariantAttr>();
+  // §3.9 (2026-06-17): a *managed* union is also represented as a c2go_variant
+  // struct (the convert-to-struct path), so use the extended isC2GoVariantUnion
+  // — it covers explicit c2go_variant AND managed unions (c2go_managed /
+  // c2go_struct / push-pop propagation). This gates the fail-closed layout
+  // check below AND suppresses the now-false union-overlay / ptr-in-plain
+  // warnings for a union that will be precisely scanned after conversion.
+  const bool IsVariantUnion = c2go::isC2GoVariantUnion(RD);
 
   // §3.9 / T3b (soundness fail-closed): computeC2GoVariantLayout descends into
   // each alternative's NATURAL layout (nested structs and arrays), records
