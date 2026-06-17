@@ -6500,7 +6500,7 @@ static void handleC2GoManagedAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 // handleC2GoVariantAttr (§3.9 / T3): the convert-to-struct "variant container"
 // marker. Only meaningful on a union (it re-describes the union as a struct so
 // pointer slots can be GC-scanned precisely). Anything that is not a union ->
-// hard error, mirroring err_c2go_struct_union_type's style.
+// hard error (err_c2go_variant_not_union).
 static void handleC2GoVariantAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   const auto *RD = dyn_cast<RecordDecl>(D);
   if (!RD || !RD->isUnion()) {

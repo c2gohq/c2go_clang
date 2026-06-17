@@ -1396,8 +1396,8 @@ def C2GoStruct : InheritableAttr {
 // punning), which lets c2go convert it to a struct whose pointer slots can be
 // GC-scanned precisely (instead of the default force-scan that would trip Go's
 // `invalidptr` on a type-punned scalar). Only applicable to unions; the
-// union-only check is enforced in handleC2GoVariantAttr (SemaDeclAttr.cpp),
-// mirroring err_c2go_struct_union_type's style. Spelled `c2go_variant`
+// union-only check is enforced in handleC2GoVariantAttr (SemaDeclAttr.cpp,
+// err_c2go_variant_not_union). Spelled `c2go_variant`
 // (aligns with the c2go_<word> attribute family).
 def C2GoVariant : InheritableAttr {
   let Spellings = [GNU<"c2go_variant">, CXX11<"clang", "c2go_variant">];

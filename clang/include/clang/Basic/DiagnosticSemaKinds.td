@@ -2219,8 +2219,9 @@ def note_ivar_decl : Note<"instance variable is declared here">;
 def note_bitfield_decl : Note<"bit-field is declared here">;
 
 // c2go struct diagnostics
-def err_c2go_struct_union_type : Error<
-  "union %0 cannot be marked as c2go_struct -- only struct types are supported">;
+// (§3.9 2026-06-17: c2go_struct / c2go_managed on a *union* is now ACCEPTED —
+// a managed union is represented as a c2go_variant struct — so the former
+// "union cannot be marked c2go_struct" error has been removed.)
 def err_c2go_struct_packed : Error<
   "c2go_struct %0 cannot use the 'packed' attribute (Go has no packed layout)">;
 def err_c2go_struct_aligned : Error<
@@ -2229,7 +2230,8 @@ def err_c2go_struct_field_aligned : Error<
   "c2go_struct %0 cannot have member %1 with custom alignment attributes">;
 // c2go §3.9 / task T3: c2go_variant is the opt-in "variant container" marker;
 // the convert-to-struct representation only makes sense for a union (which can
-// hold one of several alternatives). Mirrors err_c2go_struct_union_type.
+// hold one of several alternatives); the union-only check is in
+// handleC2GoVariantAttr.
 def err_c2go_variant_not_union : Error<
   "%0 attribute can only be applied to a union type">;
 // c2go §3.9 / task T3b (soundness fail-closed): the convert-to-struct layout
