@@ -301,8 +301,8 @@ X86RegisterInfo::getCalleeSavedRegs(const MachineFunction *MF) const {
   // did not cover the real production root: the RBP bit in the mask.
   //
   // CC gate: only `CallingConv::GoABI0` callees get the flip. The
-  // leaf C2GoABIInternal CC (Wave X Track A, opt-in second gate
-  // `c2go.x86-leaf-abi`) keeps the default SysV SaveList — flipping it
+  // leaf C2GoABIInternal CC (Wave X Track A; flip gated only by
+  // `c2go.goabi`) keeps the default SysV SaveList — flipping it
   // here would break the precolored EBX/ECX register-passing locked
   // by `c2go-abiinternal-reglower.ll`. Its call-preserved mask IS
   // flipped below (Wave AL GPT round-2 Fix 3).

@@ -139,8 +139,8 @@ void X86AsmPrinter::emitFunctionEntryLabel() {
   // `emitLabel(CurrentFnSym)`. The streamer's emitLabel consults C2GoFnMeta
   // to decide whether to emit a Stage-1 `TEXT … $framesize-argsize` directive
   // (NOSPLIT|NOFRAME, $0-M for the strict-leaf X86 path) or fall back to the
-  // Stage-4 TU-local `NOFRAME, $0` (the current X86 production behaviour
-  // until the second `c2go.x86-leaf-abi` gate flips ON for a function).
+  // Stage-4 TU-local `NOFRAME, $0` (used for functions the leaf-ABI pass did
+  // not flip; the leaf CC flip is gated only by `c2go.goabi`).
   //
   // Mirrors `AArch64AsmPrinter::emitFunctionEntryLabel` (#376 plumbing). The
   // publish must precede the label emission — otherwise Stage 1 misses and

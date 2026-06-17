@@ -54,10 +54,8 @@ bool isManagedPointerType(QualType Ty);
 /// explicit marker a raw pointer field defaults to "managed" only when the
 /// surrounding record itself is a c2go record (has C2GoStructAttr) — that
 /// matches the existing pipeline default that pointer-typed fields inside a
-/// c2go-tracked record are GC-traced. For an *unmarked* outer record we
-/// conservatively treat unannotated pointers as managed too, because the only
-/// caller that asks the question for an unmarked record is
-/// AddPragmaC2GoAttribute, which is about to consider attaching the attr.
+/// c2go-tracked record are GC-traced. v15: a bare unannotated pointer in an
+/// *unmarked* outer record defaults to UNMANAGED.
 bool recordContainsManagedPointer(const RecordDecl *RD);
 
 /// c2go §A4 — automatic scheme classification for a `union` record.
@@ -75,13 +73,13 @@ bool recordContainsManagedPointer(const RecordDecl *RD);
 ///     storage with a one-word GC bitmap bit set at offset N. The Go side
 ///     sees a typed pointer slot the GC can scan without ambiguity.
 ///
-///   * Scheme2 ("any-subtype translation"): managed pointers coexist with
-///     scalars at the same offset, or live at multiple distinct offsets.
-///     The static-bitmap encoding cannot represent this — Scheme2 needs an
-///     IR-level rewrite to box each alternative as a Go-side interface so
-///     the runtime carries a per-instance tag. The rewrite is staged for a
-///     later phase; today we report Scheme2 and the caller emits a
-///     diagnostic + falls back to an unscannable (zero-bit) bitmap.
+///   * Scheme2 ("type-punned pointer slot"): a scanned pointer coexists with
+///     scalars at the same offset, or scanned pointers live at multiple
+///     distinct offsets. The static-bitmap encoding cannot represent this.
+///     There is no boxing / zero-bit fallback — the boxing scaffolding was
+///     deleted. We report Scheme2 and the caller hard-errors (instructing
+///     the user to give the pointer its own pure slot, change the punned
+///     member to uintptr_t, or mark the union `__attribute__((c2go_variant))`).
 ///
 ///   * NotApplicable: \p UnionRD is not a union, or it contains no managed
 ///     pointer alternative (a pure-scalar union needs no special treatment;

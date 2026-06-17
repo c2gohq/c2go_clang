@@ -405,8 +405,10 @@ bool llvm::c2go::runC2GoLeafCCFlip(Module &M,
   // other module the convention is meaningless and must not be applied.
   if (M.getModuleFlag(llvm::c2go::kGoabiModuleFlag) == nullptr)
     return false;
-  // Optional second gate (X86 uses `c2go.x86-leaf-abi`, default OFF, until
-  // #298 main lands real `CC_X86_64_C2GoABIInternal` lowering).
+  // Optional second gate: a target may pass a non-empty ExtraGate module-flag
+  // name to require it in addition to c2go.goabi. (X86's leaf flip no longer
+  // uses a second gate — it passes ExtraGate="" — now that #298 landed the
+  // real CC_X86_64_C2GoABIInternal lowering.)
   if (!ExtraGate.empty() && M.getModuleFlag(ExtraGate) == nullptr)
     return false;
 

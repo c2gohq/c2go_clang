@@ -108,7 +108,7 @@ public:
     initializeX86C2GoLeafABIPass(*PassRegistry::getPassRegistry());
   }
   StringRef getPassName() const override {
-    return "X86 c2go leaf c2go-ABIInternal optimization (port skeleton)";
+    return "X86 c2go leaf c2go-ABIInternal optimization";
   }
   bool runOnModule(Module &M) override {
     return runX86C2GoLeafABIOnModule(M);
@@ -120,7 +120,7 @@ public:
 char X86C2GoLeafABI::ID = 0;
 
 INITIALIZE_PASS(X86C2GoLeafABI, "x86-c2go-leaf-abi",
-                "X86 c2go leaf c2go-ABIInternal optimization (port skeleton)",
+                "X86 c2go leaf c2go-ABIInternal optimization",
                 false, false)
 
 ModulePass *llvm::createX86C2GoLeafABIPass() { return new X86C2GoLeafABI(); }

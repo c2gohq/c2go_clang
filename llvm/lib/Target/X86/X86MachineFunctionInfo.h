@@ -189,11 +189,11 @@ class X86MachineFunctionInfo : public MachineFunctionInfo {
   /// the consumer-side hook) and republished into MCPlan9AsmStreamer by
   /// `X86AsmPrinter::emitFunctionEntryLabel`. When this is `std::nullopt`,
   /// the streamer's `emitLabel` falls through to the Stage-4 TU-local
-  /// `NOFRAME, $0` fallback — which is the current production behaviour
-  /// for every X86 function (the second `c2go.x86-leaf-abi` gate is OFF
-  /// by default and no X86 producer stages metadata yet). Once the
-  /// producer is wired (mirror of `AArch64::C2GoFrameEmitter`), Stage 1
-  /// `NOSPLIT|NOFRAME, $0-M` becomes reachable.
+  /// `NOFRAME, $0` fallback — used for functions the leaf-ABI producer did
+  /// not stage metadata for. When the producer (mirror of
+  /// `AArch64::C2GoFrameEmitter`) stages metadata, Stage 1
+  /// `NOSPLIT|NOFRAME, $0-M` is emitted. The leaf CC flip is gated only by
+  /// `c2go.goabi`.
   std::optional<C2GoFunctionMetadata> C2GoStagedMeta;
 
   /// c2go #298 Wave AB.1 — X86 mirror of `AArch64FunctionInfo::

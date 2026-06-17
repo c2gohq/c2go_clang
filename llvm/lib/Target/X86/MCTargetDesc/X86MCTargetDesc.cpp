@@ -482,7 +482,7 @@ static MCInstPrinter *createX86MCInstPrinter(const Triple &T,
     // Selected via OutputAsmVariant=2 in MCTargetOptions, set by clang's
     // `-fc2go-emit-plan9-asm` (target-agnostic plumbing already in place
     // from the AArch64 path). Production X86 builds keep this branch
-    // unreached unless the per-module `c2go.x86-leaf-abi` flag is ON.
+    // unreached unless the per-module `c2go.goabi` flag is ON.
     return new X86Plan9InstPrinter(MAI, MII, MRI);
   return nullptr;
 }

@@ -7,15 +7,15 @@
 //===----------------------------------------------------------------------===//
 //
 // Plan 9 (Go assembler) syntax InstPrinter for X86 / X86_64. Emits text that
-// `go tool asm` (cmd/internal/obj/x86) can ingest. Wave Y Track A — *skeleton
-// only*: the class declaration + an `MCPlan9SymbolicPrinter` overrider so the
-// generic `MCPlan9AsmStreamer` (llvm/lib/MC/MCPlan9AsmStreamer.cpp) can pick
-// this up via `MCInstPrinter::getPlan9SymbolicPrinter()`. The real mnemonic /
-// operand translation lives in Wave Y Track C (X86Plan9InstPrinter.cpp).
+// `go tool asm` (cmd/internal/obj/x86) can ingest. The class declaration +
+// an `MCPlan9SymbolicPrinter` overrider let the generic `MCPlan9AsmStreamer`
+// (llvm/lib/MC/MCPlan9AsmStreamer.cpp) pick this up via
+// `MCInstPrinter::getPlan9SymbolicPrinter()`. The mnemonic / operand
+// translation is implemented in X86Plan9InstPrinter.cpp.
 //
 //===----------------------------------------------------------------------===//
 //
-// === Design summary (Wave Y Track A) ===
+// === Design summary ===
 //
 // 1.  ARCHITECTURE MIRRORS AArch64
 //
@@ -37,48 +37,20 @@
 //
 //     X86 mirrors the same shape — see `X86Plan9InstPrinter` below.
 //
-// 2.  INTEGRATION POINT IN X86 BACKEND (read-only inventory; Wave Y Track C
-//     does the actual wiring)
+// 2.  INTEGRATION POINTS IN X86 BACKEND (implemented; mirrors AArch64)
 //
 //     a. Registration in `createX86MCInstPrinter`
-//        (llvm/lib/Target/X86/MCTargetDesc/X86MCTargetDesc.cpp:470):
-//          if (SyntaxVariant == 2)
-//            return new X86Plan9InstPrinter(MAI, MII, MRI);
-//        Currently variant 2 returns `nullptr`, which the generic streamer
-//        bootstrap (CodeGenTargetMachineImpl.cpp:206) reports as a clear
-//        error ("Plan 9 InstPrinter ... not registered for this target").
+//        (X86MCTargetDesc.cpp): variant 2 returns `X86Plan9InstPrinter`.
+//     b. `X86AsmPrinter::emitFunctionEntryLabel()` republishes per-function
+//        metadata from `X86MachineFunctionInfo` into the Plan 9 streamer
+//        (Stage-1 dispatch keyed by mangled name).
+//     c. `X86AsmPrinter::LowerSTACKMAP` / `LowerSTATEPOINT` forward
+//        Direct(SP,N) / Indirect(SP/FP,N) entries to the Plan 9 streamer.
+//     d. `X86AsmPrinter::emitEndOfAsmFile` early-returns for the Plan 9
+//        streamer so object-format finalization is skipped.
 //
-//     b. `X86AsmPrinter::emitFunctionEntryLabel()` — X86 does NOT override
-//        this today (it inherits AsmPrinter's default). Track C will add an
-//        override that republishes per-function metadata from
-//        `X86MachineFunctionInfo` into `MCPlan9AsmStreamer::C2GoFnMeta` (the
-//        Stage-1 dispatch keyed by mangled name), mirroring
-//        `AArch64AsmPrinter::emitFunctionEntryLabel()`
-//        (AArch64AsmPrinter.cpp:1496).
-//
-//     c. `X86AsmPrinter::LowerSTACKMAP` (X86MCInstLower.cpp:1022) — currently
-//        only records the binary stackmap section. Track C adds a Plan-9
-//        branch that mirrors AArch64AsmPrinter::LowerSTACKMAP
-//        (AArch64AsmPrinter.cpp:1905-1931): harvests Direct(SP,N) entries
-//        from `SM.getCSInfos().back()` and forwards them to
-//        `MCPlan9AsmStreamer::recordC2GoStackmapSite`.
-//
-//     d. `X86AsmPrinter::LowerSTATEPOINT` (X86MCInstLower.cpp:786) — Plan-9
-//        branch added by Track C mirrors AArch64's path (AArch64AsmPrinter
-//        .cpp:2200-2300): Indirect(SP/FP,N) marked whole, Direct(SP,N) goes
-//        through `c2goExpandDirectAllocaFields`; locations FP-rebased to SP
-//        (FPoff − 8) before recording.
-//
-//     e. `X86AsmPrinter::emitEndOfAsmFile` (X86AsmPrinter.cpp:1020) — needs
-//        the same `OutStreamer->isPlan9AsmStreamer()` early-return that
-//        AArch64 has (AArch64AsmPrinter.cpp:1049), so the object-format
-//        finalization (Mach-O `__auth_ptr` / `emitSubsectionsViaSymbols`,
-//        COFF `Imp_Call_V1`, ELF fault-map) is skipped — none of it has a
-//        Plan 9 equivalent.
-//
-//     The above five sites are the entire X86-side wiring. The publishing
-//     side (clang manifest → `MCPlan9AsmStreamer::enqueueC2GoBoundary`) is
-//     target-agnostic and already in place.
+//     The publishing side (clang manifest →
+//     `MCPlan9AsmStreamer::enqueueC2GoBoundary`) is target-agnostic.
 //
 // 3.  PLAN 9 X86_64 SYNTAX RULES (Go obj/x86 — reference for Track C
 //     mnemonic mapping; tabulated from the abitest_amd64 baseline, see
@@ -111,38 +83,20 @@
 //     f. 128-bit moves are `MOVUPS X0, mem` (unaligned 16) or `MOVQ X0, mem`
 //        (low 64 only). Float→int64 trunc is `CVTTSD2SQ` not `FCVTZSD`.
 //
-// 4.  WAVE Y TRACK C SCOPE (deferred from this skeleton)
-//
-//     • Real `tryPrintInst` mnemonic table — start with the call/branch
-//       family (CALL64pcrel32, CALL64r, JMP_*, JCC_1, RET) + SP-relative
-//       LEA/MOV/MOVUPS, since those are the bare minimum to make a NOSPLIT
-//       leaf function syntactically valid Plan 9 output.
-//     • Register name printer (`X86Plan9InstPrinter::printRegName`) — bare
-//       reg names without the AT&T `%` prefix; tblgen-generated
-//       `X86ATTInstPrinter::getRegisterName` returns names *with* `%` so
-//       Track C will need a separate static table (or a string-strip).
-//     • Symbol-bearing instruction handling — LEAQ / MOV with
-//       MCSymbolRefExpr operands must emit `·sym(SB)` / `$·sym(SB)` style.
-//     • Branch-target formatting helper analogous to
-//       `AArch64Plan9InstPrinter::formatBranchTarget`.
-//     • Wire-up in `createX86MCInstPrinter` (variant 2 branch).
-//     • Wire-up of the five X86AsmPrinter integration points (3.a–e above).
-//
-// 5.  GATE
+// 4.  GATE
 //
 //     The X86 Plan-9 streamer is reached only when:
 //       i)  `OutputAsmVariant == 2` (set by clang `-fc2go-emit-plan9-asm`),
 //      ii)  the per-Plan9 codegen TM is in use,
 //     iii)  `c2go.goabi` module flag is ON (foundation gate; required for
-//           any c2go behavior),
-//      iv)  `c2go.x86-leaf-abi` module flag is ON (the X86-specific
-//           opt-in gate — currently default-OFF; see
-//           `X86C2GoLeafABI.h` + `X86C2GoLeafABI.cpp`).
+//           any c2go behavior — also gates the leaf CC flip, mirroring
+//           AArch64; the former second gate `c2go.x86-leaf-abi` was
+//           removed, see `X86C2GoLeafABI.cpp`).
 //
-//     With (iv) OFF (production default) NO X86 function is flipped to
+//     With `c2go.goabi` OFF NO X86 function is flipped to
 //     `c2goabiinternalcc`, so even if a streamer is constructed the only
 //     functions emitted are ABI0/SysV — Plan 9 syntax is still correct,
-//     just no register optimization. Track C does NOT touch the gate.
+//     just no register optimization.
 //
 //===----------------------------------------------------------------------===//
 
@@ -165,13 +119,11 @@ class MCExpr;
 /// both) and `MCPlan9SymbolicPrinter` so the generic MCPlan9AsmStreamer
 /// can call `tryPrintInst` through the same interface used by AArch64.
 ///
-/// SKELETON ONLY (Wave Y Track A) — every `tryPrint*` returns false in
-/// the .cpp drop coming with Track C until Track C fills the mnemonic
-/// table. Until then the streamer falls through to its raw-byte WORD
-/// fallback for every X86 instruction (which will hit PLAN9-ERROR for
-/// any symbol-bearing inst — by design; production X86 Plan 9 emission
-/// is gated OFF by `c2go.x86-leaf-abi` so this is unreachable in
-/// clang/c2go-lto's default path).
+/// The `tryPrint*` mnemonic table is implemented in the .cpp. Instructions
+/// not covered fall through to the streamer's raw-byte WORD fallback (which
+/// hits PLAN9-ERROR for any symbol-bearing inst). X86 Plan 9 emission is
+/// gated by `c2go.goabi`, so this is unreachable in clang/c2go-lto's
+/// default path.
 class X86Plan9InstPrinter : public X86InstPrinterCommon,
                             public MCPlan9SymbolicPrinter {
 public:

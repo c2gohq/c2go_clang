@@ -68,7 +68,6 @@ namespace {
 // We only emit Struct here; nested fields don't carry their own typeinfo
 // (Go's runtime only consults the top-level `_type` for typedmemmove).
 enum class GoKind : uint8_t {
-  Invalid = 0,
   Struct = 25,
 };
 

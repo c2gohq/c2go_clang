@@ -513,8 +513,8 @@ def RetCC_X86 : CallingConv<[
 
   // c2go #298 / Wave X Track A: private C2GoABIInternal register-passing
   // convention for x86-64 only (Go runtime ABIInternal mirror). Reachable
-  // only on x86-64 modules whose `c2go.goabi` + `c2go.x86-leaf-abi` gates
-  // are both ON AND a c2go pass has flipped eligible callees' CC. The
+  // only on x86-64 modules whose `c2go.goabi` gate is ON AND a c2go pass
+  // has flipped eligible callees' CC. The
   // table itself is hand-written in X86CallingConv.cpp (aggregate
   // "all-or-nothing" rule is not expressible in CCIfConsecutiveRegs alone;
   // mirror of AArch64 design). i386 falls through to the SysV path.

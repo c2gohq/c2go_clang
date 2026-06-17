@@ -197,11 +197,11 @@ struct UnionAlt {
 // Collect alternatives for a record at base offset `BaseOff`. For unions
 // this means every direct field (each at BaseOff + 0); for structs that
 // appear as anonymous-struct alternatives this means each field at
-// BaseOff + field-relative-offset. The parent's c2go-managed default
-// (`ParentIsC2Go`) determines whether unannotated raw pointers count as
-// managed.
+// BaseOff + field-relative-offset. (2026-06-16: the managed/unmanaged
+// distinction no longer affects union slot classification — both scan —
+// so no parent-world default is threaded.)
 static void collectAlternatives(const RecordDecl *RD, uint64_t BaseOff,
-                                bool ParentIsC2Go, const ASTContext &Ctx,
+                                const ASTContext &Ctx,
                                 llvm::SmallVectorImpl<UnionAlt> &Out) {
   if (!RD)
     return;
@@ -245,7 +245,6 @@ static void collectAlternatives(const RecordDecl *RD, uint64_t BaseOff,
       // classification for unions — both scan.
       AltKind K =
           Peeled->isFunctionPointerType() ? AltKind::FuncPtr : AltKind::ScanPtr;
-      (void)ParentIsC2Go;
       uint64_t Sz = Ctx.getTypeSizeInChars(FT).getQuantity();
       Out.push_back({FieldOff, Sz, K, std::move(FName)});
       continue;
@@ -260,7 +259,7 @@ static void collectAlternatives(const RecordDecl *RD, uint64_t BaseOff,
         // int tag; Node *p; } tab; ... }` — without descent we would
         // treat `tab` as one big scalar and erase the pointer-at-offset
         // information that scheme1 needs.
-        collectAlternatives(Inner, FieldOff, ParentIsC2Go, Ctx, Out);
+        collectAlternatives(Inner, FieldOff, Ctx, Out);
         continue;
       }
       // Nested union or array-of-record: treat as a scalar blob covering
@@ -286,15 +285,8 @@ C2GoUnionClassification classifyC2GoUnion(const RecordDecl *UnionRD,
   if (!UnionRD || !UnionRD->isUnion())
     return Result; // NotApplicable
 
-  // Determine the c2go-managed default for this union's pointer fields.
-  // A union that carries C2GoStructAttr (explicitly or via #pragma c2go
-  // push) makes raw pointers managed by default; everywhere else, the
-  // pointer-in-union is unmanaged unless individually annotated. This
-  // mirrors the field-world resolution used by CGC2GoTypeInfo.
-  const bool ParentIsC2Go = UnionRD->hasAttr<C2GoStructAttr>();
-
   llvm::SmallVector<UnionAlt, 16> Alts;
-  collectAlternatives(UnionRD, /*BaseOff=*/0, ParentIsC2Go, Ctx, Alts);
+  collectAlternatives(UnionRD, /*BaseOff=*/0, Ctx, Alts);
 
   // Partition by AltKind and collect offsets. 2026-06-16: a scan-pointer
   // alternative (managed OR unmanaged data ptr) contributes a scan offset;

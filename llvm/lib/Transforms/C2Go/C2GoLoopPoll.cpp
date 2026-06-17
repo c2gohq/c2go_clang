@@ -151,9 +151,9 @@ static uint64_t computeM(Loop &L, ScalarEvolution &SE,
   else
     M = uint64_t(Raw);
   // Round down to the nearest power of two so we can use `cnt & (M-1)`.
+  // M is always >= 1 here (the branches above set M to 1, kMaxM, or
+  // uint64_t(Raw) with Raw > 1.0, and `1ULL << Log2_64(M)` preserves >= 1).
   M = 1ULL << Log2_64(M);
-  if (M == 0)
-    M = 1;
 
   // If trip count is known and < M, no point inserting — the counter would
   // never trip. Fall back to kFallbackM for unknown trip counts (the design
@@ -167,9 +167,8 @@ static uint64_t computeM(Loop &L, ScalarEvolution &SE,
     // one. This keeps the period bounded for hot pure-arith loops where
     // SCEV can't see the exit count.
     M = std::min(M, kFallbackM);
+    // M stays >= 1 (kFallbackM is 1024 and the incoming M is >= 1).
     M = 1ULL << Log2_64(M);
-    if (M == 0)
-      M = 1;
   }
   return M;
 }
