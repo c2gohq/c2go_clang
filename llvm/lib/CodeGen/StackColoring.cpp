@@ -60,6 +60,7 @@
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/C2Go/C2GoGCMaskUtils.h"
 #include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include <algorithm>
 #include <cassert>
@@ -204,6 +205,23 @@ static bool isC2GoPtrBearingSlot(const MachineFrameInfo *MFI, int Slot,
   return aggregateHasPointerField(Ty, DL);
 }
 
+// c2go #492 (A3): collect the slot's pointer-word byte offsets via the SAME
+// canonical walker (`c2go::walkPointerFields`) that C2GoSafepoint /
+// C2GoGCSetup / the target FrameEmitter use to build the per-PC locals
+// bitmap. Reusing the shared header-only walker (no link dependency)
+// guarantees the offsets compared here are byte-for-byte what the stackmap
+// actually emits. Empty for spill slots (no alloca) — those are handled by
+// the tag channel, not by this aggregate path.
+static void collectC2GoSlotPtrOffsets(const MachineFrameInfo *MFI, int Slot,
+                                      const DataLayout &DL,
+                                      SmallVectorImpl<uint64_t> &Out) {
+  const AllocaInst *AI = MFI->getObjectAllocation(Slot);
+  if (!AI)
+    return;
+  llvm::c2go::walkPointerFields(AI->getAllocatedType(), /*Base=*/0, DL,
+                                [&](uint64_t Off) { Out.push_back(Off); });
+}
+
 static bool areC2GoSlotsCompatibleForMerge(const MachineFunction *MF,
                                            const MachineFrameInfo *MFI,
                                            int SlotA, int SlotB) {
@@ -219,9 +237,27 @@ static bool areC2GoSlotsCompatibleForMerge(const MachineFunction *MF,
   // them). Gated so non-c2go targets see zero change.
   if (isC2GoMode(MF)) {
     const DataLayout &DL = MF->getFunction().getParent()->getDataLayout();
-    if (isC2GoPtrBearingSlot(MFI, SlotA, DL) !=
-        isC2GoPtrBearingSlot(MFI, SlotB, DL))
+    bool PA = isC2GoPtrBearingSlot(MFI, SlotA, DL);
+    bool PB = isC2GoPtrBearingSlot(MFI, SlotB, DL);
+    if (PA != PB)
       return false;
+
+    // #492 (A3): two pointer-bearing slots may only merge if their pointer-
+    // word offset LAYOUTS are identical. After merge the combined slot is
+    // described by a SINGLE per-PC bitmap (derived from one slot's layout);
+    // merging e.g. `{ptr,int}` with `{int,ptr}` would mark a scalar word as a
+    // pointer (over-mark → copystack/GC reads garbage as a root) or miss a
+    // real pointer at the other slot's offset. The #305 boolean check above
+    // only catches ptr-vs-non-ptr; this catches ptr-vs-ptr-different-layout.
+    // `walkPointerFields` visits offsets in a canonical ascending order, so
+    // the two vectors are directly comparable.
+    if (PA && PB) {
+      SmallVector<uint64_t, 8> OffsA, OffsB;
+      collectC2GoSlotPtrOffsets(MFI, SlotA, DL, OffsA);
+      collectC2GoSlotPtrOffsets(MFI, SlotB, DL, OffsB);
+      if (OffsA != OffsB)
+        return false;
+    }
   }
   return true;
 }
