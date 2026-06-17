@@ -2380,9 +2380,10 @@ def err_c2go_managed_cross_type : Error<
 // alternative is live). Warn so the user either splits the union, pins
 // the pointee, or annotates fields with c2go_unmanaged.
 def warn_c2go_managed_union_overlay : Warning<
-  "union %0 mixes c2go_managed and unmanaged fields without "
-  "c2go_union_scheme1 / c2go_union_scheme2 attribute; "
-  "GC treats the storage as unmanaged (no relocation)">,
+  "union %0 mixes c2go_managed and unmanaged fields; the GC treats the "
+  "storage as unmanaged (no relocation). Mark the union "
+  "'__attribute__((c2go_variant))' to convert it to a scanned struct, split "
+  "the alternatives, or annotate fields with c2go_unmanaged">,
   InGroup<C2GoManagedOverlay>;
 // c2go #472 (Wave J): storing &local (address of an automatic / parameter
 // variable in the current function) into a c2go-managed heap-rooted
