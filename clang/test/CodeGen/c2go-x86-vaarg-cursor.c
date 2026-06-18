@@ -1,0 +1,73 @@
+// X86 GoABI0 va_arg callee-side lowering.
+//
+// In c2go mode, va_list (`ap`) is a void* holding a void** cursor over the
+// caller-packed `void* argptrs[]`, so va_arg(ap, T) == *(T*)(*ap++). The X86
+// lowering must produce this cursor shape rather than falling back to the SysV
+// register-save-area machinery, whose gp_offset / overflow_arg_area /
+// reg_save_area reads would misinterpret the cursor. (The va_list storage type
+// may stay __va_list_tag; only its interpretation as a cursor slot is
+// load-bearing.) The SysV walk is locked out via --implicit-check-not, and the
+// AArch64 lowering must produce the same shape for parity.
+//
+// REQUIRES: x86-registered-target
+//
+// RUN: %clang_cc1 -triple x86_64-unknown-none-goabi -fc2go -std=c2go23 \
+// RUN:   -emit-llvm -o - %s | FileCheck %s \
+// RUN:   --implicit-check-not=gp_offset \
+// RUN:   --implicit-check-not=overflow_arg_area \
+// RUN:   --implicit-check-not=reg_save_area \
+// RUN:   --implicit-check-not=llvm.va_start \
+// RUN:   --implicit-check-not=llvm.va_end
+//
+// Parity: the AArch64 lowering must produce the same cursor shape.
+// RUN: %clang_cc1 -triple aarch64-unknown-none-goabi -fc2go -std=c2go23 \
+// RUN:   -emit-llvm -o - %s | FileCheck %s \
+// RUN:   --implicit-check-not=llvm.va_start \
+// RUN:   --implicit-check-not=llvm.va_end
+
+#include <stdarg.h>
+
+static long g;
+
+// CHECK order: my_config is static, so clang defers its emission until after
+// the referencing non-static test_entry. The CHECK blocks below follow IR
+// emission order (test_entry, then my_config), not source order.
+
+// Caller side packs one argptr slot per vararg (locked here so caller/callee
+// stay in lockstep).
+// CHECK-LABEL: define{{.*}} goabi0cc i64 @test_entry()
+// CHECK: call goabi0cc void @my_config(i32 noundef 4, ptr noundef %c2go.va.argptrs)
+
+// Callee side: va_start binds the synthetic `void** __c2go_va` cursor
+// parameter; each va_arg loads the cursor, loads the argptr, advances
+// the cursor, then loads the value.
+// CHECK-LABEL: define{{.*}} goabi0cc void @my_config(i32 noundef %op, ptr noundef %__c2go_va)
+// CHECK: %c2go.va.base = load ptr, ptr %__c2go_va.addr
+// CHECK: store ptr %c2go.va.base,
+//
+// va_arg(ap, void*):
+// CHECK: %c2go.va.cur = load ptr,
+// CHECK: %c2go.va.argp = load ptr, ptr %c2go.va.cur
+// CHECK: %c2go.va.next = getelementptr inbounds ptr, ptr %c2go.va.cur, i64 1
+// CHECK: load ptr, ptr %c2go.va.argp
+//
+// va_arg(ap, long):
+// CHECK: %c2go.va.cur{{[0-9]+}} = load ptr,
+// CHECK: %c2go.va.argp{{[0-9]+}} = load ptr, ptr %c2go.va.cur
+// CHECK: load i64, ptr %c2go.va.argp
+
+static void my_config(int op, ...) {
+  va_list ap;
+  va_start(ap, op);
+  if (op == 4) {
+    void *p = va_arg(ap, void *);
+    long l = va_arg(ap, long);
+    g = (long)p + l;
+  }
+  va_end(ap);
+}
+
+long test_entry(void) {
+  my_config(4, (void *)0x10, 32L);
+  return g;
+}

@@ -1,4 +1,4 @@
-//===- C2GoBackendKnobsX86Test.cpp - X86 c2go BackendConfig hook smoke ---===//
+//===- C2GoBackendKnobsX86Test.cpp - X86 c2go BackendConfig hook ---------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -6,18 +6,15 @@
 //
 //===---------------------------------------------------------------------===//
 //
-// c2go #298 / #435: smoke-test that `LLVMInitializeX86Target` registers an
-// `applyX86C2GoConfig` hook for Triple::x86 + Triple::x86_64, so the
-// arch-neutral `llvm::c2go::applyC2GoBackendConfig(TM, Cfg)` dispatcher
-// resolves to a real applier on X86 instead of silently falling through as
-// "no applier for this arch".
+// Verify that LLVMInitializeX86Target registers an X86 c2go BackendConfig
+// applier for both Triple::x86 and Triple::x86_64, so the arch-neutral
+// llvm::c2go::applyC2GoBackendConfig dispatcher resolves to a real applier
+// on X86 rather than falling through as "no applier for this arch".
 //
-// Wave W Track B: the production applier is no longer a no-op — it writes
-// the 3 booleans into the per-TM `C2Go*` fields (mirror of
-// `applyAArch64C2GoConfig`). Tests (1) and (2) still spy the dispatcher
-// path; the new test (3) replaces the prior "default applier is noop"
-// observation with a direct `WritesX86TMFields` check that exercises the
-// production applier and reads back each field via the X86 subclass.
+// The production applier writes the calling-convention knob booleans into
+// the per-TargetMachine C2Go* fields. The first two tests spy the dispatch
+// path; the third exercises the production applier directly and reads back
+// each field via the X86TargetMachine subclass.
 //
 //===---------------------------------------------------------------------===//
 
@@ -45,16 +42,16 @@ static std::unique_ptr<TargetMachine> createX86TM(const char *TripleStr) {
       CodeGenOptLevel::Default));
 }
 
-// Spy state — incremented every time SpyApplier is dispatched. Static
-// because `ApplyC2GoConfigFn` is a plain C-style function pointer.
+// Spy state, bumped each time SpyApplier is dispatched. Static because the
+// hook is a plain C-style function pointer.
 static unsigned SpyHitCount = 0;
 static c2go::BackendConfig SpyLastCfg{};
 
 static void SpyApplier(TargetMachine *TM, const c2go::BackendConfig &Cfg) {
   ++SpyHitCount;
   SpyLastCfg = Cfg;
-  // Sanity: dispatcher should only route to us when the arch matches the key
-  // we registered against.
+  // The dispatcher must only route here when the arch matches the registered
+  // key.
   ASSERT_TRUE(TM != nullptr);
   ASSERT_TRUE(TM->getTargetTriple().isX86());
 }
@@ -70,8 +67,8 @@ protected:
   }
 };
 
-// (1) x86_64 hook resolves and dispatches. Default-registered applier is a
-// no-op, so we re-register a spy to observe the dispatch.
+// The x86_64 hook resolves and dispatches; a spy applier is registered to
+// observe the routed config.
 TEST_F(C2GoBackendKnobsX86Test, DispatchesOnX86_64) {
   auto TM = createX86TM("x86_64-unknown-linux");
   ASSERT_TRUE(TM) << "x86_64 TargetMachine lookup failed";
@@ -89,8 +86,8 @@ TEST_F(C2GoBackendKnobsX86Test, DispatchesOnX86_64) {
   EXPECT_TRUE(SpyLastCfg.DisableGlobalMerge);
 }
 
-// (2) i386 (32-bit) hook resolves and dispatches — exercises the second
-// registration in `LLVMInitializeX86Target`.
+// The i386 (32-bit) hook resolves and dispatches, exercising the second
+// registration in LLVMInitializeX86Target.
 TEST_F(C2GoBackendKnobsX86Test, DispatchesOnI386) {
   auto TM = createX86TM("i386-unknown-linux");
   ASSERT_TRUE(TM) << "i386 TargetMachine lookup failed";
@@ -108,20 +105,20 @@ TEST_F(C2GoBackendKnobsX86Test, DispatchesOnI386) {
   EXPECT_FALSE(SpyLastCfg.DisableGlobalMerge);
 }
 
-// (3) Wave W Track B: production applier writes each Cfg bool into the
-// per-TM `C2Go*` field. Verifies the real consumer wiring is live — a
-// regression that left the applier as a (void)Cfg no-op would fail here.
+// The production applier writes each config bool into the per-TargetMachine
+// C2Go* field. Pins the real consumer wiring: a regression that left the
+// applier as a (void)Cfg no-op would fail here.
 TEST_F(C2GoBackendKnobsX86Test, WritesX86TMFields) {
   auto TM = createX86TM("x86_64-unknown-linux");
   ASSERT_TRUE(TM);
   auto *X86TM = static_cast<X86TargetMachine *>(TM.get());
 
-  // Default state — every field must be false before any apply.
+  // Every field must be false before any apply.
   EXPECT_FALSE(X86TM->C2GoForceBlockAddressJumpTable);
   EXPECT_FALSE(X86TM->C2GoDisableRegisterCoalescing);
   EXPECT_FALSE(X86TM->C2GoDisableGlobalMerge);
 
-  // Don't re-register the spy — exercise the production applier directly.
+  // No spy registered, so this exercises the production applier directly.
   c2go::BackendConfig Cfg{/*ForceBlockAddressJumpTable=*/true,
                           /*DisableRegisterCoalescing=*/true,
                           /*DisableGlobalMerge=*/true};
@@ -133,7 +130,7 @@ TEST_F(C2GoBackendKnobsX86Test, WritesX86TMFields) {
   EXPECT_TRUE(X86TM->C2GoDisableRegisterCoalescing);
   EXPECT_TRUE(X86TM->C2GoDisableGlobalMerge);
 
-  // Flip back — applier is idempotent / re-writable.
+  // Re-applying with all-false clears them; the applier is re-writable.
   c2go::BackendConfig Off{};
   c2go::applyC2GoBackendConfig(TM.get(), Off);
   EXPECT_FALSE(X86TM->C2GoForceBlockAddressJumpTable);

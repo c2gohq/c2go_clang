@@ -1,0 +1,59 @@
+# End-to-end check that c2go-lto runs the module inliner on the combined
+# module before Plan 9 codegen.
+#
+# Two TUs (a.ll, b.ll) split out of this file by split-file. b.ll defines a
+# trivial @b_helper; a.ll calls it. When the inliner runs, a_caller's Plan 9
+# .s body folds in b_helper's `add 1` and the CALL disappears. With
+# --c2go-lto-inline=false the call must survive - that negative subcase
+# isolates "inliner ran" from "inliner didn't run", which is the regression
+# guarded against.
+#
+# Helper is external linkage on purpose: an internal definition in b.ll vs
+# declare in a.ll would let llvm-link drop b.ll's body before any pass sees
+# the call site - a Linker semantics quirk, not what this tests. Cross-TU
+# inlining of external helpers is the WF2-relevant case.
+
+# RUN: rm -rf %t && split-file %s %t
+# RUN: c2go-lto %t/a.ll %t/b.ll --c2go-emit-asm=%t/inlined.s
+# RUN: FileCheck %s --input-file=%t/inlined.s --check-prefix=INLINED
+# RUN: c2go-lto %t/a.ll %t/b.ll --c2go-lto-inline=false --c2go-emit-asm=%t/noinline.s
+# RUN: FileCheck %s --input-file=%t/noinline.s --check-prefix=NOINLINE
+
+# Inliner ran: a_caller's Plan 9 body absorbs b_helper's `add 1` and the
+# cross-TU CALL is gone.
+# INLINED:       TEXT ·a_caller(SB)
+# INLINED-NEXT:  ADDW $1, R0, R0
+# INLINED-NEXT:  RET
+# INLINED-NOT:   CALL ·b_helper(SB)
+
+# Inliner suppressed: the CALL survives in a_caller and b_helper still has
+# its own TEXT entry.
+# NOINLINE:      TEXT ·a_caller(SB)
+# NOINLINE:      CALL ·b_helper(SB)
+# NOINLINE:      TEXT ·b_helper(SB)
+
+#--- a.ll
+target triple = "aarch64-unknown-unknown-elf"
+
+declare i32 @b_helper(i32 %x)
+
+define i32 @a_caller(i32 %x) {
+  %r = call i32 @b_helper(i32 %x)
+  ret i32 %r
+}
+
+!llvm.module.flags = !{!0, !1}
+!0 = !{i32 1, !"c2go.goabi", i32 1}
+!1 = !{i32 1, !"c2go.target_go_version", !"1.22-1.25"}
+
+#--- b.ll
+target triple = "aarch64-unknown-unknown-elf"
+
+define i32 @b_helper(i32 %x) {
+  %r = add i32 %x, 1
+  ret i32 %r
+}
+
+!llvm.module.flags = !{!0, !1}
+!0 = !{i32 1, !"c2go.goabi", i32 1}
+!1 = !{i32 1, !"c2go.target_go_version", !"1.22-1.25"}

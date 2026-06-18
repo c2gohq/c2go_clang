@@ -1,0 +1,63 @@
+# c2go-lto emits a real Unix `ar` archive bundling the Plan 9 .s and the
+# manifest .c2go-export.json. This test covers the two equivalent entry
+# points to that behaviour:
+#
+#   1. The native flag:    `c2go-lto --c2go-emit-archive=libfoo.a a.ll`
+#   2. The ar-CLI shim:    `c2go-lto rcs libfoo.a a.ll` (drop-in for
+#      `AR=c2go-lto` in build systems)
+#
+# Both paths must produce a byte-identical archive - same members, same
+# content - so a build can opt into either UX without changing what
+# c2go-bind sees downstream.
+#
+# Member naming contract (matches c2go-bind's suffix dispatch):
+#   <stem>.s
+#   <stem>.c2go-export.json
+# where <stem> is the archive's filename stem.
+
+# RUN: rm -rf %t && split-file %s %t
+
+# Native flag:
+# RUN: mkdir -p %t/native
+# RUN: c2go-lto --c2go-emit-archive=%t/native/libfoo.a %t/a.ll
+# RUN: llvm-ar t %t/native/libfoo.a | FileCheck %s --check-prefix=MEMBERS
+
+# ar-CLI shim - same archive, different driver. Use the same stem so
+# member names match, exercising byte-identity below.
+# RUN: mkdir -p %t/shim
+# RUN: c2go-lto rcs %t/shim/libfoo.a %t/a.ll
+# RUN: llvm-ar t %t/shim/libfoo.a | FileCheck %s --check-prefix=MEMBERS
+
+# Native vs shim must be byte-identical: deterministic archive writer
+# (mtime/uid/gid/mode zeroed) + same stem + same input bitcode +
+# in-memory tee of the .s and manifest .json (rendered once, fanned out).
+# RUN: cmp %t/native/libfoo.a %t/shim/libfoo.a
+
+# Extract members and verify their contents - `.s` carries the Plan 9
+# TEXT directive emitted by MCPlan9AsmStreamer; `.json` is the manifest
+# sidecar with the expected pkgpath and target_go_version fields.
+# RUN: mkdir -p %t/x && cd %t/x && llvm-ar x %t/native/libfoo.a
+# RUN: FileCheck %s --check-prefix=ASM  --input-file=%t/x/libfoo.s
+# RUN: FileCheck %s --check-prefix=JSON --input-file=%t/x/libfoo.c2go-export.json
+
+# MEMBERS: libfoo.s
+# MEMBERS: libfoo.c2go-export.json
+
+# Plan 9 asm: the function we defined survives as a TEXT directive.
+# ASM: TEXT ·a_caller(SB)
+
+# Manifest: the round-tripped module flags become top-level JSON fields.
+# JSON: "pkgpath"
+# JSON: "wf2-rt"
+
+#--- a.ll
+target triple = "aarch64-unknown-unknown-elf"
+
+define i32 @a_caller(i32 %x) {
+  ret i32 %x
+}
+
+!llvm.module.flags = !{!0, !1, !2}
+!0 = !{i32 1, !"c2go.goabi", i32 1}
+!1 = !{i32 1, !"c2go.target_go_version", !"1.22-1.25"}
+!2 = !{i32 1, !"c2go.pkgpath", !"wf2-rt"}

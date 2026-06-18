@@ -1,0 +1,83 @@
+# c2go-lto WF2 fallback negative paths. The fallback manifest-emit path
+# (when the c2go.func.<X> NamedMD is absent on a boundary) rebuilds
+# export-identity fields from per-function c2go-... string attrs. Two attr
+# shapes have specific failure semantics that downstream c2go-bind depends
+# on:
+#
+#   (1) Empty (or absent) c2go-c-name on a c2go-boundary function => the
+#       bitcode is malformed (hand-crafted .ll, corrupted strip, or an
+#       out-of-date AST writer). c2go-lto exits non-zero and diagnoses the
+#       offending IR symbol, rather than silently emitting a symbols[] entry
+#       keyed off the empty string and corrupting the sort order / linkname
+#       stitch downstream.
+#
+#   (2) Missing c2go-boundary-argsize => producer contract only - the
+#       attr-writer never ran for this function (very old bitcode or a
+#       hand-crafted stub). The current consumer still treats the omitted
+#       field as the same scalar default 0 it would compute from a
+#       zero-argsize boundary; the OMISSION exists so a future upgrade can
+#       promote the JSON shape from a plain integer to a nullable optional
+#       and distinguish "unknown frame size" from a legitimate void-ABI0
+#       zero. Pinning the OMITS-not-0 shape now preserves that upgrade path
+#       without breaking the bitcode-level fallback contract today.
+#
+# Both pins guard against silent regressions of the fallback that would
+# otherwise re-corrupt the WF2 manifest at the join with c2go-bind.
+
+# REQUIRES: aarch64-registered-target
+
+# RUN: rm -rf %t && split-file %s %t
+
+# (1) Empty c2go-c-name on a c2go-boundary => non-zero exit + diagnostic.
+# `not` flips the expected non-zero exit back to success for lit while
+# preserving stderr for FileCheck.
+# RUN: not c2go-lto %t/empty-cname.ll --c2go-emit-manifest=%t/empty.json 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=EMPTY
+# EMPTY: c2go-boundary function '{{.*}}empty_cname_fn{{.*}}' is missing the c2go-c-name attribute
+
+# (2) Missing c2go-boundary-argsize => `argsize` key omitted from JSON.
+# Successful run (rc=0), then assert the manifest does NOT contain `argsize`
+# and DOES contain the boundary by name.
+# RUN: c2go-lto %t/no-argsize.ll --c2go-emit-manifest=%t/noargs.json
+# RUN: FileCheck %s --check-prefix=NOARGSIZE --input-file=%t/noargs.json
+# NOARGSIZE:     "name": "no_argsize_fn"
+# NOARGSIZE-NOT: "argsize"
+
+#--- empty-cname.ll
+target triple = "aarch64-unknown-none-elf"
+
+define i32 @empty_cname_fn(i32 %x) #0 {
+entry:
+  ret i32 %x
+}
+
+attributes #0 = {
+  "c2go-boundary"
+  "c2go-c-name"=""
+  "c2go-go-sig"="func empty_cname_fn(x int32) int32"
+}
+
+!llvm.module.flags = !{!0, !1}
+!0 = !{i32 1, !"c2go.goabi", i32 1}
+!1 = !{i32 1, !"c2go.pkgpath", !"wf2neg"}
+
+#--- no-argsize.ll
+target triple = "aarch64-unknown-none-elf"
+
+; Boundary with a valid c2go-c-name but no c2go-boundary-argsize. The
+; fallback manifest path must omit `argsize` (not emit `argsize: 0`).
+define i32 @no_argsize_fn(i32 %x) #0 {
+entry:
+  ret i32 %x
+}
+
+attributes #0 = {
+  "c2go-boundary"
+  "c2go-c-name"="no_argsize_fn"
+  "c2go-go-sig"="func no_argsize_fn(x int32) int32"
+  "c2go-export-case"="0"
+}
+
+!llvm.module.flags = !{!0, !1}
+!0 = !{i32 1, !"c2go.goabi", i32 1}
+!1 = !{i32 1, !"c2go.pkgpath", !"wf2neg"}

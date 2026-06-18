@@ -1,0 +1,57 @@
+# Cross-TU archive bundling.
+#
+# Two LLVM bitcode TUs are linked into one combined module by c2go-lto and
+# emitted as a single Plan 9 .s + manifest .c2go-export.json, packaged into
+# a Unix `ar` archive. The archive's .s member must carry BOTH per-TU TEXT
+# entries (no cross-TU inlining is invoked here because b_helper is local -
+# --c2go-lto-inline=false would not change the outcome, this is about
+# packaging, not the inliner).
+#
+# This guards the multi-input drop-in shape:
+#   `c2go-lto rcs lib.a a.ll b.ll`
+# which a build system uses when it has accumulated multiple .o's (really
+# .bc's) for a single static library.
+
+# RUN: rm -rf %t && split-file %s %t
+
+# RUN: c2go-lto rcs %t/libmulti.a %t/a.ll %t/b.ll
+# RUN: llvm-ar t %t/libmulti.a | FileCheck %s --check-prefix=MEMBERS
+# RUN: mkdir -p %t/x && cd %t/x && llvm-ar x %t/libmulti.a
+# RUN: FileCheck %s --check-prefix=ASM --input-file=%t/x/libmulti.s
+
+# Archive packaging: still exactly two members regardless of TU count
+# (we link first, then emit one `.s` + one `.json` per archive).
+# MEMBERS: libmulti.s
+# MEMBERS: libmulti.c2go-export.json
+
+# Both TUs' code is present in the combined Plan 9 .s.
+# ASM-DAG: TEXT ·a_caller(SB)
+# ASM-DAG: TEXT ·b_helper(SB)
+
+#--- a.ll
+target triple = "aarch64-unknown-unknown-elf"
+
+declare i32 @b_helper(i32 %x)
+
+define i32 @a_caller(i32 %x) {
+  %r = call i32 @b_helper(i32 %x)
+  ret i32 %r
+}
+
+!llvm.module.flags = !{!0, !1, !2}
+!0 = !{i32 1, !"c2go.goabi", i32 1}
+!1 = !{i32 1, !"c2go.target_go_version", !"1.22-1.25"}
+!2 = !{i32 1, !"c2go.pkgpath", !"wf2-multi"}
+
+#--- b.ll
+target triple = "aarch64-unknown-unknown-elf"
+
+define i32 @b_helper(i32 %x) {
+  %r = add i32 %x, 1
+  ret i32 %r
+}
+
+!llvm.module.flags = !{!0, !1, !2}
+!0 = !{i32 1, !"c2go.goabi", i32 1}
+!1 = !{i32 1, !"c2go.target_go_version", !"1.22-1.25"}
+!2 = !{i32 1, !"c2go.pkgpath", !"wf2-multi"}

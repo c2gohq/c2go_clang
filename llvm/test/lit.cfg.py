@@ -29,12 +29,16 @@ if lit_shell_env:
     use_lit_shell = lit.util.pythonize_bool(lit_shell_env)
 
 # testFormat: The test format to use to interpret tests.
+# `enable_profcheck` is set by the generated lit.site.cfg.py from
+# LLVM_ENABLE_PROFCHECK; fall back to False when running lit.cfg.py
+# directly without a site config (e.g. ad-hoc invocations in unconfigured
+# build trees).
 extra_substitutions = extra_substitutions = (
     [
         (r"FileCheck .*", "cat > /dev/null"),
         (r"not FileCheck .*", "cat > /dev/null"),
     ]
-    if config.enable_profcheck
+    if getattr(config, "enable_profcheck", False)
     else []
 )
 config.test_format = lit.formats.ShTest(not use_lit_shell, extra_substitutions)
@@ -48,7 +52,7 @@ config.suffixes = [".ll", ".c", ".test", ".txt", ".s", ".mir", ".yaml", ".spv"]
 # directories.
 config.excludes = ["Inputs", "CMakeLists.txt", "README.txt", "LICENSE.txt"]
 
-if config.enable_profcheck:
+if getattr(config, "enable_profcheck", False):
     config.available_features.add("profcheck")
     # Exclude llvm-reduce tests for profcheck because we substitute the FileCheck
     # binary with a no-op command for profcheck, but llvm-reduce tests have RUN
@@ -302,6 +306,8 @@ tools.extend(
         "sancov",
         "sanstats",
         "llvm-remarkutil",
+        # c2go: WF2 - see llvm/test/tools/c2go-lto/
+        "c2go-lto",
     ]
 )
 

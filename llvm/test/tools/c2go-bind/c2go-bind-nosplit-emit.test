@@ -1,0 +1,44 @@
+# c2go-bind must emit //go:nosplit on the three c2go-libc runtime
+# helpers the Clang c2go pipeline declares as gc-leaf-function:
+#
+#   _c2go_writePtr          (write-barrier slow-path shim)
+#   _c2go_typedmemmove      (singleton typed-copy)
+#   _c2go_typedMemmoveArray (array typed-copy)
+#
+# The IR side of the contract (the gc-leaf-function attribute group)
+# is pinned by separate clang/pass tests. This test pins the Go side:
+# c2go-bind must emit //go:nosplit immediately above each helper body.
+# Removing either half in isolation silently breaks GC soundness, so
+# both halves are pinned by tests.
+#
+# The c2go-bind binary lives outside llvm-project (see lit.local.cfg
+# for path discovery). When unreachable this test is marked
+# unsupported.
+
+# Build a minimal sidecar manifest. The runtime preamble (incl. the
+# three nosplit helpers) is emitted unconditionally regardless of the
+# manifest's symbol set, so a zero-symbol manifest is sufficient.
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: echo '{"pkgpath":"example.com/stub","min_go_version":"1.22","max_go_version":"1.26","symbols":[],"types":[]}' > %t/stub.c2go-export.json
+
+# Drive c2go-bind in -dry-run mode (writes generated Go to stdout, no
+# files needed). The Go output must carry //go:nosplit immediately
+# above each of the three helper definitions.
+# RUN: %c2gobind -pkg example.com/stub -dry-run %t/stub.c2go-export.json | FileCheck %s
+
+# For each helper, anchor on a unique line that precedes its definition
+# (the //go:linkname or the leading comment), then assert the next lines
+# are //go:nosplit + the signature. This catches a regression that
+# deletes the //go:nosplit pragma but leaves the helper body in place.
+
+# CHECK:      //go:linkname _runtime_typedmemmove runtime.typedmemmove
+# CHECK:      //go:nosplit
+# CHECK-NEXT: func _c2go_typedmemmove(typ unsafe.Pointer, dst, src unsafe.Pointer)
+
+# CHECK:      // _c2go_typedMemmoveArray is the per-element loop used by the
+# CHECK:      //go:nosplit
+# CHECK-NEXT: func _c2go_typedMemmoveArray(typ unsafe.Pointer, dst, src unsafe.Pointer, n uintptr)
+
+# CHECK:      // _c2go_writePtr is the slow-path of the inline write barrier.
+# CHECK:      //go:nosplit
+# CHECK-NEXT: func _c2go_writePtr(slot *unsafe.Pointer, val unsafe.Pointer)

@@ -1,0 +1,5 @@
+// Module map for the c2go-typeinfo Modules test.
+module C2GoTypeInfoMod {
+  header "c2go-typeinfo-mod.h"
+  export *
+}

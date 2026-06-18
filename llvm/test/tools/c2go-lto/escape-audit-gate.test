@@ -1,0 +1,64 @@
+# c2go-lto's whole-program stack->heap escape audit is a build gate - when
+# an alloca address may flow into a heap allocation or mutable global via a
+# store, c2go-lto exits non-zero so the surrounding build pipeline fails
+# fast.
+#
+# - clean.ll has zero escapes => c2go-lto exits 0
+# - escape.ll stores a stack alloca address into a malloc'd heap slot =>
+#   c2go-lto exits non-zero and prints "stack->heap in <fn>"
+#
+# malloc / calloc / realloc / aligned_alloc / reallocf / valloc / GCMalloc
+# are all recognised heap allocators.
+
+# RUN: rm -rf %t && split-file %s %t
+
+# Clean run: no escapes, exits 0, summary line says 0.
+# RUN: c2go-lto %t/clean.ll 2>&1 | FileCheck %s --check-prefix=CLEAN
+# CLEAN: c2go-lto: 0 stack-address escape point(s)
+
+# Escape run: one stack->heap store. `not` flips the expected non-zero exit
+# back to success for lit while preserving stderr/stdout for FileCheck.
+# RUN: not c2go-lto %t/escape.ll 2>&1 | FileCheck %s --check-prefix=ESCAPE
+# ESCAPE: c2go-lto: stack->heap in stack_to_heap
+# ESCAPE: c2go-lto: 1 stack-address escape point(s)
+
+# dedup: three stores of the SAME alloca into a heap collapse to ONE escape
+# report by default; --c2go-escape-dedup=false restores the per-store stream.
+# RUN: not c2go-lto %t/dedup.ll 2>&1 | FileCheck %s --check-prefix=DEDUP
+# RUN: not c2go-lto --c2go-escape-dedup=false %t/dedup.ll 2>&1 | FileCheck %s --check-prefix=NODEDUP
+# DEDUP:        c2go-lto: stack->heap in three_stores_one_alloca
+# DEDUP:        c2go-lto: 1 stack-address escape point(s)
+# NODEDUP:      c2go-lto: 3 stack-address escape point(s)
+
+#--- clean.ll
+target triple = "aarch64-unknown-linux"
+declare ptr @malloc(i64)
+define void @no_escape() {
+  %p = call ptr @malloc(i64 8)
+  store i64 42, ptr %p
+  ret void
+}
+
+#--- escape.ll
+target triple = "aarch64-unknown-linux"
+declare ptr @malloc(i64)
+define void @stack_to_heap() {
+  %s = alloca i64
+  %h = call ptr @malloc(i64 8)
+  store ptr %s, ptr %h
+  ret void
+}
+
+#--- dedup.ll
+target triple = "aarch64-unknown-linux"
+declare ptr @malloc(i64)
+define void @three_stores_one_alloca() {
+  %s = alloca i64
+  %h0 = call ptr @malloc(i64 8)
+  %h1 = call ptr @malloc(i64 8)
+  %h2 = call ptr @malloc(i64 8)
+  store ptr %s, ptr %h0
+  store ptr %s, ptr %h1
+  store ptr %s, ptr %h2
+  ret void
+}
