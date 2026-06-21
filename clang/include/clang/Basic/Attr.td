@@ -1453,6 +1453,22 @@ def C2GoTypeInfo : InheritableAttr {
   let LangOpts = [COnly];
 }
 
+// c2go #533 — internal carrier attribute attached by ActOnC2GoCallback to the
+// synthesized bodyless `c2go_cb_<name>` cdecl-trampoline FunctionDecl. Carries
+// the originating c2go callback-target FunctionDecl so buildC2GoManifest can
+// emit a callbacks[] entry (and clang the per-sig converter) without inferring
+// the target from the trampoline decl. Has no user-facing spelling; never
+// produced by the parser. Mirrors C2GoTypeInfo's fake-DeclArgument carrier
+// pattern, but threads a FunctionDecl instead of a RecordDecl.
+def C2GoCallback : InheritableAttr {
+  let Spellings = [];
+  let SemaHandler = 0;
+  let Subjects = SubjectList<[Function], ErrorDiag>;
+  let Args = [DeclArgument<Function, "Target", 0, /*fake=*/1>];
+  let Documentation = [InternalOnly];
+  let LangOpts = [COnly];
+}
+
 def GoLinkname : InheritableAttr {
   // Legacy alias for c2go_linkname. Deprecated.
   let Spellings = [GCC<"go_linkname">];

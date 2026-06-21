@@ -17023,6 +17023,85 @@ ExprResult Sema::ActOnC2GoTypeInfo(Scope *S, SourceLocation BuiltinLoc,
   return ImpCastExprToType(AddrOf.get(), VoidPtrTy, CK_BitCast);
 }
 
+ExprResult Sema::ActOnC2GoCallback(Scope *S, SourceLocation BuiltinLoc,
+                                   Expr *FnExpr, SourceLocation RParenLoc) {
+  if (!FnExpr)
+    return ExprError();
+
+  // The operand must name a c2go function: peel parens/implicit casts to a
+  // DeclRefExpr referring to a FunctionDecl. c2go_callback needs the target's
+  // STATIC identity (it is the destFn the trampoline re-enters via cgocallback),
+  // so a runtime function-pointer value is not accepted.
+  Expr *E = FnExpr->IgnoreParenImpCasts();
+  auto *DRE = dyn_cast<DeclRefExpr>(E);
+  auto *FD = DRE ? dyn_cast<FunctionDecl>(DRE->getDecl()) : nullptr;
+  if (!FD) {
+    Diag(FnExpr->getExprLoc(), diag::err_c2go_callback_not_function);
+    return ExprError();
+  }
+
+  // The target is address-taken: it must keep a Go ABI0 entry for the
+  // converter's indirect GoABI0 call (#495 hook), and it must be emitted.
+  MarkFunctionReferenced(BuiltinLoc, FD);
+
+  // Synthesize (once per target FD) a bodyless extern `c2go_cb_<name>`
+  // FunctionDecl whose emitted symbol is the per-fn cdecl trampoline c2gobind
+  // defines. Its C type is the target's function type (the trampoline is called
+  // with the target's native signature); taking its address yields the
+  // unmanaged native function pointer the extern library calls. A C2GoCallback
+  // carrier preserves the target FD so buildC2GoManifest emits a callbacks[]
+  // entry (and clang the per-sig converter). Cached by a reserved identifier so
+  // repeated c2go_callback(f) share one trampoline decl.
+  QualType FnTy = FD->getType();
+  TranslationUnitDecl *TU = Context.getTranslationUnitDecl();
+  std::string TrampSym = "c2go_cb_" + FD->getNameAsString();
+  std::string LookupName = "__c2go_cb_" + FD->getNameAsString();
+  IdentifierInfo *FnII = &Context.Idents.get(LookupName);
+
+  FunctionDecl *Tramp = nullptr;
+  for (NamedDecl *ND : TU->lookup(DeclarationName(FnII)))
+    if (auto *Existing = dyn_cast<FunctionDecl>(ND)) {
+      Tramp = Existing;
+      if (!Tramp->hasAttr<C2GoCallbackAttr>())
+        Tramp->addAttr(
+            C2GoCallbackAttr::CreateImplicit(Context, FD, BuiltinLoc));
+      break;
+    }
+  if (!Tramp) {
+    Tramp = FunctionDecl::Create(
+        Context, TU, BuiltinLoc, BuiltinLoc, DeclarationName(FnII), FnTy,
+        Context.getTrivialTypeSourceInfo(FnTy, BuiltinLoc), SC_Extern);
+    Tramp->setImplicit();
+    // Build params from the prototype so the decl is well-formed for address-of.
+    if (const auto *FPT = FnTy->getAs<FunctionProtoType>()) {
+      llvm::SmallVector<ParmVarDecl *, 8> Params;
+      for (unsigned i = 0, n = FPT->getNumParams(); i < n; ++i) {
+        QualType PT = FPT->getParamType(i);
+        auto *PV = ParmVarDecl::Create(
+            Context, Tramp, BuiltinLoc, BuiltinLoc, /*Id=*/nullptr, PT,
+            Context.getTrivialTypeSourceInfo(PT, BuiltinLoc), SC_None,
+            /*DefArg=*/nullptr);
+        PV->setScopeInfo(0, i);
+        Params.push_back(PV);
+      }
+      Tramp->setParams(Params);
+    }
+    Tramp->addAttr(AsmLabelAttr::CreateImplicit(Context, TrampSym, BuiltinLoc));
+    Tramp->addAttr(C2GoCallbackAttr::CreateImplicit(Context, FD, BuiltinLoc));
+    TU->addDecl(Tramp);
+  }
+
+  // The c2go_cb_<name> function name in a value context decays to its
+  // (unmanaged, default address-space) function pointer — exactly the native
+  // callback value the extern library calls.
+  ExprResult Ref = BuildDeclRefExpr(
+      Tramp, FnTy, VK_LValue,
+      DeclarationNameInfo(Tramp->getDeclName(), BuiltinLoc));
+  if (Ref.isInvalid())
+    return ExprError();
+  return DefaultFunctionArrayConversion(Ref.get());
+}
+
 ExprResult Sema::ActOnChooseExpr(SourceLocation BuiltinLoc,
                                  Expr *CondExpr,
                                  Expr *LHSExpr, Expr *RHSExpr,

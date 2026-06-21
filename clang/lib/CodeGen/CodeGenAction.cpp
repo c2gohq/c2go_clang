@@ -1081,6 +1081,72 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
   }
   llvm::sort(Linknames, byName);
 
+  // c2go #533: callbacks[] — one entry per distinct c2go_callback(fn) target.
+  // ActOnC2GoCallback synthesized a bodyless `c2go_cb_<name>` trampoline decl
+  // carrying a C2GoCallback attr holding the target FunctionDecl. c2gobind emits
+  // the per-fn cdecl trampoline .s (mechanical C-ABI spill + crosscall2); clang
+  // emits the per-fn GoABI0 converter (#536). The trampoline's address is what
+  // the extern library calls; the converter re-enters the target's ABI0 entry.
+  {
+    llvm::json::Array Callbacks;
+    llvm::DenseSet<const Decl *> SeenCB;
+    for (const Decl *D : Ctx.getTranslationUnitDecl()->decls()) {
+      const auto *FD = dyn_cast<FunctionDecl>(D);
+      if (!FD)
+        continue;
+      const auto *CB = FD->getAttr<C2GoCallbackAttr>();
+      if (!CB || !CB->getTarget())
+        continue;
+      const FunctionDecl *Target = CB->getTarget();
+      if (!SeenCB.insert(Target->getCanonicalDecl()).second)
+        continue;
+      std::string TName = Target->getNameAsString();
+      llvm::json::Object E;
+      E["tramp"] = "c2go_cb_" + TName;             // extern fn-ptr target symbol
+      E["target_asm_symbol"] = "\xc2\xb7" + TName; // destFn Go ABI0 entry
+      E["converter"] = "c2go_cbconv_" + TName;     // per-fn GoABI0 converter (unix, #536)
+      // windows (#541): c2gobind generates a typed Go converter (the
+      // syscall.NewCallback fn) from this go_sig; the flags let it fail-closed
+      // on signatures NewCallback rejects (float args/returns, >uintptr struct).
+      E["go_sig"] = c2goBuildGoSig(Target, Ctx);
+      {
+        bool HasFloat = false, HasAggregate = false;
+        auto Chk = [&](QualType QT) {
+          QT = QT.getCanonicalType();
+          if (QT->isVoidType())
+            return;
+          if (QT->isFloatingType() || QT->isAnyComplexType() ||
+              QT->isVectorType())
+            HasFloat = true;
+          if (QT->isRecordType())
+            HasAggregate = true;
+        };
+        for (auto *PVD : Target->parameters())
+          Chk(PVD->getType());
+        Chk(Target->getReturnType());
+        if (HasFloat)
+          E["has_float"] = true;
+        if (HasAggregate)
+          E["has_aggregate"] = true;
+      }
+      // Multi-word struct return: emit the per-word int/float classes so the
+      // cdecl trampoline reads result[k] into the right native return register.
+      // (Single-word returns use the uniform result[0]->R0+F0 path, no list.)
+      if (CGM) {
+        if (auto RW = CGM->c2goCallbackReturnWords(Target);
+            RW && RW->size() > 1) {
+          llvm::json::Array Words;
+          for (bool F : *RW)
+            Words.push_back(F ? "float" : "int");
+          E["ret_words"] = std::move(Words);
+        }
+      }
+      Callbacks.push_back(std::move(E));
+    }
+    if (!Callbacks.empty())
+      Root["callbacks"] = std::move(Callbacks);
+  }
+
   Root["symbols"] = std::move(Symbols);
   Root["types"] = std::move(Types);
   Root["linknames"] = std::move(Linknames);

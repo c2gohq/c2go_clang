@@ -1047,11 +1047,18 @@ bool X86Plan9InstPrinter::tryPrintSSEMov(const MCInst *MI, raw_ostream &O) {
   bool IsRM = Nm.ends_with("rm");
   bool IsMR = Nm.ends_with("mr");
   if (IsRR) {
-    if (MI->getNumOperands() < 2 || !MI->getOperand(0).isReg() ||
-        !MI->getOperand(1).isReg())
+    // Destination is operand 0; the true source is the LAST operand. A plain
+    // move (MOVSDrr) has 2 operands [dst, src], but a 2-address SSE arithmetic
+    // op (ADDSD/SUBSD/MULSD/DIVSD, and the tied CVTSI2SD/CVTSI2SS) has 3
+    // [dst, src1(tied=dst), src2] — taking operand 1 there prints the tied dst
+    // as the source (e.g. `ADDSD X0, X0` for `addsd %xmm1, %xmm0`, computing
+    // x+x instead of x+y).
+    unsigned N = MI->getNumOperands();
+    unsigned SrcIdx = N - 1;
+    if (N < 2 || !MI->getOperand(0).isReg() || !MI->getOperand(SrcIdx).isReg())
       return false;
     O << "\t" << MnP9 << " ";
-    printPlan9Reg(O, MI->getOperand(1).getReg(), MRI);
+    printPlan9Reg(O, MI->getOperand(SrcIdx).getReg(), MRI);
     O << ", ";
     printPlan9Reg(O, MI->getOperand(0).getReg(), MRI);
     O << "\n";

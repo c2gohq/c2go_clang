@@ -478,6 +478,11 @@ KEYWORD(__builtin_va_arg            , KEYALL)
 // that c2gobind emits. Spelled with the `__c2go_` prefix; the user-facing
 // `c2go_typeinfo(T)` macro in <c2go.h> forwards to it.
 KEYWORD(__c2go_typeinfo             , KEYALL)
+// c2go: __c2go_callback(fn) yields an unmanaged native function pointer for a
+// c2go function `fn` — a per-fn cdecl trampoline (emitted by c2gobind) that
+// re-enters `fn` through runtime.cgocallback so a foreign C thread can call it.
+// The user-facing `c2go_callback(fn)` macro in <c2go.h> forwards to it.
+KEYWORD(__c2go_callback             , KEYALL)
 KEYWORD(__extension__               , KEYALL)
 KEYWORD(__float128                  , KEYALL)
 KEYWORD(__ibm128                    , KEYALL)

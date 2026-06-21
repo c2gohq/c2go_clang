@@ -36,7 +36,6 @@
 #define managed         __attribute__((c2go_managed))
 #define unmanaged       __attribute__((c2go_unmanaged))
 #define c2go_extern     __attribute__((c2go_extern))
-#define c2go_linkname(name) __attribute__((c2go_linkname(name)))
 
 /* Named selector values (use instead of bare 0 / 1). */
 /* c2go_extern Go-name casing (its optional int arg): the bare `c2go_extern`
@@ -85,7 +84,6 @@
  *===-----------------------------------------------------------------------*/
 
 void *gc_malloc(const void *type_info, __SIZE_TYPE__ n)
-    c2go_linkname("github.com/c2go_project/c2go_libc.GCMalloc");
     c2go_linkname("github.com/c2go_project/c2go_libc.GCMalloc", C2GO_GOABI0);
 
 /*===-- RTTI: *runtime._type for a managed type (v15 §P4 / §4.6.5) ---------
@@ -108,6 +106,25 @@ void *gc_malloc(const void *type_info, __SIZE_TYPE__ n)
 
 #define c2go_typeinfo(T) (__c2go_typeinfo(T))
 
+/*===-- Callback: c2go function -> unmanaged native fn-ptr ----------------
+ * c2go_callback(fn) yields an unmanaged, native-callable function pointer for
+ * the c2go function `fn`, suitable to hand to an unmanaged_extern library that
+ * expects a C callback (e.g. qsort's comparator). clang's `__c2go_callback`
+ * built-in synthesizes a per-fn cdecl trampoline (emitted by c2gobind) that
+ * marshals the native C-ABI arguments into a Go ABI0 frame and re-enters `fn`
+ * through runtime.cgocallback, so a foreign thread's call lands safely in the
+ * Go world. The result type is `fn`'s signature as an unmanaged function
+ * pointer.
+ *
+ * Usage:
+ *   extern void qsort(void *, __SIZE_TYPE__, __SIZE_TYPE__,
+ *                     int (*)(const void *, const void *));
+ *   int cmp(const void *a, const void *b) { ... }
+ *   qsort(base, n, sz, c2go_callback(cmp));
+ *===-----------------------------------------------------------------------*/
+
+#define c2go_callback(fn) (__c2go_callback(fn))
+
 /*===-- GC array allocation (v15 §P4) -------------------------------------
  * gc_malloc_array(type_info, elem_size, count) allocates a contiguous,
  * GC-tracked array of `count` elements, each `elem_size` bytes, scanned per
@@ -128,7 +145,6 @@ static inline void *gc_malloc_array(const void *type_info,
 /*===-- errno accessor (per-goroutine via GLS) ----------------------------*/
 
 extern int *__c2go_errno_ptr(void)
-    c2go_linkname("github.com/c2go_project/c2go_libc.ErrnoPtr");
     c2go_linkname("github.com/c2go_project/c2go_libc.ErrnoPtr", C2GO_GOABI0);
 
 #define errno (*__c2go_errno_ptr())

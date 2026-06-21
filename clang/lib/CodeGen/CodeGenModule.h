@@ -1775,6 +1775,19 @@ public:
   /// lands on the stack). \p D may be null (an indirect call).
   bool useC2GoGoABI0CallingConv(const Decl *D) const;
 
+  /// c2go #541: true when generating windows extern glue (-c2go-extern-os=
+  /// windows). A windows c2go_callback target resolves to a syscall.NewCallback
+  /// var (load), not a .s cdecl trampoline (function address).
+  bool isC2GoExternWindows() const;
+
+  /// c2go: per-word float-class flags of a callback target's return value if it
+  /// is reverse-marshalable for the cdecl trampoline (a single scalar word, or
+  /// an arch-neutral homogeneous all-int/all-double struct <=16B); nullopt =
+  /// fail-closed. Used by the converter gate (CodeGenModule) and the manifest
+  /// ret_words (CodeGenAction).
+  std::optional<llvm::SmallVector<bool, 4>>
+  c2goCallbackReturnWords(const FunctionDecl *FD);
+
   /// c2go §2.0.2 (#281): true when the function/call should use the internal
   /// register-return convention (ABIInternal-style result placement). This is
   /// the SINGLE source of truth shared by callee body (`CodeGenModule`) and
@@ -2131,6 +2144,13 @@ private:
   /// c2go-bind Go-dispatch wrapper. Gated by -c2go-extern-wrappers (default off
   /// during migration). Must run after EmitDeferred().
   void EmitC2GoUnmanagedExternWrappers();
+
+  /// c2go #533/#536: synthesize a per-target GoABI0 converter c2go_cbconv_<fn>
+  /// (reverse of the unmanaged-extern wrapper) for each c2go_callback(fn)
+  /// target: reconstruct foreign C-ABI args from cbFrame.args and indirectly
+  /// call the target's Go ABI0 entry.
+  void EmitC2GoCallbackConverters();
+
   /// Try to emit external vtables as available_externally if they have emitted
   /// all inlined virtual functions.  It runs after EmitDeferred() and therefore
   /// is not allowed to create new references to things that need to be emitted

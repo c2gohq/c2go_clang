@@ -2415,6 +2415,11 @@ def err_c2go_typeinfo_reserved_identifier : Error<
   "user-declared identifiers starting with '__c2go_typeinfo_' collide with "
   "the implicit RTTI carrier synthesized by Sema and are rejected">;
 
+// c2go: __c2go_callback(fn) callback surface.
+def err_c2go_callback_not_function : Error<
+  "'__c2go_callback' requires a function name; the operand must name a c2go "
+  "function whose address becomes an unmanaged native callback">;
+
 def err_c2go_linkname_abi0_illegal_name : Error<
   "C2GO_GOABI0 (direct reference) cannot be used with the c2go_linkname target "
   "%0: it contains a character the Plan 9 assembler cannot carry in a symbol "

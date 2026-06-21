@@ -1200,6 +1200,10 @@ void CodeGenModule::Release() {
   // -c2go-extern-wrappers is set.
   if (LangOpts.C2GoMode)
     EmitC2GoUnmanagedExternWrappers();
+  // c2go #533/#536: synthesize the per-fn GoABI0 converter for each
+  // c2go_callback(fn) target (reverse marshal: foreign C-ABI args -> destFn).
+  if (LangOpts.C2GoMode)
+    EmitC2GoCallbackConverters();
   // c2go WF2 (#319, C5): materialize and pin every c2go_extern function
   // declaration so it survives dead-stripping into the bitcode. Without this,
   // unreferenced unmanaged externs (e.g. raw_read prototype) and
@@ -4830,6 +4834,434 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
         B.CreateRet(B.CreateLoad(RetTy, Img));
       }
     }
+  }
+}
+
+// c2go #533/#536: synthesize, per distinct c2go_callback(fn) target, a GoABI0
+// converter `c2go_cbconv_<fn>`. It is the REVERSE of the unmanaged-extern
+// wrapper: it reads the foreign C-ABI arguments out of the cbFrame.args spill
+// region (laid out by the c2gobind-emitted cdecl trampoline as
+// [F0..F7, intRegs, stack]), reconstructs each per the target's native ABI,
+// indirectly calls the target's Go ABI0 entry (cbFrame.destFn), and stores the
+// result into cbFrame.result. Walking the .s pipeline gives it an automatic args
+// stackmap so the GC scans pointer arguments precisely once they land in the
+// destFn GoABI0 frame. Scalar/float/pointer signatures only; struct-by-value /
+// sret targets get no converter (link-fails = fail-closed) pending a follow-up.
+bool CodeGenModule::isC2GoExternWindows() const {
+  return C2GoExternOS == "windows";
+}
+
+std::optional<llvm::SmallVector<bool, 4>>
+CodeGenModule::c2goCallbackReturnWords(const FunctionDecl *FD) {
+  CanQual<FunctionProtoType> CanFT =
+      FD->getType()->getCanonicalTypeUnqualified().castAs<FunctionProtoType>();
+  const CGFunctionInfo &FI = getTypes().arrangeFreeFunctionType(CanFT);
+  const ABIArgInfo &RI = FI.getReturnInfo();
+  const llvm::DataLayout &DL = getDataLayout();
+
+  llvm::SmallVector<bool, 4> Out;
+  if (RI.isIgnore())
+    return Out; // void return: zero result words
+
+  // Indirect (sret / >16B) and offset coerces are not reverse-marshalable.
+  if (!(RI.isDirect() || RI.isExtend()) || RI.getDirectOffset() != 0)
+    return std::nullopt;
+
+  // Decompose the coerce type into ABI words (float-class + byte size).
+  struct RWord {
+    bool Float;
+    uint64_t Off;
+    uint64_t Sz;
+  };
+  llvm::SmallVector<RWord, 4> Ws;
+  llvm::Type *CT = RI.getCoerceToType();
+  if (auto *ST = dyn_cast<llvm::StructType>(CT)) {
+    const llvm::StructLayout *SL = DL.getStructLayout(ST);
+    for (unsigned i = 0, n = ST->getNumElements(); i < n; ++i) {
+      llvm::Type *E = ST->getElementType(i);
+      Ws.push_back({E->isFPOrFPVectorTy(), SL->getElementOffset(i),
+                    DL.getTypeStoreSize(E).getFixedValue()});
+    }
+  } else if (auto *AT = dyn_cast<llvm::ArrayType>(CT)) {
+    llvm::Type *E = AT->getElementType();
+    uint64_t ESz = DL.getTypeAllocSize(E).getFixedValue();
+    for (uint64_t i = 0, n = AT->getNumElements(); i < n; ++i)
+      Ws.push_back({E->isFPOrFPVectorTy(), i * ESz,
+                    DL.getTypeStoreSize(E).getFixedValue()});
+  } else {
+    Ws.push_back(
+        {CT->isFPOrFPVectorTy(), 0, DL.getTypeStoreSize(CT).getFixedValue()});
+  }
+
+  // Single scalar word: the uniform return path handles any simple type that
+  // fits one register. A wider single word (e.g. __int128 -> a single i128
+  // coerce on arm64) would be truncated by the uniform path, so fail closed --
+  // amd64 splits __int128 into {i64,i64} but classify() rejects it there too,
+  // keeping both arches consistent.
+  if (Ws.size() == 1) {
+    if (Ws[0].Sz > 8)
+      return std::nullopt;
+    Out.push_back(Ws[0].Float);
+    return Out;
+  }
+
+  // Multi-word: only arch-neutral homogeneous all-int/all-double structs <=16B
+  // (<=2 eightbyte words, each 8 bytes). On AAPCS vs SysV these classify
+  // identically (all-int -> X/AX,DX; all-double -> V/XMM0,1); mixed, float
+  // pairs, and >16B (Indirect / HFA>2) diverge between arches and fail closed.
+  if (Ws.size() > 2)
+    return std::nullopt;
+  // Each ABI word must occupy its own eightbyte register (8-byte aligned,
+  // <=8 bytes). amd64 coerces all-int P3 to {i64,i32} (a 4-byte tail word at
+  // offset 8) -- still one word per register; this excludes packed float-pairs
+  // (two 4-byte floats at offsets 0/4 that share one register).
+  for (const RWord &W : Ws)
+    if (W.Off % 8 != 0 || W.Sz > 8)
+      return std::nullopt;
+  // Field homogeneity is arch-independent: it catches the AAPCS-hides-mixed
+  // case ({long,double} coerces to [2 x i64] on arm64 but {i64,double} on
+  // amd64). 0 = all integer/pointer, 1 = all double, else unsupported.
+  std::function<int(QualType)> classify = [&](QualType T) -> int {
+    T = T.getCanonicalType();
+    if (const auto *RT = T->getAs<RecordType>()) {
+      const RecordDecl *RD = RT->getDecl();
+      if (RD->isUnion())
+        return -1;
+      int C = -2;
+      for (const FieldDecl *F : RD->fields()) {
+        int FC = classify(F->getType());
+        if (FC < 0)
+          return -1;
+        if (C == -2)
+          C = FC;
+        else if (C != FC)
+          return -1;
+      }
+      return C;
+    }
+    if (const auto *AT = getContext().getAsConstantArrayType(T))
+      return classify(AT->getElementType());
+    if (T->isIntegerType() || T->isPointerType() || T->isEnumeralType() ||
+        T->isBooleanType())
+      return getContext().getTypeSize(T) > 64 ? -1 : 0; // __int128 etc: reject
+    if (T->isRealFloatingType())
+      return getContext().getTypeSize(T) == 64 ? 1 : -1; // double only
+    return -1;
+  };
+  int Cls = classify(FD->getReturnType());
+  if (Cls != 0 && Cls != 1)
+    return std::nullopt;
+  for (size_t i = 0; i < Ws.size(); ++i)
+    Out.push_back(Cls == 1); // double -> float-class regs, int -> int-class
+  return Out;
+}
+
+void CodeGenModule::EmitC2GoCallbackConverters() {
+  if (!LangOpts.C2GoMode)
+    return;
+  // c2go #541: windows callbacks use syscall.NewCallback + a c2gobind-emitted
+  // Go converter (NewCallback rejects the .s GoABI0 converter's ABI). No clang
+  // .s converter on windows; c2gobind emits the typed Go converter instead.
+  if (isC2GoExternWindows())
+    return;
+
+  // Collect distinct callback targets from the C2GoCallback carrier on each
+  // synthesized c2go_cb_<fn> trampoline decl.
+  llvm::SmallVector<const FunctionDecl *, 8> Targets;
+  llvm::DenseSet<const Decl *> Seen;
+  for (const Decl *D : Context.getTranslationUnitDecl()->decls()) {
+    const auto *Tramp = dyn_cast<FunctionDecl>(D);
+    if (!Tramp)
+      continue;
+    const auto *CB = Tramp->getAttr<C2GoCallbackAttr>();
+    if (!CB || !CB->getTarget())
+      continue;
+    const FunctionDecl *T = CB->getTarget();
+    if (Seen.insert(T->getCanonicalDecl()).second)
+      Targets.push_back(T);
+  }
+  if (Targets.empty())
+    return;
+
+  unsigned IntRegs;
+  switch (getTarget().getTriple().getArch()) {
+  case llvm::Triple::x86_64:
+    IntRegs = 6;
+    break;
+  case llvm::Triple::aarch64:
+  case llvm::Triple::aarch64_be:
+    IntRegs = 8;
+    break;
+  default:
+    return;
+  }
+
+  llvm::Type *Int64Ty = llvm::Type::getInt64Ty(getLLVMContext());
+  llvm::Type *Int32Ty = llvm::Type::getInt32Ty(getLLVMContext());
+  llvm::Type *Int8Ty = llvm::Type::getInt8Ty(getLLVMContext());
+  llvm::PointerType *PtrTy = llvm::PointerType::getUnqual(getLLVMContext());
+  const llvm::DataLayout &DL = getDataLayout();
+
+  // cbFrame (dl): converter@0 destFn@8 args@16 result@24. args spill region:
+  // [F0..F7 @0, intRegs @64, stack @64+IntRegs*8].
+  const uint64_t kDestFnOff = 8, kArgsOff = 16, kResultOff = 24;
+  const uint64_t kFloatBase = 0, kIntBase = 64;
+  const uint64_t kStackBase = 64 + (uint64_t)IntRegs * 8;
+
+  struct AbiWord {
+    bool Float;
+    uint64_t Off;
+    uint64_t Sz;
+  };
+  auto coerceWordsOf = [&](llvm::Type *T, uint64_t Base,
+                           llvm::SmallVectorImpl<AbiWord> &Out) {
+    if (auto *ST = dyn_cast<llvm::StructType>(T)) {
+      const llvm::StructLayout *SL = DL.getStructLayout(ST);
+      for (unsigned i = 0, n = ST->getNumElements(); i < n; ++i) {
+        llvm::Type *E = ST->getElementType(i);
+        Out.push_back({E->isFPOrFPVectorTy(), Base + SL->getElementOffset(i),
+                       DL.getTypeStoreSize(E).getFixedValue()});
+      }
+    } else if (auto *AT = dyn_cast<llvm::ArrayType>(T)) {
+      llvm::Type *E = AT->getElementType();
+      uint64_t ESz = DL.getTypeAllocSize(E).getFixedValue();
+      uint64_t SSz = DL.getTypeStoreSize(E).getFixedValue();
+      for (uint64_t i = 0, n = AT->getNumElements(); i < n; ++i)
+        Out.push_back({E->isFPOrFPVectorTy(), Base + i * ESz, SSz});
+    } else {
+      Out.push_back(
+          {T->isFPOrFPVectorTy(), Base, DL.getTypeStoreSize(T).getFixedValue()});
+    }
+  };
+  std::function<bool(llvm::Type *)> simpleType = [&](llvm::Type *T) -> bool {
+    if (auto *ST = dyn_cast<llvm::StructType>(T)) {
+      for (auto *E : ST->elements())
+        if (!simpleType(E))
+          return false;
+      return true;
+    }
+    if (auto *AT = dyn_cast<llvm::ArrayType>(T))
+      return simpleType(AT->getElementType());
+    return T->isIntegerTy() || T->isPointerTy() || T->isFloatTy() ||
+           T->isDoubleTy();
+  };
+  // A param/return slot we can reverse-marshal: a single simple scalar word.
+  auto singleWord = [&](const ABIArgInfo &AI) -> bool {
+    if (AI.isIgnore())
+      return true;
+    if (AI.getPaddingType())
+      return false;
+    if (!(AI.isDirect() || AI.isExtend()) || AI.getDirectOffset() != 0)
+      return false;
+    if (!simpleType(AI.getCoerceToType()))
+      return false;
+    llvm::SmallVector<AbiWord, 2> W;
+    coerceWordsOf(AI.getCoerceToType(), 0, W);
+    return W.size() == 1;
+  };
+  auto numIRArgsOf = [](const ABIArgInfo &AI) -> unsigned {
+    if (AI.isDirect() || AI.isExtend()) {
+      auto *ST = dyn_cast<llvm::StructType>(AI.getCoerceToType());
+      if (AI.isDirect() && AI.getCanBeFlattened() && ST)
+        return ST->getNumElements();
+    }
+    return 1;
+  };
+  // A param we can reverse-marshal: a Direct/Extend simple coerce whose ABI
+  // words map 1:1 to flattened IR args (each word pulled from one C-ABI slot).
+  // Multi-word small structs ({int,int,int}, {double,double}) qualify; Indirect
+  // (sret/byval large struct), padding, and non-flattened coerces fail-closed.
+  auto reversibleArg = [&](const ABIArgInfo &AI) -> bool {
+    if (AI.isIgnore())
+      return true;
+    if (AI.getPaddingType())
+      return false;
+    if (!(AI.isDirect() || AI.isExtend()) || AI.getDirectOffset() != 0)
+      return false;
+    if (!simpleType(AI.getCoerceToType()))
+      return false;
+    llvm::SmallVector<AbiWord, 4> W;
+    coerceWordsOf(AI.getCoerceToType(), 0, W);
+    unsigned NumIR = numIRArgsOf(AI);
+    // Either each ABI word is its own flattened IR arg (struct coerce), or all
+    // words rebuild a single aggregate IR arg ([N x i64]/[N x double] coerce).
+    // Both are reverse-marshalable; anything else fails closed.
+    return NumIR == W.size() || NumIR == 1;
+  };
+
+  for (const FunctionDecl *Target : Targets) {
+    CanQual<FunctionProtoType> CanFT = Target->getType()
+                                           ->getCanonicalTypeUnqualified()
+                                           .castAs<FunctionProtoType>();
+    const CGFunctionInfo &FI = getTypes().arrangeFreeFunctionType(CanFT);
+    const ABIArgInfo &RI = FI.getReturnInfo();
+    (void)RI;
+
+    // Return must be reverse-marshalable (single scalar word, or an arch-neutral
+    // homogeneous all-int/all-double struct <=16B); args must be reversible.
+    bool OK = c2goCallbackReturnWords(Target).has_value();
+    for (const auto &A : FI.arguments())
+      if (!reversibleArg(A.info))
+        OK = false;
+    if (!OK)
+      continue; // fail-closed: no converter emitted -> link-fails loudly
+
+    std::string ConvName = ("c2go_cbconv_" + Target->getName()).str();
+    llvm::FunctionType *ConvTy = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(getLLVMContext()), {PtrTy}, /*isVarArg=*/false);
+    llvm::Function *Conv = cast<llvm::Function>(
+        getModule().getOrInsertFunction(ConvName, ConvTy).getCallee());
+    if (!Conv->isDeclaration())
+      continue; // already synthesized
+
+    // Mirror the target's backend codegen attrs (target-cpu/features) so the
+    // neutral-triple .s pass lowers it consistently. Do NOT use
+    // SetLLVMFunctionAttributesForDefinition(Target, Conv): Conv's signature
+    // (void(ptr)) differs from Target's, so arg-level attrs would mismatch.
+    auto *TargetF = cast<llvm::Function>(GetAddrOfFunction(Target));
+    Conv->setLinkage(llvm::GlobalValue::ExternalLinkage);
+    if (TargetF->hasFnAttribute("target-cpu"))
+      Conv->addFnAttr("target-cpu",
+                      TargetF->getFnAttribute("target-cpu").getValueAsString());
+    if (TargetF->hasFnAttribute("target-features"))
+      Conv->addFnAttr(
+          "target-features",
+          TargetF->getFnAttribute("target-features").getValueAsString());
+    // GoABI0 frame: one pointer arg (frame). frame-pointer="all" so the X86
+    // backend addresses the incoming GoABI0 stack arg RBP-relative (#495 split).
+    Conv->setCallingConv(llvm::CallingConv::GoABI0);
+    Conv->addFnAttr("frame-pointer", "all");
+    Conv->addFnAttr("c2go-argsize", "8");
+    Conv->addFnAttr("c2go-argptrmask", "01");
+
+    llvm::BasicBlock *BB =
+        llvm::BasicBlock::Create(getLLVMContext(), "entry", Conv);
+    llvm::IRBuilder<> B(BB);
+
+    llvm::Value *Frame = Conv->getArg(0);
+    llvm::Value *Args = B.CreateLoad(
+        PtrTy, B.CreateConstInBoundsGEP1_64(Int8Ty, Frame, kArgsOff));
+    llvm::Value *DestFn = B.CreateIntToPtr(
+        B.CreateLoad(Int64Ty,
+                     B.CreateConstInBoundsGEP1_64(Int8Ty, Frame, kDestFnOff)),
+        PtrTy);
+
+    // Register/stack sequencer (reverse of the wrapper's addInt/addFloat): pull
+    // each argument word from its C-ABI slot in source order.
+    unsigned NumInts = 0, NumFloats = 0, NumStack = 0;
+    auto readSlot = [&](uint64_t ByteOff) -> llvm::Value * {
+      return B.CreateLoad(
+          Int64Ty, B.CreateConstInBoundsGEP1_64(Int8Ty, Args, ByteOff));
+    };
+    auto nextStack = [&]() { return readSlot(kStackBase + (NumStack++) * 8); };
+    auto nextInt = [&]() -> llvm::Value * {
+      return NumInts < IntRegs ? readSlot(kIntBase + (NumInts++) * 8)
+                               : nextStack();
+    };
+    auto nextFloat = [&]() -> llvm::Value * {
+      return NumFloats < 8 ? readSlot(kFloatBase + (NumFloats++) * 8)
+                           : nextStack();
+    };
+    auto fromWord = [&](llvm::Value *W, llvm::Type *T) -> llvm::Value * {
+      if (T->isPointerTy())
+        return B.CreateIntToPtr(W, T);
+      if (T->isDoubleTy())
+        return B.CreateBitCast(W, T);
+      if (T->isFloatTy())
+        return B.CreateBitCast(B.CreateTrunc(W, Int32Ty), T);
+      return B.CreateZExtOrTrunc(W, T);
+    };
+
+    llvm::FunctionType *DestTy = getTypes().GetFunctionType(FI);
+    llvm::SmallVector<llvm::Value *, 8> CallArgs;
+    unsigned IRArg = 0;
+    for (const auto &A : FI.arguments()) {
+      const ABIArgInfo &AI = A.info;
+      if (AI.isIgnore())
+        continue;
+      // Pull every ABI word of the argument from its C-ABI slot, in order.
+      llvm::SmallVector<AbiWord, 4> W;
+      coerceWordsOf(AI.getCoerceToType(), AI.getDirectOffset(), W);
+      unsigned NumIR = numIRArgsOf(AI);
+      if (NumIR == W.size()) {
+        // Flattened coerce: each word is its own IR arg. GoABI0 lays the words
+        // back into the destFn's frame at the offsets it reads them from.
+        for (const AbiWord &Wd : W) {
+          llvm::Value *Raw = Wd.Float ? nextFloat() : nextInt();
+          CallArgs.push_back(fromWord(Raw, DestTy->getParamType(IRArg)));
+          ++IRArg;
+        }
+      } else {
+        // Single IR arg covering all words ([N x i64]/[N x double] coerce of a
+        // multi-word small struct): rebuild it in a stack slot from its words,
+        // then load the whole param type and pass it by value.
+        llvm::Type *ParamTy = DestTy->getParamType(IRArg++);
+        if (W.size() == 1) {
+          llvm::Value *Raw = W[0].Float ? nextFloat() : nextInt();
+          CallArgs.push_back(fromWord(Raw, ParamTy));
+        } else {
+          llvm::Value *Slot = B.CreateAlloca(ParamTy);
+          uint64_t Base = W.front().Off;
+          for (const AbiWord &Wd : W) {
+            llvm::Value *Raw = Wd.Float ? nextFloat() : nextInt();
+            B.CreateStore(Raw, B.CreateConstInBoundsGEP1_64(Int8Ty, Slot,
+                                                            Wd.Off - Base));
+          }
+          CallArgs.push_back(B.CreateLoad(ParamTy, Slot));
+        }
+      }
+    }
+
+    llvm::CallInst *Ret = B.CreateCall(DestTy, DestFn, CallArgs);
+    Ret->setCallingConv(llvm::CallingConv::GoABI0);
+
+    if (!RI.isIgnore()) {
+      llvm::SmallVector<AbiWord, 4> RW;
+      coerceWordsOf(RI.getCoerceToType(), 0, RW);
+      if (RW.size() == 1) {
+        // Single-word scalar return -> its i64 register word -> result[0]. The
+        // cdecl trampoline reads result[0] back into R0/AX (int/pointer) or
+        // F0/XMM0 (float).
+        llvm::Type *RT = Ret->getType();
+        llvm::Value *Word;
+        if (RT->isPointerTy())
+          Word = B.CreatePtrToInt(Ret, Int64Ty);
+        else if (RT->isDoubleTy())
+          Word = B.CreateBitCast(Ret, Int64Ty);
+        else if (RT->isFloatTy())
+          Word = B.CreateZExt(B.CreateBitCast(Ret, Int32Ty), Int64Ty);
+        else if (RT->isIntegerTy())
+          Word = B.CreateZExtOrTrunc(Ret, Int64Ty);
+        else {
+          // Single-word aggregate return (e.g. struct{int}, struct{float}
+          // whose coerce keeps an aggregate IR type): spill to a zero-filled
+          // i64 slot and read the word back. The cdecl trampoline's uniform
+          // result[0] -> R0+F0 path then selects the right register.
+          llvm::Value *Slot = B.CreateAlloca(Int64Ty);
+          B.CreateStore(llvm::ConstantInt::get(Int64Ty, 0), Slot);
+          B.CreateStore(Ret, Slot);
+          Word = B.CreateLoad(Int64Ty, Slot);
+        }
+        B.CreateStore(Word, B.CreateConstInBoundsGEP1_64(Int8Ty, Frame,
+                                                         kResultOff));
+      } else {
+        // Multi-word struct return (arch-neutral all-int/all-double, gated by
+        // c2goCallbackReturnWords): spill the aggregate to a stack slot, then
+        // copy each ABI word into result[k]. The cdecl trampoline reads
+        // result[k] into the k-th int (X0,X1 / AX,DX) or float (V0,V1 /
+        // XMM0,XMM1) return register per the manifest ret_words classes.
+        llvm::Value *Slot =
+            B.CreateAlloca(llvm::ArrayType::get(Int64Ty, RW.size()));
+        B.CreateStore(Ret, Slot);
+        for (unsigned k = 0; k < RW.size(); ++k) {
+          llvm::Value *Wv = B.CreateLoad(
+              Int64Ty, B.CreateConstInBoundsGEP1_64(Int8Ty, Slot, RW[k].Off));
+          B.CreateStore(Wv, B.CreateConstInBoundsGEP1_64(
+                                Int8Ty, Frame, kResultOff + k * 8));
+        }
+      }
+    }
+    B.CreateRetVoid();
   }
 }
 

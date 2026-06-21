@@ -2793,6 +2793,20 @@ Value *ScalarExprEmitter::VisitCastExpr(CastExpr *CE) {
     return CGF.getAsNaturalPointerTo(CGF.EmitArrayToPointerDecay(E),
                                      CE->getType()->getPointeeType());
   case CK_FunctionToPointerDecay:
+    // c2go #541: on windows a c2go_callback(fn) target `c2go_cb_<fn>` is a Go
+    // package var holding the syscall.NewCallback value (not a .s function), so
+    // load the var rather than take the function address. (Unix keeps the
+    // function-address path: c2go_cb_<fn> is the c2gobind-emitted cdecl tramp.)
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts()))
+      if (const auto *FD = dyn_cast<FunctionDecl>(DRE->getDecl()))
+        if (FD->hasAttr<C2GoCallbackAttr>() && CGF.CGM.isC2GoExternWindows())
+          if (const auto *AL = FD->getAttr<AsmLabelAttr>()) {
+            llvm::Constant *GV =
+                CGF.CGM.CreateRuntimeVariable(CGF.Int64Ty, AL->getLabel());
+            llvm::Value *V = CGF.Builder.CreateAlignedLoad(
+                CGF.Int64Ty, GV, CharUnits::fromQuantity(8).getAsAlign());
+            return CGF.Builder.CreateIntToPtr(V, CGF.ConvertType(CE->getType()));
+          }
     return EmitLValue(E).getPointer(CGF);
 
   case CK_NullToPointer:

@@ -7666,6 +7666,15 @@ public:
                                SourceLocation TypeLoc, ParsedType ParsedArgTy,
                                SourceLocation RParenLoc);
 
+  // c2go #533: __c2go_callback(fn) — takes a c2go function name and yields an
+  // unmanaged, native-callable function pointer (the address of a per-fn cdecl
+  // trampoline c2gobind emits, which re-enters `fn` via runtime.cgocallback).
+  // Synthesizes (and caches) a bodyless `c2go_cb_<name>` FunctionDecl bound by
+  // AsmLabel to that trampoline symbol, with a C2GoCallback carrier preserving
+  // the target FunctionDecl, and returns its (managed-stripped) fn-ptr address.
+  ExprResult ActOnC2GoCallback(Scope *S, SourceLocation BuiltinLoc,
+                               Expr *FnExpr, SourceLocation RParenLoc);
+
   // __builtin_choose_expr(constExpr, expr1, expr2)
   ExprResult ActOnChooseExpr(SourceLocation BuiltinLoc, Expr *CondExpr,
                              Expr *LHSExpr, Expr *RHSExpr,
