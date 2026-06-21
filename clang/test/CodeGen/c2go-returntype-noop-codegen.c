@@ -27,7 +27,7 @@ typedef struct {
 // attribute documents multi-return intent for Sema; this test pins it as an
 // IR no-op.
 extern TupAB FuncTwoRet(int x)
-    c2go_linkname("pkg.FuncTwoRet")
+    c2go_linkname("pkg.FuncTwoRet", C2GO_GOABI0)
     c2go_return_type(TupAB);
 
 int caller(int x) {

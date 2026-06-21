@@ -2415,6 +2415,12 @@ def err_c2go_typeinfo_reserved_identifier : Error<
   "user-declared identifiers starting with '__c2go_typeinfo_' collide with "
   "the implicit RTTI carrier synthesized by Sema and are rejected">;
 
+def err_c2go_linkname_abi0_illegal_name : Error<
+  "C2GO_GOABI0 (direct reference) cannot be used with the c2go_linkname target "
+  "%0: it contains a character the Plan 9 assembler cannot carry in a symbol "
+  "('-' in an import path, or a method symbol's '('/'*'/')'). Omit C2GO_GOABI0 "
+  "so the binding is routed through a generated stub instead">;
+
 // c2go v15 §P5: C calling into Go.
 def err_c2go_return_type_not_record : Error<
   "'c2go_returntype' requires a struct type naming the Go function's return "

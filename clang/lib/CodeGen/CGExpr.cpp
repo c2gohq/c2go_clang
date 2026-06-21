@@ -3323,6 +3323,44 @@ static LValue EmitGlobalVarDeclLValue(CodeGenFunction &CGF,
     }
   }
 
+  // c2go: a variable bound via c2go_linkname to a Go symbol whose name the
+  // Plan 9 assembler cannot carry ('-' in an import path, or a method symbol)
+  // is pointer-indirected. The .s cannot reference the sanitised local symbol
+  // as data — a Go 1.25 bodyless //go:linkname no longer satisfies a
+  // .s-referenced symbol, and unlike a function there is no wrapper. Instead
+  // c2gobind emits `@_c2go_ptr_<local>` holding the remote variable's address;
+  // load it and use the loaded pointer as this variable's address, so every
+  // read / write / address-of goes through the remote storage. (The variable's
+  // own symbol is never referenced.) Mirrors the __c2go_typeinfo interception
+  // above. A clean-named c2go_linkname variable falls through to the normal
+  // direct reference below.
+  if (const auto *LN = VD->getAttr<C2GoLinknameAttr>()) {
+    StringRef GoTarget = LN->getName();
+    bool HasIllegal = false;
+    for (char C : GoTarget)
+      if (!((C >= 'A' && C <= 'Z') || (C >= 'a' && C <= 'z') ||
+            (C >= '0' && C <= '9') || C == '_' || C == '/' || C == '.')) {
+        HasIllegal = true;
+        break;
+      }
+    if (HasIllegal) {
+      std::string PtrSym = "_c2go_ptr_";
+      for (char C : GoTarget)
+        PtrSym += ((C >= 'A' && C <= 'Z') || (C >= 'a' && C <= 'z') ||
+                   (C >= '0' && C <= '9') || C == '_')
+                      ? C
+                      : '_';
+      llvm::Constant *PtrGV =
+          CGF.CGM.CreateRuntimeVariable(CGF.VoidPtrTy, PtrSym);
+      llvm::Value *Remote = CGF.Builder.CreateLoad(
+          Address(PtrGV, CGF.VoidPtrTy, CGF.getPointerAlign()), "c2go.ptr");
+      llvm::Type *RealVarTy = CGF.getTypes().ConvertTypeForMem(VD->getType());
+      CharUnits Alignment = CGF.getContext().getDeclAlign(VD);
+      Address Addr(Remote, RealVarTy, Alignment);
+      return CGF.MakeAddrLValue(Addr, T, AlignmentSource::Decl);
+    }
+  }
+
   // If it's thread_local, emit a call to its wrapper function instead.
   if (VD->getTLSKind() == VarDecl::TLS_Dynamic &&
       CGF.CGM.getCXXABI().usesThreadWrapperFunction(VD))

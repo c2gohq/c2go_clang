@@ -1,0 +1,151 @@
+# c2go-bind .go emission for the c2go_linkname / __c2go_typeinfo matrix.
+#
+# Clang lowers c2go_linkname targets the Plan 9 assembler can carry (a
+# clean Go name) by burning the symbol straight into the .s. Targets it
+# cannot carry (an import path with `-`, or a method symbol) are emitted
+# under a sanitised current-package local symbol; c2go-bind bridges that
+# local back to the real cross-package symbol with a //go:linkname (a
+# bodyless declaration for an export-direction symbol the .s defines, or
+# an alias-then-wrap stub for an imported one whose body lives elsewhere).
+# Managed structs reach their type descriptor through a per-type
+# _typeinfo_<X> var that c2go-bind pins once at init via reflect.TypeFor
+# (no value construction, so opaque external types work). The pin is
+# emitted ONLY for descriptors the .s actually references, so `reflect`
+# is pulled in only when a typeinfo is genuinely used.
+#
+# This test pins the c2go-bind (Go-side) half of that contract. The .s
+# half is pinned by clang/test/CodeGen/c2go-linkname-plan9-asm.c (and the
+# X86 mirror). Two runs over one manifest, differing only in whether the
+# fixture .s references any descriptor, lock the reflect gating: the
+# descriptor pins and the `reflect` import appear in the first run and
+# vanish in the second, while the type aliases and linkname bridges
+# (which do not depend on typeinfo) stay in both.
+#
+# The c2go-bind binary lives outside llvm-project; see lit.local.cfg for
+# path discovery / the unsupported fallback.
+
+# RUN: rm -rf %t && split-file %s %t
+
+# Run 1: the .s references four descriptors (a C-owner struct, two
+# Go-owner aliases, and an anonymous ref with no Go type). Expect the
+# full emission matrix incl. the reflect pin table.
+# RUN: %c2gobind -pkg example.com/demo -dry-run --sidecar %t/m.json %t/withrefs.s > %t/emit.go
+# RUN: FileCheck %s --check-prefix=EMIT --input-file=%t/emit.go
+
+# Run 2: same manifest, a .s that references no descriptor. The aliases
+# and linkname bridges must still be emitted, but the reflect pin table
+# and the `reflect` import must be fully gated out.
+# RUN: %c2gobind -pkg example.com/demo -dry-run --sidecar %t/m.json %t/norefs.s > %t/gated.go
+# RUN: FileCheck %s --check-prefix=GATED --input-file=%t/gated.go
+# RUN: FileCheck %s --check-prefix=NOREFLECT --input-file=%t/gated.go
+
+# --- Run 1: import set. reflect appears because a typeinfo is used; the
+# arbitrary-package Go-owner type pulls in a deterministic alias import.
+# EMIT:      import (
+# EMIT-NEXT:   libc "github.com/c2go_project/c2go_libc"
+# EMIT-NEXT:   "reflect"
+# EMIT-NEXT:   c2go_imp_example_com_peer "example.com/peer"
+# EMIT-NEXT:   "unsafe"
+# EMIT-NEXT: )
+
+# --- C-owner struct: full body emitted here (clang owns the decl).
+# EMIT:      type Local struct {
+# EMIT-NEXT:   A int32
+# EMIT-NEXT:   B unsafe.Pointer
+# EMIT-NEXT: }
+# --- Go-owner structs: transparent type alias, no body. c2go_libc owner
+# resolves through the `libc` import; an arbitrary package gets the alias.
+# EMIT:      type ExtLibc = libc.DIR
+# EMIT:      type ExtPkg = c2go_imp_example_com_peer.Widget
+
+# --- Reflect pin table: one var per referenced descriptor (sorted),
+# plus a nil var for the anonymous ref that has no nameable Go type.
+# EMIT:      var (
+# EMIT-NEXT:   _typeinfo_ExtLibc unsafe.Pointer
+# EMIT-NEXT:   _typeinfo_ExtPkg unsafe.Pointer
+# EMIT-NEXT:   _typeinfo_Local unsafe.Pointer
+# EMIT-NEXT:   _typeinfo_c2go_anon_00dead unsafe.Pointer
+# EMIT-NEXT: )
+# EMIT:      func _c2go_rtype(t reflect.Type) unsafe.Pointer {
+# EMIT:      func init() {
+# EMIT-NEXT:   _typeinfo_ExtLibc = _c2go_rtype(reflect.TypeFor[ExtLibc]())
+# EMIT-NEXT:   _typeinfo_ExtPkg = _c2go_rtype(reflect.TypeFor[ExtPkg]())
+# EMIT-NEXT:   _typeinfo_Local = _c2go_rtype(reflect.TypeFor[Local]())
+# EMIT-NEXT: }
+
+# --- Casing bridge: a lowercase C name exported under a different Go
+# name needs a //go:linkname. A name whose case already matches does
+# not; the EMIT-NEXT chain proves nothing is emitted between the two.
+# EMIT:      //go:linkname MyFunc example.com/demo.my_func
+# EMIT-NEXT: func MyFunc(x int32) int32
+# EMIT-NEXT: func Already(x int32) int32
+
+# --- Path-b bridges: hyphenated import paths the assembler cannot carry
+# become sanitised locals bridged back to the raw cross-package symbol.
+# An imported target (body in another package) cannot be satisfied by a
+# bodyless //go:linkname on Go 1.25, so c2go-bind emits an alias-then-wrap
+# stub: pull the raw target into a private name, then expose the local as a
+# real nosplit wrapper the .s CALL resolves to.
+# EMIT:      //go:linkname _c2go_imp_github_com_c2go_project_c2go_libc_FImport github.com/c2go-project/c2go-libc.FImport
+# EMIT-NEXT: func _c2go_imp_github_com_c2go_project_c2go_libc_FImport(x int32) int32
+# EMIT:      //go:nosplit
+# EMIT-NEXT: func github_com_c2go_project_c2go_libc_FImport(x int32) int32 {
+# EMIT-NEXT:   return _c2go_imp_github_com_c2go_project_c2go_libc_FImport(x)
+# EMIT-NEXT: }
+# An export-direction bridge (body here in the .s) stays a plain bodyless
+# declaration.
+# EMIT:      //go:linkname github_com_c2go_project_c2go_libc_FExport github.com/c2go-project/c2go-libc.FExport
+# EMIT-NEXT: func github_com_c2go_project_c2go_libc_FExport(x int32) int32
+# An imported '-' variable is pointer-indirected: pull the remote variable
+# into a private name (Go-referenced, so its //go:linkname alias is honoured)
+# and expose a pointer to its storage under the symbol clang's reference loads.
+# EMIT:      //go:linkname _c2go_imp_github_com_c2go_project_c2go_libc_VHyphen github.com/c2go-project/c2go-libc.VHyphen
+# EMIT-NEXT: var _c2go_imp_github_com_c2go_project_c2go_libc_VHyphen int32
+# EMIT-NEXT: var _c2go_ptr_github_com_c2go_project_c2go_libc_VHyphen = &_c2go_imp_github_com_c2go_project_c2go_libc_VHyphen
+
+# --- Run 2: aliases + bridges survive without any descriptor ref...
+# GATED:     c2go_imp_example_com_peer "example.com/peer"
+# GATED:     type ExtLibc = libc.DIR
+# GATED:     type ExtPkg = c2go_imp_example_com_peer.Widget
+# GATED:     //go:linkname MyFunc example.com/demo.my_func
+# GATED:     //go:linkname _c2go_imp_github_com_c2go_project_c2go_libc_FImport github.com/c2go-project/c2go-libc.FImport
+
+# --- ...but the descriptor pin table and the reflect import are gone.
+# NOREFLECT-NOT: "reflect"
+# NOREFLECT-NOT: reflect.TypeFor
+# NOREFLECT-NOT: _c2go_rtype
+# NOREFLECT-NOT: _typeinfo_
+# NOREFLECT-NOT: Type-descriptor
+
+#--- m.json
+{
+  "pkgpath": "example.com/demo",
+  "min_go_version": "go1.22",
+  "max_go_version": "go1.26",
+  "symbols": [
+    {"name":"my_func","kind":"func","go_sig":"func my_func(x int32) int32","go_name":"MyFunc","needs_linkname":true,"asm_symbol":"·my_func"},
+    {"name":"Already","kind":"func","go_sig":"func Already(x int32) int32","go_name":"Already"}
+  ],
+  "types": [
+    {"name":"Local","managed_record":true,"go_def":"struct {\n\tA int32\n\tB unsafe.Pointer\n}"},
+    {"name":"ExtLibc","managed_record":true,"linkage_owner":"go","linkname":"c2go_libc.DIR"},
+    {"name":"ExtPkg","managed_record":true,"linkage_owner":"go","linkname":"example.com/peer.Widget"}
+  ],
+  "linknames": [
+    {"name":"f_import","kind":"func","go_sig":"func f_import(x int32) int32","asm_symbol":"·github_com_c2go_project_c2go_libc_FImport","linkname":"github.com/c2go-project/c2go-libc.FImport","imported":true},
+    {"name":"f_export","kind":"func","go_sig":"func f_export(x int32) int32","asm_symbol":"·github_com_c2go_project_c2go_libc_FExport","linkname":"github.com/c2go-project/c2go-libc.FExport"},
+    {"name":"v_hyphen","kind":"var","go_type":"int32","asm_symbol":"·github_com_c2go_project_c2go_libc_VHyphen","linkname":"github.com/c2go-project/c2go-libc.VHyphen","imported":true}
+  ]
+}
+
+#--- withrefs.s
+TEXT ·alloc(SB), $0-8
+	MOVD	·_typeinfo_Local(SB), R8
+	MOVD	·_typeinfo_ExtLibc(SB), R8
+	MOVD	·_typeinfo_ExtPkg(SB), R8
+	MOVD	·_typeinfo_c2go_anon_00dead(SB), R8
+	RET
+
+#--- norefs.s
+TEXT ·alloc(SB), $0-8
+	RET

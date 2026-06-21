@@ -29,9 +29,13 @@
 
 typedef __SIZE_TYPE__ size_t;
 
-// (1) Function with c2go_linkname - C calls a Go symbol via GoABI0.
+// (1) Function with c2go_linkname - C calls a Go symbol via GoABI0. The 1 is
+// C2GO_GOABI0: runtime.helper has a Go ABI0 entry, so the symbol is referenced
+// directly and the IR symbol name IS the raw linkname. (Without C2GO_GOABI0 a
+// function binds to an external ABIInternal Go symbol and is routed through a
+// sanitised local stub instead.)
 extern int RuntimeGoHelper(int x)
-    __attribute__((c2go_linkname("runtime.helper")));
+    __attribute__((c2go_linkname("runtime.helper", 1)));
 
 // (2) Var with c2go_linkname - C reads a Go-side global. The IR symbol name IS
 // the linkname (no leading `\01` or wrapper), because Plan 9 asm uses the

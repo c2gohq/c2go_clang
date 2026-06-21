@@ -1347,9 +1347,24 @@ def C2GoLinkname : InheritableAttr {
   // Call sites use GoABI0 calling convention. The target package must
   // provide an ABI0 entry, which Go's compiler does automatically for
   // any function with //go:linkname push (single-arg form).
+  //
+  // Optional 2nd int arg `HasAbi0` (C2GO_GOABI0 == 1; default 0) selects how
+  // the binding is lowered for an IMPORTED function:
+  //   * 0 (default) — target is a plain external Go symbol (ABIInternal). The
+  //     .s references a sanitised current-package local symbol and c2gobind
+  //     emits an alias-then-wrap stub (a Go 1.25 bodyless //go:linkname no
+  //     longer satisfies a .s-referenced symbol).
+  //   * 1 (C2GO_GOABI0) — target provides an ABI0 entry (another c2go package,
+  //     or a c2go-libc symbol exposing one). The .s references the symbol
+  //     directly; no stub. Required for clean-name ABI0 targets like
+  //     c2go-libc's GCMalloc. Combining C2GO_GOABI0 with a target name that
+  //     contains a '-' (or a method symbol) is rejected: such a name cannot be
+  //     referenced directly in Plan 9 asm.
+  // Variables ignore the flag (data has no ABI0/ABIInternal split): a clean
+  // name is referenced directly; a '-' name is pointer-indirected.
   let Spellings = [GCC<"c2go_linkname">];
   let Subjects = SubjectList<[Function, Var, Record], ErrorDiag>;
-  let Args = [StringArgument<"Name">];
+  let Args = [StringArgument<"Name">, DefaultIntArgument<"HasAbi0", 0>];
   let Documentation = [Undocumented];
   let LangOpts = [COnly];
 }

@@ -6313,17 +6313,70 @@ static void handleC2GoLinknameAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
         << AL << AL.getRange();
     return;
   }
+  // Optional 2nd arg: the C2GO_GOABI0 selector (0 default / 1). Only 0 or 1
+  // are accepted, mirroring c2go_extern's ExportCase.
+  uint32_t HasAbi0 = 0;
+  if (AL.getNumArgs() >= 2) {
+    Expr *E = AL.getArgAsExpr(1);
+    if (!S.checkUInt32Argument(AL, E, HasAbi0)) {
+      AL.setInvalid();
+      return;
+    }
+    if (HasAbi0 > 1) {
+      S.Diag(AL.getLoc(), diag::err_attribute_argument_out_of_range)
+          << AL << 0 << 1 << E->getSourceRange();
+      AL.setInvalid();
+      return;
+    }
+  }
+  // Does the Go target contain a char the Plan 9 assembler cannot carry raw
+  // in a `·name(SB)` symbol — `-` (hyphenated import paths) or a method
+  // symbol's `(`/`*`/`)`? Mirrors goSymToPlan9 / the manifest path-b check.
+  auto isPlan9Ident = [](char C) {
+    return (C >= 'A' && C <= 'Z') || (C >= 'a' && C <= 'z') ||
+           (C >= '0' && C <= '9') || C == '_';
+  };
+  bool HasIllegal = false;
+  for (char C : Name)
+    if (!(isPlan9Ident(C) || C == '/' || C == '.')) {
+      HasIllegal = true;
+      break;
+    }
+  // C2GO_GOABI0 asks for a direct reference; impossible for a name the
+  // assembler can't carry.
+  if (HasAbi0 && HasIllegal) {
+    S.Diag(AL.getLoc(), diag::err_c2go_linkname_abi0_illegal_name) << Name;
+    AL.setInvalid();
+    return;
+  }
   if (D->hasAttr<AsmLabelAttr>() || D->hasAttr<C2GoLinknameAttr>() ||
       D->hasAttr<GoLinknameAttr>()) {
     S.Diag(AL.getLoc(), diag::warn_attribute_ignored) << AL;
     return;
   }
-  D->addAttr(::new (S.Context) C2GoLinknameAttr(S.Context, AL, Name));
-  // Asm label only makes sense on value decls (functions/variables);
-  // RecordDecls use the attribute purely as a type-identity binding to
-  // a Go-side type (no IR symbol involved).
-  if (isa<ValueDecl>(D))
-    D->addAttr(AsmLabelAttr::CreateImplicit(S.Context, Name, AL.getLoc()));
+  D->addAttr(::new (S.Context) C2GoLinknameAttr(S.Context, AL, Name, (int)HasAbi0));
+  // RecordDecls use the attribute purely as a type-identity binding (no IR
+  // symbol); only functions/variables get an asm label.
+  if (!isa<ValueDecl>(D))
+    return;
+  // Choose the IR symbol the Plan 9 .s will reference:
+  //   * Direct (raw target name; goSymToPlan9 -> pkg·name / address-of) when
+  //     the bound symbol is GoABI0: a function with C2GO_GOABI0 (importing an
+  //     ABI0 target, or exporting a c2go function whose body is GoABI0), or
+  //     any clean-named variable (data has no ABI; a direct cross-package
+  //     data reference resolves).
+  //   * Stub/local (sanitised current-package ident; goSymToPlan9 -> ·local)
+  //     otherwise: a function importing an external ABIInternal Go symbol
+  //     (c2gobind emits an alias-then-wrap stub — a Go 1.25 bodyless
+  //     //go:linkname no longer satisfies a .s-referenced symbol), or a '-'
+  //     variable (pointer-indirected at its use sites; see CGExpr).
+  bool Direct = isa<VarDecl>(D) ? !HasIllegal : ((int)HasAbi0 != 0 && !HasIllegal);
+  std::string Label = Name.str();
+  if (!Direct)
+    for (char &C : Label)
+      if (!isPlan9Ident(C))
+        C = '_';
+  D->addAttr(AsmLabelAttr::CreateImplicit(S.Context, Label, AL.getLoc()));
 }
 
 // handleC2GoExternAttr (#269): exports a c2go-managed function/var to

@@ -634,18 +634,51 @@ bool AArch64Plan9InstPrinter::tryPrintADRPPairCompletion(const MCInst *MI,
     StringRef Sym = PendingADRPSymbol;
     MCRegister Rd = MI->getOperand(0).getReg();
     if (PendingADRPIsGOT) {
-      // GOT-indirect (#258): ADRP@GOTPAGE + LDR@GOTPAGEOFF loads the
-      // ADDRESS of `sym` (the GOT slot holds &sym), so this lowers to an
-      // address-of, NOT a value load — Plan 9 / Go asm has no GOT and the
-      // symbol is directly addressable. The actual value load is the
-      // SUBSEQUENT `LDR [Rd]`; emitting a value load here would make that
-      // double-dereference (nil-deref for an uninitialised managed global).
-      O << "\tMOVD $" << goSymToPlan9(Sym);
-      emitSymbolOffsetSuffix(O, Off);
-      O << "(SB), ";
-      printPlan9GPR(O, Rd);
-      O << "\n";
-      rememberRegHoldsPage(Rd, PendingADRPSymbol);
+      // c2go (#218 parity): an external typeinfo descriptor (a Go-owner
+      // managed struct) is GOT-indirect here; route it to the SAME
+      // Â·_typeinfo_<X>(SB) reflect-pin var as the direct C-owner ADD path
+      // above, so c2gobind resolves it. X86 already composes the GOT path
+      // with this rewrite; AArch64 previously fell through to the raw
+      // c2go_typeinfoÂ·<X> mangling (link-time undefined).
+      StringRef Ti = Sym;
+      bool TiRewrote = true;
+      if (Ti.consume_front("type:")) {
+        std::string Name = Ti.str();
+        auto Dot = Name.rfind('.');
+        if (Dot != std::string::npos)
+          Name = Name.substr(Dot + 1);
+        O << "\tMOVD \xc2\xb7_typeinfo_" << Name << "(SB), ";
+        printPlan9GPR(O, Rd);
+      } else if (Ti.consume_front("c2go.typeinfo.")) {
+        std::string SymStr(Ti);
+        if (SymStr.rfind("c2go.", 0) == 0)
+          for (char &C : SymStr)
+            if (C == '.')
+              C = '_';
+        O << "\tMOVD \xc2\xb7_typeinfo_" << SymStr << "(SB), ";
+        printPlan9GPR(O, Rd);
+      } else {
+        TiRewrote = false;
+      }
+      if (TiRewrote) {
+        if (Off) {
+          O << "\n\tADD $" << Off << ", ";
+          printPlan9GPR(O, Rd);
+        }
+        O << "\n";
+        // typeinfo *pointer*, not a page address — do not RegHoldsPage.
+      } else {
+        // GOT-indirect (#258): ADRP@GOTPAGE + LDR@GOTPAGEOFF loads the
+        // ADDRESS of `sym` (the GOT slot holds &sym), so this lowers to an
+        // address-of, NOT a value load. The actual value load is the
+        // SUBSEQUENT `LDR [Rd]`.
+        O << "\tMOVD $" << goSymToPlan9(Sym);
+        emitSymbolOffsetSuffix(O, Off);
+        O << "(SB), ";
+        printPlan9GPR(O, Rd);
+        O << "\n";
+        rememberRegHoldsPage(Rd, PendingADRPSymbol);
+      }
     } else {
       // ADRP+LDR → MOVD/MOVW ·sym+N(SB), Rd  (direct value load).
       O << "\t" << (Op == AArch64::LDRXui ? "MOVD" : "MOVW")

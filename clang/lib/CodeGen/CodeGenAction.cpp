@@ -32,6 +32,8 @@
 #include "clang/Basic/SourceManager.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/CodeGen/BackendUtil.h"
+#include "clang/CodeGen/CGFunctionInfo.h"
+#include "clang/CodeGen/CodeGenABITypes.h"
 #include "clang/CodeGen/ModuleBuilder.h"
 #include "clang/Driver/DriverDiagnostic.h"
 #include "clang/Frontend/CompilerInstance.h"
@@ -264,6 +266,140 @@ static uint64_t c2goComputeArgSize(const FunctionDecl *FD,
   return clang::c2go::computeC2GoArgSize(FD, Ctx);
 }
 
+// c2go §E (unmanaged_extern full ABI): emit a per-target parameter-passing
+// description derived from clang's own C-ABI lowering (CGFunctionInfo /
+// ABIArgInfo). c2gobind generates the dispatch wrapper from this instead of
+// re-deriving the SysV / AAPCS64 eightbyte / HFA classification on the Go side
+// (which is what purego must do because it only has the Go reflect.Type).
+//
+// Schema (target-specific, alongside the per-target Plan 9 .s):
+//   { "ret":    <slot>,
+//     "params": [ <slot>, ... ] }
+// where <slot> is one of:
+//   { "pass":"void" }                                   // ignored / void return
+//   { "pass":"direct", "words":[ <word>, ... ] }        // register-passed
+//   { "pass":"byval",  "sz":N }                         // SysV memory: stack bytes
+//   { "pass":"indirect","sz":N }                        // AAPCS large: pointer in int reg
+//   { "pass":"sret",   "sz":N }                         // hidden-pointer struct return
+// and <word> is { "f":bool, "off":N, "sz":N [, "sext":true] } — a machine word
+// taken from byte offset `off` (size `sz`) of the argument/return image, routed
+// to a float ("f":true) or integer register; "sext" marks a sub-word signed
+// scalar the wrapper must sign-extend.
+//
+// Returns nullopt for ABI forms not yet wired (Expand / CoerceAndExpand /
+// InAlloca) so the caller leaves the legacy has_float/has_aggregate fields and
+// c2gobind falls back.
+static std::optional<llvm::json::Object>
+c2goBuildAbiDesc(CodeGen::CodeGenModule &CGM, const FunctionDecl *FD) {
+  if (!FD->getType()->getAs<FunctionProtoType>())
+    return std::nullopt; // K&R / no prototype: fall back
+  CanQual<FunctionProtoType> CanFT =
+      FD->getType()->getCanonicalTypeUnqualified().castAs<FunctionProtoType>();
+  const CodeGen::CGFunctionInfo &FI =
+      CodeGen::arrangeFreeFunctionType(CGM, CanFT);
+  const llvm::DataLayout &DL = CGM.getDataLayout();
+
+  auto isFloatClass = [](llvm::Type *T) { return T->isFPOrFPVectorTy(); };
+
+  // Decompose a Direct coerce type into register words (one per element of a
+  // struct/array coerce, else the scalar itself). The coerce element offset is
+  // the byte offset into the argument image to read the word from.
+  auto coerceWords = [&](llvm::Type *T, unsigned BaseOff,
+                         llvm::json::Array &Words) {
+    if (auto *ST = dyn_cast<llvm::StructType>(T)) {
+      const llvm::StructLayout *SL = DL.getStructLayout(ST);
+      for (unsigned i = 0, n = ST->getNumElements(); i < n; ++i) {
+        llvm::Type *E = ST->getElementType(i);
+        llvm::json::Object W;
+        W["f"] = isFloatClass(E);
+        W["off"] = (int64_t)(BaseOff + SL->getElementOffset(i));
+        W["sz"] = (int64_t)DL.getTypeStoreSize(E).getFixedValue();
+        Words.push_back(std::move(W));
+      }
+    } else if (auto *AT = dyn_cast<llvm::ArrayType>(T)) {
+      llvm::Type *E = AT->getElementType();
+      uint64_t ESz = DL.getTypeAllocSize(E).getFixedValue();
+      uint64_t SSz = DL.getTypeStoreSize(E).getFixedValue();
+      for (uint64_t i = 0, n = AT->getNumElements(); i < n; ++i) {
+        llvm::json::Object W;
+        W["f"] = isFloatClass(E);
+        W["off"] = (int64_t)(BaseOff + i * ESz);
+        W["sz"] = (int64_t)SSz;
+        Words.push_back(std::move(W));
+      }
+    } else {
+      llvm::json::Object W;
+      W["f"] = isFloatClass(T);
+      W["off"] = (int64_t)BaseOff;
+      W["sz"] = (int64_t)DL.getTypeStoreSize(T).getFixedValue();
+      Words.push_back(std::move(W));
+    }
+  };
+
+  auto slotOf = [&](const CodeGen::ABIArgInfo &AI, QualType QT,
+                    llvm::json::Object &Out) -> bool {
+    switch (AI.getKind()) {
+    case CodeGen::ABIArgInfo::Ignore:
+      Out["pass"] = "void";
+      return true;
+    case CodeGen::ABIArgInfo::Extend:
+    case CodeGen::ABIArgInfo::Direct: {
+      Out["pass"] = "direct";
+      llvm::json::Array Words;
+      coerceWords(AI.getCoerceToType(), AI.getDirectOffset(), Words);
+      if (AI.getKind() == CodeGen::ABIArgInfo::Extend && AI.isSignExt() &&
+          Words.size() == 1)
+        (*Words[0].getAsObject())["sext"] = true;
+      Out["words"] = std::move(Words);
+      return true;
+    }
+    case CodeGen::ABIArgInfo::Indirect:
+    case CodeGen::ABIArgInfo::IndirectAliased: {
+      int64_t Sz = CGM.getContext().getTypeSizeInChars(QT).getQuantity();
+      Out["pass"] = (AI.isIndirect() && AI.getIndirectByVal()) ? "byval"
+                                                               : "indirect";
+      Out["sz"] = Sz;
+      return true;
+    }
+    default:
+      return false; // Expand / CoerceAndExpand / InAlloca: not wired
+    }
+  };
+
+  llvm::json::Object Abi;
+  {
+    const CodeGen::ABIArgInfo &RI = FI.getReturnInfo();
+    llvm::json::Object Ret;
+    if (RI.isIgnore()) {
+      Ret["pass"] = "void";
+    } else if (RI.isIndirect()) {
+      Ret["pass"] = "sret";
+      Ret["sz"] = (int64_t)CGM.getContext()
+                      .getTypeSizeInChars(FD->getReturnType())
+                      .getQuantity();
+    } else if (RI.isDirect() || RI.isExtend()) {
+      Ret["pass"] = "direct";
+      llvm::json::Array Words;
+      coerceWords(RI.getCoerceToType(), RI.getDirectOffset(), Words);
+      Ret["words"] = std::move(Words);
+    } else {
+      return std::nullopt;
+    }
+    Abi["ret"] = std::move(Ret);
+  }
+  {
+    llvm::json::Array Params;
+    for (const auto &A : FI.arguments()) {
+      llvm::json::Object P;
+      if (!slotOf(A.info, A.type, P))
+        return std::nullopt;
+      Params.push_back(std::move(P));
+    }
+    Abi["params"] = std::move(Params);
+  }
+  return Abi;
+}
+
 // c2go #444 — three Go-export-name spelling helpers
 // (c2goCapitalizeUnderscore / c2goExportGoName / c2goInitMainRenamedSymbol)
 // live in the shared header `llvm/Transforms/C2Go/C2GoExportName.h`, which
@@ -305,7 +441,8 @@ collectC2GoModuleGCMaskVars(const llvm::Module *M) {
 static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
                                             const LangOptions &LangOpts,
                                             DiagnosticsEngine &Diags,
-                                            llvm::Module *Mod) {
+                                            llvm::Module *Mod,
+                                            CodeGen::CodeGenModule *CGM) {
   llvm::json::Object Root;
   Root["pkgpath"] = LangOpts.C2GoPackagePath.empty()
                        ? "main"
@@ -449,6 +586,37 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
           Sym["has_float"] = true;
         if (HasAggregate)
           Sym["has_aggregate"] = true;
+      }
+      // c2go §E full ABI: for unmanaged_extern targets, attach the per-target
+      // parameter-passing description from clang's C-ABI lowering so c2gobind
+      // generates a real (float / struct-aware) dispatch wrapper instead of a
+      // panic stub. Falls back silently (legacy has_float/has_aggregate stay)
+      // for not-yet-wired ABI forms or when no CodeGenModule is available.
+      if (CGM && !HasBody) {
+        if (auto Abi = c2goBuildAbiDesc(*CGM, FD))
+          Sym["cabi"] = std::move(*Abi);
+        // By-value struct params/returns of an unmanaged_extern need their Go
+        // type emitted so the wrapper signature is correctly sized. Plain C
+        // structs carry no C2GoStructAttr, so seed the record worklist
+        // directly (its field-walking path builds the layout); the Emitted set
+        // dedups against managed records.
+        auto SeedRecord = [&](QualType QT) {
+          QT = QT.getCanonicalType();
+          if (const auto *RT = QT->getAs<RecordType>())
+            if (const RecordDecl *Def = RT->getDecl()->getDefinition())
+              RecordWorklist.push_back(Def);
+        };
+        for (const auto *PVD : FD->parameters())
+          SeedRecord(PVD->getType());
+        SeedRecord(FD->getReturnType());
+        // c2go §E (.s-wrapper model): if clang synthesized the GoABI0 dispatch
+        // wrapper for this symbol (EmitC2GoUnmanagedExternWrappers tagged the
+        // IR function with `c2go-wrapper-in-asm`), tell c2gobind to emit only
+        // the bodyless decl + fn-address glue, NOT its own Go dispatch wrapper.
+        if (Mod)
+          if (llvm::Function *WF = Mod->getFunction(CName))
+            if (WF->hasFnAttribute("c2go-wrapper-in-asm"))
+              Sym["wrapper_in_asm"] = true;
       }
       (void)DefFD;
       // c2go WF2 (#367 Bug A): mirror the just-built JSON symbols[]
@@ -871,7 +1039,16 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
           return false;
       return true;
     };
-    if (plan9Direct(Target)) continue; // path (a), nothing to bridge
+    // Direct (path a) — referenced raw in the .s, no Go-side bridge — only
+    // when the bound symbol is GoABI0-reachable by name: a clean-named
+    // variable (data has no ABI), or a function explicitly marked C2GO_GOABI0
+    // (the target provides an ABI0 entry). A function WITHOUT C2GO_GOABI0
+    // imports an external ABIInternal Go symbol and needs the alias-then-wrap
+    // stub even when its name is clean; a '-'/method name always needs the
+    // local-symbol path. Mirrors handleC2GoLinknameAttr's AsmLabel routing.
+    bool VarKind = isa<VarDecl>(D);
+    bool Direct = plan9Direct(Target) && (VarKind || LA->getHasAbi0() != 0);
+    if (Direct) continue; // path (a), nothing to bridge
     const Decl *Canonical = D->getCanonicalDecl();
     if (!LinknameEmitted.insert(Canonical).second) continue;
 
@@ -880,11 +1057,21 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
       Bridge["name"] = FD->getNameAsString();
       Bridge["kind"] = "func";
       Bridge["go_sig"] = c2goBuildGoSig(FD, Ctx);
+      // Import vs export direction. When no definition exists in this TU the
+      // function body lives in another package and the .s only CALLs the
+      // sanitised local symbol. On Go 1.25 a bodyless `//go:linkname` no
+      // longer satisfies a .s-referenced symbol (same breakage the runtime
+      // helper preamble works around), so c2gobind must emit an
+      // alias-then-wrap stub rather than a bodyless bridge. A definition
+      // present here is the export direction: the .s provides the body and
+      // the plain bodyless bridge is correct.
+      Bridge["imported"] = (FD->getDefinition() == nullptr);
     } else if (const auto *VD = dyn_cast<VarDecl>(D)) {
       bool Unmanaged = VD->hasAttr<C2GoUnmanagedAttr>();
       Bridge["name"] = VD->getNameAsString();
       Bridge["kind"] = "var";
       Bridge["go_type"] = c2goMapType(VD->getType(), Ctx, Unmanaged);
+      Bridge["imported"] = (VD->getDefinition() == nullptr);
     } else {
       continue;
     }
@@ -956,7 +1143,8 @@ void BackendConsumer::HandleTranslationUnit(ASTContext &C) {
     // scoop up the `@c2go.global.gcmask.<var>` bitmaps emitted by
     // CodeGenModule::emitC2GoGlobalGCMask into the manifest's
     // `module_gcmask` section.
-    C2GoManifest = buildC2GoManifest(C, CI.getLangOpts(), Diags, getModule());
+    C2GoManifest =
+        buildC2GoManifest(C, CI.getLangOpts(), Diags, getModule(), &Gen->CGM());
     C2GoManifestBuilt = true;
     if (!CI.getLangOpts().C2GoEmitManifestPath.empty())
       writeC2GoManifest(C2GoManifest,

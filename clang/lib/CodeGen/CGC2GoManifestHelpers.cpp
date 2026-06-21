@@ -77,6 +77,16 @@ std::string mapC2GoType(QualType QT, const ASTContext &Ctx, bool IsUnmanaged) {
       }
       if (!RD->getNameAsString().empty())
         return RD->getNameAsString();
+      // c2go §E: a by-value struct passed to / returned from an
+      // unmanaged_extern is usually a `typedef struct { ... } T;` whose
+      // RecordDecl is anonymous. Use the typedef name so the generated Go
+      // wrapper signature carries a real, correctly-sized type (the manifest
+      // emits its layout — see the RecordWorklist seeding in CodeGenAction).
+      // Without this the struct would degrade to `uintptr` and the ABI0 frame
+      // size would be wrong.
+      if (const TypedefNameDecl *TD = RD->getTypedefNameForAnonDecl())
+        if (!TD->getNameAsString().empty())
+          return TD->getNameAsString();
     }
   }
   return "uintptr";

@@ -38,6 +38,27 @@
 #define c2go_extern     __attribute__((c2go_extern))
 #define c2go_linkname(name) __attribute__((c2go_linkname(name)))
 
+/* Named selector values (use instead of bare 0 / 1). */
+/* c2go_extern Go-name casing (its optional int arg): the bare `c2go_extern`
+ * macro is the default (C2GO_EXPORTED). Passing C2GO_KEEPCASE needs the raw
+ * attribute (`__attribute__((c2go_extern(C2GO_KEEPCASE)))`) because the
+ * object-like `c2go_extern` macro shadows the attribute spelling, so a
+ * convenience wrapper macro can't carry the arg. Keep-case is currently
+ * unused; these names document the values. */
+#define C2GO_EXPORTED   1   /* default: Go name upper-first (foo -> Foo) */
+#define C2GO_KEEPCASE   0   /* keep the C symbol's casing */
+
+/* c2go_linkname target-ABI selector (its optional 2nd arg): */
+#define C2GO_GOABI0     1   /* target provides an ABI0 entry -> direct reference */
+/* (omit the 2nd arg) -> external Go symbol (ABIInternal) -> alias-then-wrap stub */
+
+/* c2go_linkname takes a Go symbol name and an OPTIONAL 2nd selector. Variadic
+ * so both forms work:
+ *   c2go_linkname("pkg.Sym")               // external Go symbol -> stub
+ *   c2go_linkname("pkg.Sym", C2GO_GOABI0)  // target has ABI0 -> direct
+ */
+#define c2go_linkname(...) __attribute__((c2go_linkname(__VA_ARGS__)))
+
 /* c2go_return_type(struct X): marks a c2go_linkname/c2go_extern function as
  * returning a Go multi-value tuple. The named C struct's fields correspond
  * 1:1 (order + type) to the called Go function's return values; the call
@@ -65,6 +86,7 @@
 
 void *gc_malloc(const void *type_info, __SIZE_TYPE__ n)
     c2go_linkname("github.com/c2go_project/c2go_libc.GCMalloc");
+    c2go_linkname("github.com/c2go_project/c2go_libc.GCMalloc", C2GO_GOABI0);
 
 /*===-- RTTI: *runtime._type for a managed type (v15 §P4 / §4.6.5) ---------
  * The Go-runtime `*_type` for a managed Record type T lives in a per-type
@@ -107,6 +129,7 @@ static inline void *gc_malloc_array(const void *type_info,
 
 extern int *__c2go_errno_ptr(void)
     c2go_linkname("github.com/c2go_project/c2go_libc.ErrnoPtr");
+    c2go_linkname("github.com/c2go_project/c2go_libc.ErrnoPtr", C2GO_GOABI0);
 
 #define errno (*__c2go_errno_ptr())
 

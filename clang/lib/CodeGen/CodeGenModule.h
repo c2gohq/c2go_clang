@@ -2120,6 +2120,17 @@ private:
   /// transform is rolled back for that function. Must run after EmitDeferred().
   void EmitC2GoLeafWrappers();
 
+  /// c2go §E (.s-wrapper model): synthesize a GoABI0 forwarding wrapper body for
+  /// each USED bodyless unmanaged_extern (a c2go_extern function with no body in
+  /// this TU and no c2go_linkname). The wrapper marshals its GoABI0 stack args
+  /// into a purego syscallArgs block on its own frame and `CALL runtime·cgocall`
+  /// directly through the syscallX trampoline, so the Plan 9 .s carries the
+  /// whole dispatch and the function gets an automatic args stackmap from the
+  /// normal c2go frame pipeline. Phase A handles scalar/pointer signatures only;
+  /// float / by-value struct / sret forms are left bodyless and fall back to the
+  /// c2go-bind Go-dispatch wrapper. Gated by -c2go-extern-wrappers (default off
+  /// during migration). Must run after EmitDeferred().
+  void EmitC2GoUnmanagedExternWrappers();
   /// Try to emit external vtables as available_externally if they have emitted
   /// all inlined virtual functions.  It runs after EmitDeferred() and therefore
   /// is not allowed to create new references to things that need to be emitted

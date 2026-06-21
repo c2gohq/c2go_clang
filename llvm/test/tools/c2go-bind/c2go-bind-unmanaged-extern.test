@@ -1,0 +1,109 @@
+# c2go-bind emission for §E unmanaged_extern symbols — a c2go_extern function
+# with NO body in the compilation, calling into a host library symbol. c2go-bind
+# emits a Go wrapper whose auto-generated ABI0 entry satisfies the Plan 9 .s
+# `CALL ·<name>(SB)` site; the wrapper dispatches through c2go-libc's `external`
+# package (a thin shim over ebitengine/purego: SyscallN + Dlsym, with purego's
+# fakecgo making runtime.cgocall work under CGO_ENABLED=0).
+#
+# This pins every emission dimension:
+#   * scalar function  -> lazy runtime Dlsym(RTLD_DEFAULT) + SyscallN dispatch
+#   * void return      -> SyscallN, no result
+#   * variadic         -> `_va ...any` packed via _c2goVariadicArg + SyscallN
+#   * float fixed arg/return  -> panic stub (SyscallN is integer-only, phase 2.5)
+#   * aggregate by value      -> panic stub (ABI can't be expressed as ...uintptr)
+#   * lowercase C name -> //go:linkname exported alias (Ext<Name>)
+# and the `-l<name>` static-bind variant (//go:cgo_import_dynamic).
+#
+# c2go-bind lives outside llvm-project; see lit.local.cfg for path discovery.
+
+# RUN: rm -rf %t && split-file %s %t
+
+# Default: no -l -> runtime Dlsym resolution.
+# RUN: %c2gobind -pkg demo -dry-run %t/m.json | FileCheck %s --check-prefix=EXT
+
+# -l<name> -> load-time cgo_import_dynamic binding (a nonexistent lib name so
+# the soname probe always falls back to the bare ELF token, deterministically).
+# RUN: %c2gobind -pkg demo -dry-run -l c2gotestlib %t/m.json | FileCheck %s --check-prefix=DYN
+
+# --- Imports: external (dispatch) + reflect (variadic packer) + unsafe.
+# EXT:      external "github.com/c2go_project/c2go_libc/external"
+# EXT:      "reflect"
+# EXT:      "unsafe"
+
+# Symbols are emitted in name-sorted order: ext_log, ext_mkpt, ext_printf,
+# ext_read, ext_sqrt.
+
+# --- void return: SyscallN with no result, + exported alias.
+# EXT:      func ext_log(code int32) {
+# EXT:      _, _, _ = external.SyscallN(fn,
+# EXT-NEXT:   uintptr(code))
+# EXT:      //go:linkname ExtLog demo.ext_log
+# EXT-NEXT: func ExtLog(code int32)
+
+# --- aggregate-by-value: panic stub (not a broken wrapper), loud + actionable.
+# EXT:      has_aggregate=true
+# EXT:      func ext_mkpt(p Pt) Pt {
+# EXT:      panic("c2go {{.*}}unmanaged extern ext_mkpt unsupported
+
+# --- variadic: fixed param coerced, trailing ...any packed, slice-dispatched.
+# EXT:      func ext_printf(fmt *byte, _va ...any) int32 {
+# EXT:      _argv := make([]uintptr, 0, 1+len(_va))
+# EXT-NEXT:   _argv = append(_argv, uintptr(unsafe.Pointer(fmt)))
+# EXT:      _argv = append(_argv, _c2goVariadicArg(_a))
+# EXT:      r1, _, _ := external.SyscallN(fn, _argv...)
+
+# --- scalar: lazy Dlsym(RTLD_DEFAULT) resolve cached in a uintptr, SyscallN.
+# EXT:      fn, err := external.Dlsym(external.RTLD_DEFAULT, "ext_read")
+# EXT:      func ext_read(fd int32, buf unsafe.Pointer, n uint64) int64 {
+# EXT:      r1, _, _ := external.SyscallN(fn,
+# EXT-NEXT:   uintptr(fd),
+
+# --- float fixed arg/return: panic stub.
+# EXT:      has_float=true
+# EXT:      func ext_sqrt(v float64) float64 {
+# EXT:      panic("c2go {{.*}}unmanaged extern ext_sqrt unsupported
+
+# --- the variadic packer helper (emitted once, after the wrappers).
+# EXT:      func _c2goVariadicArg(a any) uintptr {
+# EXT:      panic("c2go {{.*}}float in variadic args needs FP-aware dispatch
+
+# The default path never uses load-time binding.
+# EXT-NOT:  cgo_import_dynamic
+
+# --- -l<name>: each scalar/void/variadic symbol binds at load time via
+# //go:cgo_import_dynamic instead of the runtime Dlsym path. The directive
+# names the (probe-fallback) bare ELF soname.
+# DYN:      //go:cgo_import_dynamic _c2goExtern_ext_read_fn ext_read "libc2gotestlib.so"
+# DYN-NEXT: //go:linkname _c2goExtern_ext_read_fn _c2goExtern_ext_read_fn
+# DYN-NEXT: var _c2goExtern_ext_read_fn uintptr
+# Static binding replaces the runtime resolver entirely (the default path's
+# lazy _resolve() helper is not emitted; the stub workaround comments still
+# mention Dlsym, so key on the resolver function name instead).
+# DYN-NOT:  _c2goExtern_ext_read_resolve
+#
+# KNOWN BUG (see the cgo_import_dynamic / purego analysis): a
+# //go:cgo_import_dynamic symbol is LOCATED AT the imported function, so the
+# function pointer is the symbol's ADDRESS (&sym), as ebitengine/purego does
+# (`var dlopen uint8; uintptr(unsafe.Pointer(&dlopen))`). The wrapper above
+# instead reads the symbol's VALUE (`fn := _c2goExtern_ext_read_fn`), which is
+# the bytes at the function entry, not its address — and on darwin/arm64 the
+# address form additionally needs an asm-stub indirection purego ships but
+# c2go-bind does not. This -l path is therefore not wired up correctly and is
+# currently unexercised (the working path is the default runtime Dlsym above).
+# The CHECKs here pin only the (correct) import directives, not the buggy
+# value-based dispatch; tighten them once the address-vs-value fix lands.
+
+#--- m.json
+{
+  "pkgpath": "demo",
+  "min_go_version": "go1.22",
+  "max_go_version": "go1.26",
+  "symbols": [
+    {"name":"ext_log","kind":"unmanaged_extern","abi":"abi0","go_sig":"func ext_log(code int32)","go_name":"ExtLog","needs_linkname":true},
+    {"name":"ext_mkpt","kind":"unmanaged_extern","abi":"abi0","go_sig":"func ext_mkpt(p Pt) Pt","go_name":"ExtMkpt","needs_linkname":true,"has_aggregate":true},
+    {"name":"ext_printf","kind":"unmanaged_extern","abi":"abi0","go_sig":"func ext_printf(fmt *byte) int32","go_name":"ExtPrintf","needs_linkname":true,"is_variadic":true},
+    {"name":"ext_read","kind":"unmanaged_extern","abi":"abi0","go_sig":"func ext_read(fd int32, buf unsafe.Pointer, n uint64) int64","go_name":"ExtRead","needs_linkname":true},
+    {"name":"ext_sqrt","kind":"unmanaged_extern","abi":"abi0","go_sig":"func ext_sqrt(v float64) float64","go_name":"ExtSqrt","needs_linkname":true,"has_float":true}
+  ],
+  "types": []
+}
