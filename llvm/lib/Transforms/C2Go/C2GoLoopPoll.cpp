@@ -52,7 +52,7 @@ using namespace llvm;
 #define DEBUG_TYPE "c2go-loop-poll"
 
 // Default ON (#362). The pass injects calls to c2go-libc's Gosched bridge
-// (`github.com/c2go_project/c2go_libc.Gosched`, a Go-side thin wrapper for
+// (`github.com/c2gohq/c2go_libc.Gosched`, a Go-side thin wrapper for
 // `runtime.Gosched` with a `//go:linkname` push so the ABI0 entry is
 // generated). `runtime.Gosched` itself has no linkname push and is
 // ABIInternal-only, so c2go .s cannot target it directly. The c2go-libc
@@ -219,10 +219,10 @@ static bool injectPoll(Loop &L, uint64_t M, Function &F) {
   // an ABI0 entry is emitted. The Plan9 streamer encodes `.`/`/` in this
   // multi-segment path via U+00B7 / U+2215 Unicode escapes (symbolToPlan9
   // path-a), producing
-  //   BL github·com∕c2go_project∕c2go_libc·Gosched(SB)
+  //   BL github·com∕c2gohq∕c2go_libc·Gosched(SB)
   // which `go tool asm` resolves to the c2go-libc ABI0 wrapper.
   FunctionCallee Gosched = F.getParent()->getOrInsertFunction(
-      "github.com/c2go_project/c2go_libc.Gosched", VoidFT);
+      "github.com/c2gohq/c2go_libc.Gosched", VoidFT);
   // #455(c): the per-injection `enforceGoABI0AndOptLeaf(GoschedF, false)`
   // retrofit was deleted — the pass-end sweep below (run unconditionally
   // on every pass invocation) already retrofits the helper declaration
@@ -327,11 +327,11 @@ PreservedAnalyses C2GoLoopPollPass::run(Module &M, ModuleAnalysisManager &AM) {
   // PreservedAnalyses::none().
   bool SweepChanged = false;
   if (auto *GoschedF =
-          M.getFunction("github.com/c2go_project/c2go_libc.Gosched"))
+          M.getFunction("github.com/c2gohq/c2go_libc.Gosched"))
     SweepChanged |=
         llvm::c2go::enforceGoABI0AndOptLeaf(GoschedF, /*IsLeaf=*/false);
   SweepChanged |= llvm::c2go::enforceCallSiteCC(
-      M.getFunction("github.com/c2go_project/c2go_libc.Gosched"));
+      M.getFunction("github.com/c2gohq/c2go_libc.Gosched"));
 
   LLVM_DEBUG(dbgs() << "c2go-loop-poll: injected " << NInjected
                     << " poll(s) in " << M.getName() << "\n");

@@ -32,7 +32,7 @@ declare void @llvm.memcpy.p1.p1.i64(ptr addrspace(1), ptr addrspace(1), i64, i1)
 ; CHECK-LABEL: define void @both_paths{{.*}} gc "c2go-gc"
 ;
 ; libc.Memmove is the real non-leaf path: it must end up under a statepoint.
-; CHECK: gc.statepoint{{.*}}@"github.com/c2go_project/c2go_libc.Memmove"
+; CHECK: gc.statepoint{{.*}}@"github.com/c2gohq/c2go_libc.Memmove"
 ;
 ; The typed helper is a leaf and must NOT be wrapped in a statepoint.
 ; CHECK-NOT: gc.statepoint{{.*}}@_c2go_typedmemmove
@@ -47,7 +47,7 @@ define void @both_paths(ptr addrspace(1) %dst, ptr addrspace(1) %src) {
 ; The libc.Memmove declaration must NOT carry gc-leaf-function on its line - it
 ; is a real non-leaf libc copy path and RS4GC needs to wrap it. The pattern
 ; below asserts the declaration line does not mention the attribute.
-; CHECK-NOT: declare {{.*}}@"github.com/c2go_project/c2go_libc.Memmove"{{.*}}gc-leaf-function
+; CHECK-NOT: declare {{.*}}@"github.com/c2gohq/c2go_libc.Memmove"{{.*}}gc-leaf-function
 
 ; The typed helper declaration must still carry gc-leaf-function via its
 ; attribute group.

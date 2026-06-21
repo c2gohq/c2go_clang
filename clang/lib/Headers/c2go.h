@@ -84,7 +84,7 @@
  *===-----------------------------------------------------------------------*/
 
 void *gc_malloc(const void *type_info, __SIZE_TYPE__ n)
-    c2go_linkname("github.com/c2go_project/c2go_libc.GCMalloc", C2GO_GOABI0);
+    c2go_linkname("github.com/c2gohq/c2go_libc.GCMalloc", C2GO_GOABI0);
 
 /*===-- RTTI: *runtime._type for a managed type (v15 §P4 / §4.6.5) ---------
  * The Go-runtime `*_type` for a managed Record type T lives in a per-type
@@ -145,7 +145,7 @@ static inline void *gc_malloc_array(const void *type_info,
 /*===-- errno accessor (per-goroutine via GLS) ----------------------------*/
 
 extern int *__c2go_errno_ptr(void)
-    c2go_linkname("github.com/c2go_project/c2go_libc.ErrnoPtr", C2GO_GOABI0);
+    c2go_linkname("github.com/c2gohq/c2go_libc.ErrnoPtr", C2GO_GOABI0);
 
 #define errno (*__c2go_errno_ptr())
 

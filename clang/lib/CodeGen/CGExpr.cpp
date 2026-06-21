@@ -7016,8 +7016,8 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
     if (auto *FD = dyn_cast_or_null<FunctionDecl>(TargetDecl)) {
       if (auto *LN = FD->getAttr<C2GoLinknameAttr>()) {
         StringRef Name = LN->getName();
-        bool IsMemcpy = Name == "github.com/c2go_project/c2go_libc.Memcpy" ||
-                        Name == "github.com/c2go_project/c2go_libc.Memmove";
+        bool IsMemcpy = Name == "github.com/c2gohq/c2go_libc.Memcpy" ||
+                        Name == "github.com/c2gohq/c2go_libc.Memmove";
         if (IsMemcpy) {
           // The c2go-libc Memcpy/Memmove stub is `(dst, src, n)`, so the
           // byte length is operand 2. attachC2GoElemTypeMetadata uses the

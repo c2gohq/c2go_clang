@@ -42,9 +42,10 @@
 # --- Run 1: import set. reflect appears because a typeinfo is used; the
 # arbitrary-package Go-owner type pulls in a deterministic alias import.
 # EMIT:      import (
-# EMIT-NEXT:   libc "github.com/c2go_project/c2go_libc"
+# EMIT-NEXT:   libc "github.com/c2gohq/c2go_libc"
 # EMIT-NEXT:   "reflect"
 # EMIT-NEXT:   c2go_imp_example_com_peer "example.com/peer"
+# EMIT-NEXT:   _ "github.com/c2gohq/c2go-libc"
 # EMIT-NEXT:   "unsafe"
 # EMIT-NEXT: )
 
@@ -86,29 +87,29 @@
 # bodyless //go:linkname on Go 1.25, so c2go-bind emits an alias-then-wrap
 # stub: pull the raw target into a private name, then expose the local as a
 # real nosplit wrapper the .s CALL resolves to.
-# EMIT:      //go:linkname _c2go_imp_github_com_c2go_project_c2go_libc_FImport github.com/c2go-project/c2go-libc.FImport
-# EMIT-NEXT: func _c2go_imp_github_com_c2go_project_c2go_libc_FImport(x int32) int32
+# EMIT:      //go:linkname _c2go_imp_github_com_c2gohq_c2go_libc_FImport github.com/c2gohq/c2go-libc.FImport
+# EMIT-NEXT: func _c2go_imp_github_com_c2gohq_c2go_libc_FImport(x int32) int32
 # EMIT:      //go:nosplit
-# EMIT-NEXT: func github_com_c2go_project_c2go_libc_FImport(x int32) int32 {
-# EMIT-NEXT:   return _c2go_imp_github_com_c2go_project_c2go_libc_FImport(x)
+# EMIT-NEXT: func github_com_c2gohq_c2go_libc_FImport(x int32) int32 {
+# EMIT-NEXT:   return _c2go_imp_github_com_c2gohq_c2go_libc_FImport(x)
 # EMIT-NEXT: }
 # An export-direction bridge (body here in the .s) stays a plain bodyless
 # declaration.
-# EMIT:      //go:linkname github_com_c2go_project_c2go_libc_FExport github.com/c2go-project/c2go-libc.FExport
-# EMIT-NEXT: func github_com_c2go_project_c2go_libc_FExport(x int32) int32
+# EMIT:      //go:linkname github_com_c2gohq_c2go_libc_FExport github.com/c2gohq/c2go-libc.FExport
+# EMIT-NEXT: func github_com_c2gohq_c2go_libc_FExport(x int32) int32
 # An imported '-' variable is pointer-indirected: pull the remote variable
 # into a private name (Go-referenced, so its //go:linkname alias is honoured)
 # and expose a pointer to its storage under the symbol clang's reference loads.
-# EMIT:      //go:linkname _c2go_imp_github_com_c2go_project_c2go_libc_VHyphen github.com/c2go-project/c2go-libc.VHyphen
-# EMIT-NEXT: var _c2go_imp_github_com_c2go_project_c2go_libc_VHyphen int32
-# EMIT-NEXT: var _c2go_ptr_github_com_c2go_project_c2go_libc_VHyphen = &_c2go_imp_github_com_c2go_project_c2go_libc_VHyphen
+# EMIT:      //go:linkname _c2go_imp_github_com_c2gohq_c2go_libc_VHyphen github.com/c2gohq/c2go-libc.VHyphen
+# EMIT-NEXT: var _c2go_imp_github_com_c2gohq_c2go_libc_VHyphen int32
+# EMIT-NEXT: var _c2go_ptr_github_com_c2gohq_c2go_libc_VHyphen = &_c2go_imp_github_com_c2gohq_c2go_libc_VHyphen
 
 # --- Run 2: aliases + bridges survive without any descriptor ref...
 # GATED:     c2go_imp_example_com_peer "example.com/peer"
 # GATED:     type ExtLibc = libc.DIR
 # GATED:     type ExtPkg = c2go_imp_example_com_peer.Widget
 # GATED:     //go:linkname MyFunc example.com/demo.my_func
-# GATED:     //go:linkname _c2go_imp_github_com_c2go_project_c2go_libc_FImport github.com/c2go-project/c2go-libc.FImport
+# GATED:     //go:linkname _c2go_imp_github_com_c2gohq_c2go_libc_FImport github.com/c2gohq/c2go-libc.FImport
 
 # --- ...but the descriptor pin table and the reflect import are gone.
 # NOREFLECT-NOT: "reflect"
@@ -132,9 +133,9 @@
     {"name":"ExtPkg","managed_record":true,"linkage_owner":"go","linkname":"example.com/peer.Widget"}
   ],
   "linknames": [
-    {"name":"f_import","kind":"func","go_sig":"func f_import(x int32) int32","asm_symbol":"·github_com_c2go_project_c2go_libc_FImport","linkname":"github.com/c2go-project/c2go-libc.FImport","imported":true},
-    {"name":"f_export","kind":"func","go_sig":"func f_export(x int32) int32","asm_symbol":"·github_com_c2go_project_c2go_libc_FExport","linkname":"github.com/c2go-project/c2go-libc.FExport"},
-    {"name":"v_hyphen","kind":"var","go_type":"int32","asm_symbol":"·github_com_c2go_project_c2go_libc_VHyphen","linkname":"github.com/c2go-project/c2go-libc.VHyphen","imported":true}
+    {"name":"f_import","kind":"func","go_sig":"func f_import(x int32) int32","asm_symbol":"·github_com_c2gohq_c2go_libc_FImport","linkname":"github.com/c2gohq/c2go-libc.FImport","imported":true},
+    {"name":"f_export","kind":"func","go_sig":"func f_export(x int32) int32","asm_symbol":"·github_com_c2gohq_c2go_libc_FExport","linkname":"github.com/c2gohq/c2go-libc.FExport"},
+    {"name":"v_hyphen","kind":"var","go_type":"int32","asm_symbol":"·github_com_c2gohq_c2go_libc_VHyphen","linkname":"github.com/c2gohq/c2go-libc.VHyphen","imported":true}
   ]
 }
 

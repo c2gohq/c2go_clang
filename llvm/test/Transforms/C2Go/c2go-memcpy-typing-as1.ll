@@ -50,7 +50,7 @@ define void @copy_array_as1(ptr addrspace(1) %dst, ptr addrspace(1) %src) {
 ; CHECK-LABEL: define void @copy_untyped_as1
 ; CHECK: %[[LDC:.*]] = addrspacecast ptr addrspace(1) %dst to ptr
 ; CHECK: %[[LSC:.*]] = addrspacecast ptr addrspace(1) %src to ptr
-; CHECK: call goabi0cc ptr @"github.com/c2go_project/c2go_libc.Memmove"(ptr %[[LDC]], ptr %[[LSC]], i64 4096)
+; CHECK: call goabi0cc ptr @"github.com/c2gohq/c2go_libc.Memmove"(ptr %[[LDC]], ptr %[[LSC]], i64 4096)
 ; CHECK-NOT: llvm.memcpy
 define void @copy_untyped_as1(ptr addrspace(1) %dst, ptr addrspace(1) %src) {
   call void @llvm.memcpy.p1.p1.i64(ptr addrspace(1) %dst, ptr addrspace(1) %src, i64 4096, i1 false)

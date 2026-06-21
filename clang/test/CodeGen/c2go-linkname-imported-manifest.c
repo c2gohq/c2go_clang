@@ -13,12 +13,12 @@
 
 // Defined here (body in this TU) -> export direction. The attribute is on a
 // forward declaration so the definition does not draw a GCC-compat warning.
-int f_export(int x) __attribute__((c2go_linkname("github.com/c2go-project/c2go-libc.FExport")));
+int f_export(int x) __attribute__((c2go_linkname("github.com/c2gohq/c2go-libc.FExport")));
 int f_export(int x) { return x; }
 
 // Declared extern, no body here -> import direction.
 extern int f_import(int x)
-    __attribute__((c2go_linkname("github.com/c2go-project/c2go-libc.FImport")));
+    __attribute__((c2go_linkname("github.com/c2gohq/c2go-libc.FImport")));
 
 int use(int x) { return f_export(x) + f_import(x); }
 
@@ -26,9 +26,9 @@ int use(int x) { return f_export(x) + f_import(x); }
 // keys are emitted in sorted order, so the import direction of each is pinned
 // by an ordered scan.
 // CHECK:      "linknames": [
-// CHECK:        "asm_symbol": "·github_com_c2go_project_c2go_libc_FExport"
+// CHECK:        "asm_symbol": "·github_com_c2gohq_c2go_libc_FExport"
 // CHECK:        "imported": false
 // CHECK:        "name": "f_export"
-// CHECK:        "asm_symbol": "·github_com_c2go_project_c2go_libc_FImport"
+// CHECK:        "asm_symbol": "·github_com_c2gohq_c2go_libc_FImport"
 // CHECK:        "imported": true
 // CHECK:        "name": "f_import"

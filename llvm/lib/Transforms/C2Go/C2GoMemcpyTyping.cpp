@@ -76,9 +76,9 @@ namespace {
 // c2go-libc/include/string.h. Only Memcpy/Memmove are intercepted here;
 // memset/bzero/etc. are left to clang's TLI optimisations and the
 // c2go-libc raw-name ABI0 fallback entries.
-constexpr StringRef kMemcpyName  = "github.com/c2go_project/c2go_libc.Memcpy";
-constexpr StringRef kMemmoveName = "github.com/c2go_project/c2go_libc.Memmove";
-constexpr StringRef kMemsetName  = "github.com/c2go_project/c2go_libc.Memset";
+constexpr StringRef kMemcpyName  = "github.com/c2gohq/c2go_libc.Memcpy";
+constexpr StringRef kMemmoveName = "github.com/c2gohq/c2go_libc.Memmove";
+constexpr StringRef kMemsetName  = "github.com/c2gohq/c2go_libc.Memset";
 
 // Runtime typed-copy helpers — provided by c2gobind's runtimeHelpers.
 //   _c2go_typedmemmove(typ *_type, dst, src unsafe.Pointer)

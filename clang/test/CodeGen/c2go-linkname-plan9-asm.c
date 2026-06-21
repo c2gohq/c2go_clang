@@ -35,8 +35,8 @@ extern int f_stub(int x) __attribute__((c2go_linkname("example.com/pkg.FStub")))
 
 // (2) function, hyphenated import path -> sanitized current-package local.
 extern int f_hyphen(int x)
-    __attribute__((c2go_linkname("github.com/c2go-project/c2go-libc.FHyphen")));
-// CHECK: CALL ·github_com_c2go_project_c2go_libc_FHyphen(SB)
+    __attribute__((c2go_linkname("github.com/c2gohq/c2go-libc.FHyphen")));
+// CHECK: CALL ·github_com_c2gohq_c2go_libc_FHyphen(SB)
 
 // (3) function, method symbol ( * ) -> sanitized local symbol too.
 extern int f_method(int x) __attribute__((c2go_linkname("mypkg.(*T).Method")));
@@ -51,8 +51,8 @@ extern int v_clean __attribute__((c2go_linkname("runtime.vclean")));
 // a .s-referenced var, so the reference loads c2gobind's _c2go_ptr_<local>
 // (holding the remote variable's address) and dereferences it.
 extern int v_hyphen
-    __attribute__((c2go_linkname("github.com/c2go-project/c2go-libc.VHyphen")));
-// CHECK: MOVD $·_c2go_ptr_github_com_c2go_project_c2go_libc_VHyphen(SB), {{R[0-9]+}}
+    __attribute__((c2go_linkname("github.com/c2gohq/c2go-libc.VHyphen")));
+// CHECK: MOVD $·_c2go_ptr_github_com_c2gohq_c2go_libc_VHyphen(SB), {{R[0-9]+}}
 
 int call_fns(int x) {
   return f_abi0(x) + f_stub(x) + f_hyphen(x) + f_method(x) + v_clean + v_hyphen;

@@ -46,12 +46,12 @@ namespace {
 // IR-level name of the runtime helper. Signature (in Go terms):
 //   func EscapeCheck(v, dst unsafe.Pointer, site *byte)
 // We emit the call under the Go *package* symbol name so the MCPlan9 emitter
-// mangles it to `github·com∕c2go_project∕c2go_libc·EscapeCheck(SB)` and the Go
+// mangles it to `github·com∕c2gohq∕c2go_libc·EscapeCheck(SB)` and the Go
 // linker resolves it to c2go-libc's `EscapeCheck` (exposed via //go:linkname).
 // The helper reads [g.stack.lo, g.stack.hi) via X28 and reports when `v` is a
 // stack address stored through a non-stack `dst`.
 constexpr char kHelperName[] =
-    "github.com/c2go_project/c2go_libc.EscapeCheck";
+    "github.com/c2gohq/c2go_libc.EscapeCheck";
 
 // True if `dst` is *provably* a stack slot, in which case a stack->stack store
 // is not an escape and we skip instrumentation (also the common case, so this
@@ -171,7 +171,7 @@ PreservedAnalyses C2GoEscapeCheckPass::run(Module &M, ModuleAnalysisManager &) {
   // a sweep-only rewrite (no new instrumented sites this run) still
   // surfaces as PreservedAnalyses::none().
   bool SweepChanged = llvm::c2go::enforceCallSiteCC(
-      M.getFunction("github.com/c2go_project/c2go_libc.EscapeCheck"));
+      M.getFunction("github.com/c2gohq/c2go_libc.EscapeCheck"));
 
   errs() << "c2go-escape-check: instrumented " << NumInstrumented
          << " heap/global pointer store(s) in " << M.getName() << "\n";

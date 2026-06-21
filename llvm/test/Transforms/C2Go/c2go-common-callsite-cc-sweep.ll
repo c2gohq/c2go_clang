@@ -67,13 +67,13 @@ define void @prepolluted_writePtr_callsite(ptr addrspace(1) %slot,
 ; Track 2: C2GoLoopPoll - pre-existing wrong-CC call site on the Gosched bridge.
 ; -----------------------------------------------------------------------------
 
-declare void @"github.com/c2go_project/c2go_libc.Gosched"()
+declare void @"github.com/c2gohq/c2go_libc.Gosched"()
 
 ; Pre-polluted caller: a direct call carrying the wrong CC. The c2go-loop-poll
 ; pass injects its own GoABI0-CC call into a separate function below; the
 ; pass-end sweep must rewrite THIS call too.
 define void @prepolluted_gosched_callsite() #0 {
-  call void @"github.com/c2go_project/c2go_libc.Gosched"()
+  call void @"github.com/c2gohq/c2go_libc.Gosched"()
   ret void
 }
 
@@ -95,15 +95,15 @@ exit:
 
 ; After the sweep, the pre-polluted call site carries goabi0cc.
 ; LP-LABEL: define void @prepolluted_gosched_callsite
-; LP: call goabi0cc void @"github.com/c2go_project/c2go_libc.Gosched"()
+; LP: call goabi0cc void @"github.com/c2gohq/c2go_libc.Gosched"()
 
 ; The injected loop-poll call in the driver function is also goabi0cc.
 ; LP-LABEL: define void @c2go_nocall_loop_driver
-; LP: call goabi0cc void @"github.com/c2go_project/c2go_libc.Gosched"()
+; LP: call goabi0cc void @"github.com/c2gohq/c2go_libc.Gosched"()
 
 ; Diagnostic on stderr: at least one WARNING for the pre-polluted Gosched
 ; callsite (the line names the offending caller so CI can grep it).
-; LP-WARN: c2go: WARNING — call site CC mismatch for helper 'github.com/c2go_project/c2go_libc.Gosched' in function 'prepolluted_gosched_callsite'{{.*}}rewrote to match
+; LP-WARN: c2go: WARNING — call site CC mismatch for helper 'github.com/c2gohq/c2go_libc.Gosched' in function 'prepolluted_gosched_callsite'{{.*}}rewrote to match
 
 attributes #0 = { "c2go-c-name"="x" }
 

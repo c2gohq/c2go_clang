@@ -9,7 +9,7 @@ target triple = "aarch64-unknown-linux-gnu"
 ; CHECK: and i64 %c2go.lp.cnt.new, 65535
 ; Call-site CC must be goabi0cc to match the GoABI0 declaration of the
 ; c2go-libc.Gosched bridge.
-; CHECK: call goabi0cc void @"github.com/c2go_project/c2go_libc.Gosched"()
+; CHECK: call goabi0cc void @"github.com/c2gohq/c2go_libc.Gosched"()
 define void @light_known_large(ptr %p) #0 {
 entry:
   br label %loop

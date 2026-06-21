@@ -1343,7 +1343,7 @@ def C2GoExtern : DeclOrTypeAttr {
 
 def C2GoLinkname : InheritableAttr {
   // Binds a c2go C declaration to a specific Go symbol name (e.g.
-  // "runtime.mallocgc", or "github.com/c2go-project/c2go-libc.PthreadMutexLock").
+  // "runtime.mallocgc", or "github.com/c2gohq/c2go-libc.PthreadMutexLock").
   // Call sites use GoABI0 calling convention. The target package must
   // provide an ABI0 entry, which Go's compiler does automatically for
   // any function with //go:linkname push (single-arg form).

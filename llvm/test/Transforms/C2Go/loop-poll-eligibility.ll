@@ -16,7 +16,7 @@ declare void @other()
 ; The injected call site must be goabi0cc - the Go-linker generates an ABI0
 ; entry on the c2go-libc.Gosched bridge, and a default-CC call site would read
 ; garbage on entry.
-; CHECK: call goabi0cc void @"github.com/c2go_project/c2go_libc.Gosched"()
+; CHECK: call goabi0cc void @"github.com/c2gohq/c2go_libc.Gosched"()
 define void @c2go_nocall_loop(ptr %p) #0 {
 entry:
   br label %loop

@@ -17,7 +17,7 @@ target triple = "arm64-unknown-none-goabi"
 
 ; Pre-existing libc.Memmove declaration with the default C calling convention.
 ; The pass must retrofit this to goabi0cc on reuse, not leave the default CC.
-declare ptr @"github.com/c2go_project/c2go_libc.Memmove"(ptr, ptr, i64)
+declare ptr @"github.com/c2gohq/c2go_libc.Memmove"(ptr, ptr, i64)
 
 declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
 
@@ -30,17 +30,17 @@ define void @fallback_libc(ptr %dst, ptr %src) {
 }
 
 ; The declaration line must emit goabi0cc after the reuse-path retrofit.
-; CHECK: declare goabi0cc ptr @"github.com/c2go_project/c2go_libc.Memmove"(ptr, ptr, i64)
+; CHECK: declare goabi0cc ptr @"github.com/c2gohq/c2go_libc.Memmove"(ptr, ptr, i64)
 
 ; The call site must also be goabi0cc, pinned here so a regression in either
 ; direction fails the test.
-; CHECK: call goabi0cc ptr @"github.com/c2go_project/c2go_libc.Memmove"(ptr {{[^,]+}}, ptr {{[^,]+}}, i64 4096)
+; CHECK: call goabi0cc ptr @"github.com/c2gohq/c2go_libc.Memmove"(ptr {{[^,]+}}, ptr {{[^,]+}}, i64 4096)
 
 ; Reverse invariant: libc.Memmove must NOT acquire gc-leaf-function - it is
 ; the genuinely-non-leaf bucket (see c2go-libc-memmove-statepoint.ll). The
 ; check is line-anchored so it cannot accidentally match the attribute group
 ; on some other function.
-; CHECK-NOT: declare {{.*}}@"github.com/c2go_project/c2go_libc.Memmove"{{.*}}gc-leaf-function
+; CHECK-NOT: declare {{.*}}@"github.com/c2gohq/c2go_libc.Memmove"{{.*}}gc-leaf-function
 
 !llvm.module.flags = !{!0}
 !0 = !{i32 2, !"c2go.goabi", i32 1}

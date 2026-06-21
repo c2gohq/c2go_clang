@@ -56,7 +56,7 @@ entry:
 ; value-name suffix; the qualified name is exclusive to the pass's emit shape.
 ; OFF-LABEL: define void @escape_site(
 ; OFF-NOT: c2go.escape.site
-; OFF-NOT: @"github.com/c2go_project/c2go_libc.EscapeCheck"
+; OFF-NOT: @"github.com/c2gohq/c2go_libc.EscapeCheck"
 
 ; ON path: with -c2go-escape-check the stack-to-heap store is followed by a
 ; call to the GoABI0 helper, referencing a site-string global named
@@ -66,5 +66,5 @@ entry:
 ; ON:       store ptr %localParse, ptr %stack_slot
 ; ON-NOT:   EscapeCheck
 ; ON:       store ptr %localParse, ptr addrspace(1) %parse_in_heap
-; ON:       call goabi0cc void @"github.com/c2go_project/c2go_libc.EscapeCheck"({{.*}}@c2go.escape.site
-; ON-DAG: declare goabi0cc void @"github.com/c2go_project/c2go_libc.EscapeCheck"
+; ON:       call goabi0cc void @"github.com/c2gohq/c2go_libc.EscapeCheck"({{.*}}@c2go.escape.site
+; ON-DAG: declare goabi0cc void @"github.com/c2gohq/c2go_libc.EscapeCheck"

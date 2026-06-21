@@ -26,7 +26,7 @@
 # RUN: %c2gobind -pkg demo -dry-run -l c2gotestlib %t/m.json | FileCheck %s --check-prefix=DYN
 
 # --- Imports: external (dispatch) + reflect (variadic packer) + unsafe.
-# EXT:      external "github.com/c2go_project/c2go_libc/external"
+# EXT:      external "github.com/c2gohq/c2go_libc/external"
 # EXT:      "reflect"
 # EXT:      "unsafe"
 
