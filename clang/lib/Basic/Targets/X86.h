@@ -918,6 +918,11 @@ public:
     case CC_SwiftAsync:
     case CC_X86RegCall:
     case CC_DeviceKernel:
+    // c2go: GoABI0 / C2GoInternal are valid here too — c2go targets a windows
+    // OS only for C type sizes (LLP64); codegen emits Plan 9 .s with the Go
+    // calling conventions. Mirror the generic X86_64TargetInfo above.
+    case CC_GoABI0:
+    case CC_C2GoInternal:
       return CCCR_OK;
     default:
       return CCCR_Warning;

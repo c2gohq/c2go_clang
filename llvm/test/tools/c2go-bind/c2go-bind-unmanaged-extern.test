@@ -1,109 +1,67 @@
-# c2go-bind emission for §E unmanaged_extern symbols — a c2go_extern function
-# with NO body in the compilation, calling into a host library symbol. c2go-bind
-# emits a Go wrapper whose auto-generated ABI0 entry satisfies the Plan 9 .s
-# `CALL ·<name>(SB)` site; the wrapper dispatches through c2go-libc's `external`
-# package (a thin shim over ebitengine/purego: SyscallN + Dlsym, with purego's
-# fakecgo making runtime.cgocall work under CGO_ENABLED=0).
+# c2go-bind emission for unmanaged_extern symbols (c2go section E) -- a
+# bodyless c2go_extern function that calls into a host shared library.
 #
-# This pins every emission dimension:
-#   * scalar function  -> lazy runtime Dlsym(RTLD_DEFAULT) + SyscallN dispatch
-#   * void return      -> SyscallN, no result
-#   * variadic         -> `_va ...any` packed via _c2goVariadicArg + SyscallN
-#   * float fixed arg/return  -> panic stub (SyscallN is integer-only, phase 2.5)
-#   * aggregate by value      -> panic stub (ABI can't be expressed as ...uintptr)
-#   * lowercase C name -> //go:linkname exported alias (Ext<Name>)
-# and the `-l<name>` static-bind variant (//go:cgo_import_dynamic).
+# clang attaches a per-target `cabi` (parameter-passing descriptor) to each
+# unmanaged_extern symbol; c2go-bind turns that into a Go dispatch wrapper:
+# every argument is classified into a dl.Piece{} and the call goes through
+# dl.Call() -- purego's SyscallN under CGO_ENABLED=0 (fakecgo). Resolution is
+# a lazy Dlsym(RTLD_DEFAULT) cached in a uintptr. A capitalised alias exposes
+# each symbol to external Go callers.
+#
+# The full chain (clang -> c2go-bind -> go build -> dlopen a real .so -> call
+# -> assert) is exercised by .build_status/c2go_unmanaged_extern_e2e_gate.sh;
+# this test pins the generated text.
 #
 # c2go-bind lives outside llvm-project; see lit.local.cfg for path discovery.
 
 # RUN: rm -rf %t && split-file %s %t
-
-# Default: no -l -> runtime Dlsym resolution.
 # RUN: %c2gobind -pkg demo -dry-run %t/m.json | FileCheck %s --check-prefix=EXT
+# RUN: %c2gobind -pkg demo -dry-run %t/m.json | FileCheck %s --check-prefix=NOEXT
 
-# -l<name> -> load-time cgo_import_dynamic binding (a nonexistent lib name so
-# the soname probe always falls back to the bare ELF token, deterministically).
-# RUN: %c2gobind -pkg demo -dry-run -l c2gotestlib %t/m.json | FileCheck %s --check-prefix=DYN
+# Dispatch is through the c2go-libc/dl package.
+# EXT:      "github.com/c2gohq/c2go_libc/dl"
 
-# --- Imports: external (dispatch) + reflect (variadic packer) + unsafe.
-# EXT:      external "github.com/c2gohq/c2go_libc/external"
-# EXT:      "reflect"
-# EXT:      "unsafe"
+# Symbols are emitted name-sorted: ext_dscale, ext_mkpt, ext_printf,
+# ext_read, ext_store.
 
-# Symbols are emitted in name-sorted order: ext_log, ext_mkpt, ext_printf,
-# ext_read, ext_sqrt.
+# --- double arg + return: real FP dispatch (PFloat / F64bits / RFloat),
+# not a panic stub -- section E covers floats end to end.
+# EXT:      func ext_dscale(v float64, n int32) float64 {
+# EXT:        {Class: dl.PFloat, Val: dl.F64bits(v)},
+# EXT:      dl.Call(fn, _pieces, 0, dl.RFloat, nil, nil)
+# EXT:      func ExtDscale(v float64, n int32) float64 {
 
-# --- void return: SyscallN with no result, + exported alias.
-# EXT:      func ext_log(code int32) {
-# EXT:      _, _, _ = external.SyscallN(fn,
-# EXT-NEXT:   uintptr(code))
-# EXT:      //go:linkname ExtLog demo.ext_log
-# EXT-NEXT: func ExtLog(code int32)
+# --- small by-value struct return (Pt{int,int} = 8 bytes): register-class
+# RStruct dispatch with a retWord, written into the caller's &_ret. Large
+# by-value structs stay fail-closed (c2go #529).
+# EXT:      func ext_mkpt(x int32, y int32) Pt {
+# EXT:      dl.RStruct, []dl.RetWord{
+# EXT-SAME: unsafe.Pointer(&_ret))
 
-# --- aggregate-by-value: panic stub (not a broken wrapper), loud + actionable.
-# EXT:      has_aggregate=true
-# EXT:      func ext_mkpt(p Pt) Pt {
-# EXT:      panic("c2go {{.*}}unmanaged extern ext_mkpt unsupported
-
-# --- variadic: fixed param coerced, trailing ...any packed, slice-dispatched.
+# --- variadic: fixed param coerced, trailing ...any packed per arg.
 # EXT:      func ext_printf(fmt *byte, _va ...any) int32 {
-# EXT:      _argv := make([]uintptr, 0, 1+len(_va))
-# EXT-NEXT:   _argv = append(_argv, uintptr(unsafe.Pointer(fmt)))
-# EXT:      _argv = append(_argv, _c2goVariadicArg(_a))
-# EXT:      r1, _, _ := external.SyscallN(fn, _argv...)
+# EXT:        _pieces = append(_pieces, dl.Piece{Class: dl.PVararg, Val: _c2goVariadicArg(_a)})
 
-# --- scalar: lazy Dlsym(RTLD_DEFAULT) resolve cached in a uintptr, SyscallN.
-# EXT:      fn, err := external.Dlsym(external.RTLD_DEFAULT, "ext_read")
-# EXT:      func ext_read(fd int32, buf unsafe.Pointer, n uint64) int64 {
-# EXT:      r1, _, _ := external.SyscallN(fn,
-# EXT-NEXT:   uintptr(fd),
+# --- scalar: lazy Dlsym(RTLD_DEFAULT) cached, RInt dispatch, pointer args
+# kept alive across the call.
+# EXT:      func _c2goExtern_ext_read_resolve() uintptr {
+# EXT:        fn, err := dl.Dlsym(dl.RTLD_DEFAULT, "ext_read")
+# EXT:      func ext_read(fd int32, buf unsafe.Pointer, n uint64) int32 {
+# EXT:      _a1, _ := dl.Call(fn, _pieces, 0, dl.RInt, nil, nil)
+# EXT:      runtime.KeepAlive(buf)
 
-# --- float fixed arg/return: panic stub.
-# EXT:      has_float=true
-# EXT:      func ext_sqrt(v float64) float64 {
-# EXT:      panic("c2go {{.*}}unmanaged extern ext_sqrt unsupported
+# --- void return + write-through pointer arg.
+# EXT:      func ext_store(p *int32, v int32) {
+# EXT:      dl.Call(fn, _pieces, 0, dl.RVoid, nil, nil)
 
-# --- the variadic packer helper (emitted once, after the wrappers).
+# --- the variadic packer: floats inside the ... list are rejected.
 # EXT:      func _c2goVariadicArg(a any) uintptr {
-# EXT:      panic("c2go {{.*}}float in variadic args needs FP-aware dispatch
+# EXT:      phase 2.5: float in variadic args needs FP-aware dispatch
 
-# The default path never uses load-time binding.
-# EXT-NOT:  cgo_import_dynamic
-
-# --- -l<name>: each scalar/void/variadic symbol binds at load time via
-# //go:cgo_import_dynamic instead of the runtime Dlsym path. The directive
-# names the (probe-fallback) bare ELF soname.
-# DYN:      //go:cgo_import_dynamic _c2goExtern_ext_read_fn ext_read "libc2gotestlib.so"
-# DYN-NEXT: //go:linkname _c2goExtern_ext_read_fn _c2goExtern_ext_read_fn
-# DYN-NEXT: var _c2goExtern_ext_read_fn uintptr
-# Static binding replaces the runtime resolver entirely (the default path's
-# lazy _resolve() helper is not emitted; the stub workaround comments still
-# mention Dlsym, so key on the resolver function name instead).
-# DYN-NOT:  _c2goExtern_ext_read_resolve
-#
-# KNOWN BUG (see the cgo_import_dynamic / purego analysis): a
-# //go:cgo_import_dynamic symbol is LOCATED AT the imported function, so the
-# function pointer is the symbol's ADDRESS (&sym), as ebitengine/purego does
-# (`var dlopen uint8; uintptr(unsafe.Pointer(&dlopen))`). The wrapper above
-# instead reads the symbol's VALUE (`fn := _c2goExtern_ext_read_fn`), which is
-# the bytes at the function entry, not its address — and on darwin/arm64 the
-# address form additionally needs an asm-stub indirection purego ships but
-# c2go-bind does not. This -l path is therefore not wired up correctly and is
-# currently unexercised (the working path is the default runtime Dlsym above).
-# The CHECKs here pin only the (correct) import directives, not the buggy
-# value-based dispatch; tighten them once the address-vs-value fix lands.
+# The retired `external` package must never reappear (regression guard for
+# the external.Call -> dl.Call leftover from the external->dl rename).
+# NOEXT-NOT: external.
 
 #--- m.json
-{
-  "pkgpath": "demo",
-  "min_go_version": "go1.22",
-  "max_go_version": "go1.26",
-  "symbols": [
-    {"name":"ext_log","kind":"unmanaged_extern","abi":"abi0","go_sig":"func ext_log(code int32)","go_name":"ExtLog","needs_linkname":true},
-    {"name":"ext_mkpt","kind":"unmanaged_extern","abi":"abi0","go_sig":"func ext_mkpt(p Pt) Pt","go_name":"ExtMkpt","needs_linkname":true,"has_aggregate":true},
-    {"name":"ext_printf","kind":"unmanaged_extern","abi":"abi0","go_sig":"func ext_printf(fmt *byte) int32","go_name":"ExtPrintf","needs_linkname":true,"is_variadic":true},
-    {"name":"ext_read","kind":"unmanaged_extern","abi":"abi0","go_sig":"func ext_read(fd int32, buf unsafe.Pointer, n uint64) int64","go_name":"ExtRead","needs_linkname":true},
-    {"name":"ext_sqrt","kind":"unmanaged_extern","abi":"abi0","go_sig":"func ext_sqrt(v float64) float64","go_name":"ExtSqrt","needs_linkname":true,"has_float":true}
-  ],
-  "types": []
-}
+{"linknames":[],"max_go_version":"go1.26","min_go_version":"go1.22","module_gcmask":{"vars":[]},"pkgpath":"demo","symbols":[{"abi":"abi0","argsize":24,"asm_symbol":"\u00b7ext_dscale","cabi":{"params":[{"pass":"direct","words":[{"f":true,"off":0,"sz":8}]},{"pass":"direct","words":[{"f":false,"off":0,"sz":4}]}],"ret":{"pass":"direct","words":[{"f":true,"off":0,"sz":8}]}},"go_name":"ExtDscale","go_sig":"func ext_dscale(v float64, n int32) float64","has_float":true,"kind":"unmanaged_extern","managed":true,"name":"ext_dscale","needs_linkname":true},{"abi":"abi0","argsize":16,"asm_symbol":"\u00b7ext_mkpt","cabi":{"params":[{"pass":"direct","words":[{"f":false,"off":0,"sz":4}]},{"pass":"direct","words":[{"f":false,"off":0,"sz":4}]}],"ret":{"pass":"direct","words":[{"f":false,"off":0,"sz":8}]}},"go_name":"ExtMkpt","go_sig":"func ext_mkpt(x int32, y int32) Pt","has_aggregate":true,"kind":"unmanaged_extern","managed":true,"name":"ext_mkpt","needs_linkname":true},{"abi":"abi0","argsize":16,"asm_symbol":"\u00b7ext_printf","cabi":{"params":[{"pass":"direct","words":[{"f":false,"off":0,"sz":8}]},{"pass":"direct","words":[{"f":false,"off":0,"sz":8}]}],"ret":{"pass":"direct","words":[{"f":false,"off":0,"sz":4}]}},"go_name":"ExtPrintf","go_sig":"func ext_printf(fmt *byte) int32","is_variadic":true,"kind":"unmanaged_extern","managed":true,"name":"ext_printf","needs_linkname":true},{"abi":"abi0","argsize":32,"asm_symbol":"\u00b7ext_read","cabi":{"params":[{"pass":"direct","words":[{"f":false,"off":0,"sz":4}]},{"pass":"direct","words":[{"f":false,"off":0,"sz":8}]},{"pass":"direct","words":[{"f":false,"off":0,"sz":8}]}],"ret":{"pass":"direct","words":[{"f":false,"off":0,"sz":4}]}},"go_name":"ExtRead","go_sig":"func ext_read(fd int32, buf unsafe.Pointer, n uint64) int32","kind":"unmanaged_extern","managed":true,"name":"ext_read","needs_linkname":true},{"abi":"abi0","argsize":16,"asm_symbol":"\u00b7ext_store","cabi":{"params":[{"pass":"direct","words":[{"f":false,"off":0,"sz":8}]},{"pass":"direct","words":[{"f":false,"off":0,"sz":4}]}],"ret":{"pass":"void"}},"go_name":"ExtStore","go_sig":"func ext_store(p *int32, v int32)","kind":"unmanaged_extern","managed":true,"name":"ext_store","needs_linkname":true}],"types":[{"go_def":"struct {\n\tx int32\n\ty int32\n}","linkage_owner":"c","managed_record":true,"name":"Pt"}]}
+

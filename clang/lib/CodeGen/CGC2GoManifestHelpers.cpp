@@ -122,7 +122,30 @@ std::string buildC2GoGoSig(const FunctionDecl *FD, const ASTContext &Ctx) {
     Out += ArgName + " " + mapC2GoType(PVD->getType(), Ctx, ParmUnmanaged);
   }
   Out += ")";
-  std::string Ret = mapC2GoType(FD->getReturnType(), Ctx, RetUnmanaged);
+  std::string Ret;
+  // c2go_returntype(struct X): the boundary returns a Go multi-value tuple —
+  // the record's fields map 1:1 to the called Go function's return values, each
+  // its own ABI0 result slot (same stack layout as the by-value struct return).
+  // Render `(t1, t2, ...)` so the emitted Go decl matches that multi-return
+  // signature and needs no Go definition of the C struct. Sema
+  // (handleC2GoReturnTypeAttr) has already verified every field is a valid ABI0
+  // return slot. Without the attribute a record return renders as its mapped
+  // type, unchanged.
+  if (FD->hasAttr<C2GoReturnTypeAttr>())
+    if (const auto *RT = FD->getReturnType()->getAs<RecordType>()) {
+      std::string Tuple = "(";
+      bool FirstF = true;
+      for (const FieldDecl *Field : RT->getDecl()->fields()) {
+        if (!FirstF)
+          Tuple += ", ";
+        FirstF = false;
+        Tuple += mapC2GoType(Field->getType(), Ctx, RetUnmanaged);
+      }
+      Tuple += ")";
+      Ret = Tuple;
+    }
+  if (Ret.empty())
+    Ret = mapC2GoType(FD->getReturnType(), Ctx, RetUnmanaged);
   if (!Ret.empty()) Out += " " + Ret;
   return Out;
 }

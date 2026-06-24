@@ -27,6 +27,7 @@
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
@@ -87,6 +88,22 @@ rebuildManifestFromIR(Module &Composite, bool Build,
   std::string Hi = Dash == std::string::npos ? VerRange : VerRange.substr(Dash + 1);
   Root["min_go_version"] = "go" + Lo;
   Root["max_go_version"] = "go" + Hi;
+
+  // Mirror CodeGenAction::buildC2GoManifest: record Go's GOOS/GOARCH from the
+  // (still-original, pre-neutralization) module triple so the WF2-rebuilt
+  // manifest round-trips byte-identically with clang's WF1 manifest (#544).
+  Triple TT(Composite.getTargetTriple());
+  StringRef GOOS = TT.isOSWindows()  ? "windows"
+                   : TT.isOSDarwin() ? "darwin"
+                   : TT.isOSLinux()  ? "linux"
+                                     : "";
+  StringRef GOARCH = TT.getArch() == Triple::x86_64    ? "amd64"
+                     : TT.getArch() == Triple::aarch64 ? "arm64"
+                                                       : "";
+  if (!GOOS.empty())
+    Root["goos"] = GOOS;
+  if (!GOARCH.empty())
+    Root["goarch"] = GOARCH;
 
   json::Array Symbols;
   SmallVector<json::Object, 32> AllSyms;

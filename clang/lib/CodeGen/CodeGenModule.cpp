@@ -91,14 +91,17 @@ static llvm::cl::opt<bool> LimitedCoverage(
     "limited-coverage-experimental", llvm::cl::Hidden,
     llvm::cl::desc("Emit limited coverage mapping information (experimental)"));
 
-// c2go §E (.s-wrapper model): when on, clang synthesizes the GoABI0 dispatch
-// wrapper for each unmanaged_extern directly into the Plan 9 .s (marshal args
-// into a purego syscallArgs block + CALL runtime·cgocall), instead of leaving
-// the symbol bodyless for c2go-bind to wrap in Go. Default off during the
-// migration; flipped on once c2go-bind degrades to bodyless decl + fn-glue
-// (#525) for symbols clang has wrapped.
+// c2go §E (.s-wrapper model): clang synthesizes the GoABI0 dispatch wrapper for
+// each unmanaged_extern directly into the Plan 9 .s (marshal args into a purego
+// syscallArgs block + CALL runtime·cgocall) — the production path, with a real
+// GC args stackmap. c2go-bind degrades the wrapped symbol to a bodyless decl +
+// cgo_import_dynamic fn-glue (#525/#517), so the target library must be named
+// with `-l<lib>`. Now DEFAULT ON: only the cases the wrapper still bails on
+// (variadic, #529-class fallbacks) leave the symbol for c2go-bind's Go-side
+// dl.Call dispatcher. Pass -c2go-extern-wrappers=false to force that legacy
+// Go-dispatch (runtime Dlsym, no -l) for every symbol.
 static llvm::cl::opt<bool> C2GoExternWrappers(
-    "c2go-extern-wrappers", llvm::cl::Hidden, llvm::cl::init(false),
+    "c2go-extern-wrappers", llvm::cl::Hidden, llvm::cl::init(true),
     llvm::cl::desc("c2go: synthesize unmanaged_extern dispatch wrappers in .s"));
 
 // c2go §E: the unmanaged_extern dispatch differs by target OS, but the Plan 9
@@ -4502,13 +4505,11 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
       return AI.getDirectOffset() == 0 && simpleType(AI.getCoerceToType());
     case ABIArgInfo::Indirect:
     case ABIArgInfo::IndirectAliased:
-      // Large by-value structs (sret return / indirect or byval param). The
-      // GoABI0 caller passes/returns these by value (expanded), but clang
-      // arranges the boundary symbol with the NATIVE ABI (a hidden sret/struct
-      // POINTER), so a wrapper built from the native signature mismatches the
-      // by-value caller. Synthesizing the GoABI0-signature wrapper + per-param
-      // image reconstruction is a follow-up; fall back to c2go-bind for now.
-      return false;
+      // Large by-value struct (sret return / indirect|byval param). The c2go
+      // caller arranges these by value (struct expanded to its fields on the
+      // ABI0 stack); the wrapper is re-typed to that GoABI0 signature below and
+      // rebuilds the native per-arg image to marshal into the syscallArgs block.
+      return true;
     default:
       return false; // Expand / CoerceAndExpand / InAlloca / TargetSpecific
     }
@@ -4547,37 +4548,29 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
     if (Bail)
       continue;
     const bool RetSret = RI.isIndirect();
-    const bool IsWindows = (C2GoExternOS == "windows");
+    const bool IsWindows = isC2GoExternWindows();
 
-    // Windows v1 (syscall.SyscallN positional path) only handles single-word
-    // scalar/pointer/float ARGS + integer/pointer/void RETURN. syscall.SyscallN
-    // cannot return a float (XMM0 is not captured) or a struct, and multi-word
-    // struct args need the Win64 by-pointer rule — bail those to Go-dispatch.
-    if (IsWindows) {
-      bool WinOK = true;
-      if (!RI.isIgnore()) {
-        llvm::SmallVector<AbiWord, 2> RW;
-        coerceWordsOf(RI.getCoerceToType(), RI.getDirectOffset(), RW);
-        if (RW.size() != 1 || RW[0].Float)
-          WinOK = false;
+    // The c2go caller arranges a call to this boundary symbol with the GoABI0
+    // by-value ABI (records expanded to their fields on the ABI0 stack, a
+    // record result returned by value), but the symbol's existing IR
+    // declaration was created with the NATIVE ABI (a hidden sret pointer / a
+    // by-ref struct param). Re-type the wrapper to the GoABI0 signature so its
+    // frame matches the caller; the body rebuilds each param's memory image
+    // from the GoABI0 args, then marshals per the target ABI (unix: the native
+    // `FI` SysV slots; windows: the Win64 size rule). Scalars are identical in
+    // all of them, so GoFT == F's type and nothing is re-created.
+    const CGFunctionInfo &GoFI =
+        getTypes().arrangeGlobalDeclaration(GlobalDecl(FD));
+    {
+      llvm::FunctionType *GoFT = getTypes().GetFunctionType(GoFI);
+      if (F->getFunctionType() != GoFT) {
+        auto *NewF = llvm::Function::Create(GoFT, F->getLinkage(),
+                                            F->getAddressSpace(), "", &getModule());
+        NewF->takeName(F);
+        F->replaceAllUsesWith(NewF);
+        F->eraseFromParent();
+        F = NewF;
       }
-      if (WinOK)
-        for (const auto &A : FI.arguments()) {
-          if (A.info.isIgnore())
-            continue;
-          llvm::SmallVector<AbiWord, 2> W;
-          coerceWordsOf(A.info.getCoerceToType(), A.info.getDirectOffset(), W);
-          // Single integer/pointer word only. A FLOAT arg cannot ride through
-          // syscall.SyscallN — Go's windows asmstdcall does NOT copy the
-          // positional slots into XMM, so the C callee reads a stale XMM
-          // register (verified: _isnan(1.5) returned garbage). Bail floats.
-          if (W.size() != 1 || W[0].Float) {
-            WinOK = false;
-            break;
-          }
-        }
-      if (!WinOK)
-        continue;
     }
 
     // ---- Synthesize the GoABI0 wrapper body. ----
@@ -4619,44 +4612,107 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
     llvm::IRBuilder<> B(BB);
 
     // ---- Windows: positional args -> syscall.SyscallN (purego windows path).
-    // Each scalar param fills one positional slot (Go's windows asmstdcall
-    // duplicates the first 4 into XMM, so float args ride in their slot bits).
-    // c2go_SyscallN is a package-local forwarder (c2go-bind windows glue ->
-    // syscall.SyscallN) returning r1 (RAX). ----
+    // Win64: every arg occupies ONE positional slot. A scalar's bits go in the
+    // slot (Go's windows asmstdcall copies the first 4 slots into XMM0-3, so a
+    // float's bits reach the callee's XMM register; the float RETURN comes back
+    // in r2 == XMM0). A by-value struct of size 1/2/4/8 rides as those bytes in
+    // one slot; any other size (3/5/6/7/>8) is passed BY POINTER in one slot. A
+    // struct RETURN of size 1/2/4/8 comes back in r1 (RAX) bytes; any other size
+    // uses sret — a hidden leading slot holds the result-buffer pointer. F now
+    // carries the GoABI0 by-value signature (records flattened to fields); we
+    // rebuild each record's memory image from those fields, then pack/point it.
+    // c2go_SyscallN is the package-local forwarder to syscall.SyscallN. ----
     if (IsWindows) {
-      // The Windows loader binds the import-address-table slot c2go_dyn_<name>
-      // at program start. c2go-bind emits
-      //   //go:cgo_import_dynamic <pkg>.c2go_dyn_<name> <name> "<lib>"
-      // with a PACKAGE-QUALIFIED local name, so this package-local reference
-      // (`·c2go_dyn_<name>`) resolves to that slot. Load the slot VALUE — the
-      // native function address — and hand it to syscall.SyscallN. (Passing the
-      // Go-text stub address to SyscallN SEH-crashes; the IAT value is the
-      // native address SyscallN expects.) (#517)
       llvm::GlobalVariable *FnAddrW =
           getExternI64Global(("c2go_dyn_" + FD->getName()).str());
-      unsigned N = F->arg_size(); // single-word scalar params (WinOK-checked)
+
+      // A size 1/2/4/8 is a Win64 single-register class (struct-as-integer).
+      auto IsRegSize = [](uint64_t Sz) {
+        return Sz == 1 || Sz == 2 || Sz == 4 || Sz == 8;
+      };
+
+      // Return classification.
+      llvm::Type *RetTy = F->getReturnType();
+      bool RetIsRecord = FD->getReturnType()->isRecordType();
+      uint64_t RetSz =
+          RetIsRecord
+              ? getContext().getTypeSizeInChars(FD->getReturnType()).getQuantity()
+              : 0;
+      bool RetInRax = RetIsRecord && IsRegSize(RetSz);   // <=8B struct -> RAX
+      llvm::Value *WSretBuf = nullptr;                   // >8B struct -> sret buf
+      if (RetIsRecord && !RetInRax)
+        WSretBuf = B.CreateAlloca(RetTy, nullptr, "wsretbuf");
+
+      // Build the positional slot list. sret pointer (if any) leads.
+      llvm::SmallVector<llvm::Value *, 8> Slots;
+      if (WSretBuf)
+        Slots.push_back(B.CreatePtrToInt(WSretBuf, Int64Ty));
+
+      unsigned GoIRArg = 0;
+      auto GoArgIt = GoFI.arg_begin();
+      for (const auto &A : FI.arguments()) {
+        const ABIArgInfo &GAI = (GoArgIt++)->info; // GoABI0 slot -> F's args
+        unsigned GoN = numIRArgsOf(GAI);
+        if (!A.type.getTypePtr()->isRecordType()) {
+          // Scalar: a single GoABI0 IR arg packed into one slot.
+          llvm::Value *Arg = F->getArg(GoIRArg);
+          llvm::Type *T = Arg->getType();
+          llvm::Value *W;
+          if (T->isPointerTy())
+            W = B.CreatePtrToInt(Arg, Int64Ty);
+          else if (T->isDoubleTy())
+            W = B.CreateBitCast(Arg, Int64Ty);
+          else if (T->isFloatTy())
+            W = B.CreateZExt(B.CreateBitCast(Arg, Int32Ty), Int64Ty);
+          else
+            W = (GAI.isExtend() && GAI.isSignExt())
+                    ? B.CreateSExtOrTrunc(Arg, Int64Ty)
+                    : B.CreateZExtOrTrunc(Arg, Int64Ty);
+          Slots.push_back(W);
+        } else {
+          // Record: rebuild its memory image from F's GoABI0 fields, then apply
+          // the Win64 size rule (<=8B as bytes in one slot, else by pointer).
+          llvm::Type *MemTy = getTypes().ConvertTypeForMem(A.type);
+          llvm::Value *Img = B.CreateAlloca(MemTy, nullptr, "argimg");
+          if (GoN == 1) {
+            B.CreateStore(F->getArg(GoIRArg), Img); // whole aggregate / 1 word
+          } else {
+            llvm::SmallVector<AbiWord, 8> GW;
+            coerceWordsOf(GAI.getCoerceToType(), 0, GW);
+            for (unsigned k = 0; k < GoN && k < GW.size(); ++k)
+              B.CreateAlignedStore(
+                  F->getArg(GoIRArg + k),
+                  B.CreateConstInBoundsGEP1_64(Int8Ty, Img, GW[k].Off),
+                  llvm::Align(1));
+          }
+          uint64_t Sz = getContext().getTypeSizeInChars(A.type).getQuantity();
+          if (IsRegSize(Sz)) {
+            llvm::Value *V = B.CreateAlignedLoad(
+                llvm::IntegerType::get(getLLVMContext(), Sz * 8), Img,
+                llvm::Align(1));
+            Slots.push_back(B.CreateZExtOrTrunc(V, Int64Ty));
+          } else {
+            Slots.push_back(B.CreatePtrToInt(Img, Int64Ty)); // by pointer
+          }
+        }
+        GoIRArg += GoN;
+      }
+
+      unsigned N = Slots.size();
       llvm::Type *ArgsTy = llvm::ArrayType::get(Int64Ty, N ? N : 1);
       llvm::Value *ArgsArr = B.CreateAlloca(ArgsTy, nullptr, "winargs");
-      auto AI = FI.arg_begin();
-      for (unsigned I = 0; I < N; ++I, ++AI) {
-        llvm::Argument *Arg = F->getArg(I);
-        llvm::Type *T = Arg->getType();
-        llvm::Value *W;
-        if (T->isPointerTy())
-          W = B.CreatePtrToInt(Arg, Int64Ty);
-        else if (T->isDoubleTy())
-          W = B.CreateBitCast(Arg, Int64Ty);
-        else if (T->isFloatTy())
-          W = B.CreateZExt(B.CreateBitCast(Arg, Int32Ty), Int64Ty);
-        else
-          W = (AI->info.isExtend() && AI->info.isSignExt())
-                  ? B.CreateSExtOrTrunc(Arg, Int64Ty)
-                  : B.CreateZExtOrTrunc(Arg, Int64Ty);
-        B.CreateStore(W, B.CreateConstInBoundsGEP2_64(ArgsTy, ArgsArr, 0, I));
-      }
+      for (unsigned I = 0; I < N; ++I)
+        B.CreateStore(Slots[I], B.CreateConstInBoundsGEP2_64(ArgsTy, ArgsArr, 0, I));
       llvm::Value *ArgsPtr = B.CreateConstInBoundsGEP2_64(ArgsTy, ArgsArr, 0, 0);
+
+      // c2go_SyscallN returns (r1, r2) == syscall.SyscallN's first two results:
+      // r1 = RAX (integer/pointer/<=8B-struct return), r2 = XMM0 (floating-point
+      // return — Go's windows asmstdcall copies XMM0 into libcall.r2). GoABI0
+      // returns are stack-only, so this {i64,i64} aggregate maps to two return
+      // stack slots, byte-for-byte the Go `(uintptr, uintptr)` glue.
+      llvm::StructType *SNRetTy = llvm::StructType::get(Int64Ty, Int64Ty);
       llvm::FunctionType *SNTy = llvm::FunctionType::get(
-          Int64Ty, {Int64Ty, PtrTy, Int64Ty}, /*isVarArg=*/false);
+          SNRetTy, {Int64Ty, PtrTy, Int64Ty}, /*isVarArg=*/false);
       llvm::Function *SN = cast<llvm::Function>(
           getModule().getOrInsertFunction("c2go_SyscallN", SNTy).getCallee());
       SN->setCallingConv(llvm::CallingConv::GoABI0);
@@ -4667,10 +4723,29 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
       R->setCallingConv(llvm::CallingConv::GoABI0);
       if (RI.isIgnore()) {
         B.CreateRetVoid();
+      } else if (WSretBuf) {
+        // >8B struct: the callee wrote the result into the sret buffer.
+        B.CreateRet(B.CreateLoad(RetTy, WSretBuf));
+      } else if (RetInRax) {
+        // <=8B struct: reinterpret r1's low RetSz bytes as the record.
+        llvm::Value *R1 = B.CreateExtractValue(R, 0);
+        llvm::Value *RB = B.CreateAlloca(RetTy, nullptr, "wretbuf");
+        B.CreateAlignedStore(
+            B.CreateZExtOrTrunc(
+                R1, llvm::IntegerType::get(getLLVMContext(), RetSz * 8)),
+            RB, llvm::Align(1));
+        B.CreateRet(B.CreateLoad(RetTy, RB));
       } else {
-        llvm::Type *RetTy = F->getReturnType();
-        B.CreateRet(RetTy->isPointerTy() ? B.CreateIntToPtr(R, RetTy)
-                                         : B.CreateZExtOrTrunc(R, RetTy));
+        llvm::Value *R1 = B.CreateExtractValue(R, 0); // RAX  (integer/pointer)
+        llvm::Value *R2 = B.CreateExtractValue(R, 1); // XMM0 (float/double)
+        if (RetTy->isDoubleTy())
+          B.CreateRet(B.CreateBitCast(R2, RetTy));
+        else if (RetTy->isFloatTy())
+          B.CreateRet(B.CreateBitCast(B.CreateTrunc(R2, Int32Ty), RetTy));
+        else if (RetTy->isPointerTy())
+          B.CreateRet(B.CreateIntToPtr(R1, RetTy));
+        else
+          B.CreateRet(B.CreateZExtOrTrunc(R1, RetTy));
       }
       continue;
     }
@@ -4732,60 +4807,86 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
                   : B.CreateZExtOrTrunc(V, Int64Ty);
     };
 
-    // sret: the result-buffer pointer is IR arg 0. amd64 passes it as a hidden
-    // leading integer arg; arm64 puts it in x8 (the r8 slot). Added BEFORE the
-    // params so the amd64 hidden arg lands in a1.
-    unsigned IRArg = 0;
+    // sret: the c2go caller expects a record result back BY VALUE (GoABI0 lays
+    // it on the ABI0 result slots), so F has no sret IR arg. The native C call
+    // still needs a result buffer — allocate one and pass its address as the
+    // native sret slot (amd64 hidden leading int arg / arm64 x8). Added BEFORE
+    // the params so the amd64 hidden arg lands in a1. We load+return the record
+    // from it after the call.
+    llvm::Value *SretBuf = nullptr;
     if (RetSret) {
-      llvm::Value *W = B.CreatePtrToInt(F->getArg(0), Int64Ty);
+      SretBuf = B.CreateAlloca(F->getReturnType(), nullptr, "sretbuf");
+      llvm::Value *W = B.CreatePtrToInt(SretBuf, Int64Ty);
       if (IsAMD64)
         addInt(W);
       else
         B.CreateStore(W, slotPtr(kR8Slot));
-      IRArg = 1;
     }
 
-    // Marshal each parameter per its ABI slot.
+    // Marshal each parameter. F now carries the GoABI0 by-value signature
+    // (scalars as-is; a record flattened into its fields), while the native
+    // `FI` says how the foreign C ABI wants each arg. For every param, rebuild
+    // a memory image of its native type from F's GoABI0 args, then read that
+    // image back per the native slot kind — Direct register words, an Indirect
+    // pointer, or byval stack words. Routing scalars through memory too keeps a
+    // single path; mem2reg folds the round-trip away.
+    unsigned GoIRArg = 0;
+    auto GoArgIt = GoFI.arg_begin();
     for (const auto &A : FI.arguments()) {
-      const ABIArgInfo &AI = A.info;
-      unsigned N = numIRArgsOf(AI);
-      if (AI.isIgnore())
-        continue; // 0 IR args, no register word
-      if (AI.isDirect() || AI.isExtend()) {
-        llvm::SmallVector<AbiWord, 4> W;
-        coerceWordsOf(AI.getCoerceToType(), AI.getDirectOffset(), W);
-        bool Sext = AI.isExtend() && AI.isSignExt() && W.size() == 1;
-        if (N == W.size()) {
-          // One IR arg per word (flattened struct, or a single scalar).
-          for (unsigned k = 0; k < W.size(); ++k) {
-            llvm::Value *Word = toWord(F->getArg(IRArg + k), Sext);
-            W[k].Float ? addFloat(Word) : addInt(Word);
-          }
-        } else {
-          // Single IR arg of an aggregate coerce (e.g. AAPCS HFA [2 x double]):
-          // pull each word out by extractvalue.
-          llvm::Value *Agg = F->getArg(IRArg);
-          for (unsigned k = 0; k < W.size(); ++k) {
-            llvm::Value *Word = toWord(B.CreateExtractValue(Agg, k), false);
-            W[k].Float ? addFloat(Word) : addInt(Word);
-          }
-        }
-      } else {
-        // Indirect / IndirectAliased: the struct is passed by reference.
-        llvm::Value *Ptr = F->getArg(IRArg);
-        if (AI.getIndirectByVal()) {
-          // SysV memory class: split the struct image into 8-byte stack words.
-          uint64_t Sz =
-              getContext().getTypeSizeInChars(A.type).getQuantity();
-          for (uint64_t k = 0, n = (Sz + 7) / 8; k < n; ++k)
-            addStack(B.CreateLoad(
-                Int64Ty, B.CreateConstInBoundsGEP1_64(Int64Ty, Ptr, k)));
-        } else {
-          // AAPCS large aggregate: the pointer travels in an integer register.
-          addInt(B.CreatePtrToInt(Ptr, Int64Ty));
-        }
+      const ABIArgInfo &NAI = A.info;            // native slot -> syscallArgs
+      const ABIArgInfo &GAI = (GoArgIt++)->info; // GoABI0 slot -> F's args
+      unsigned GoN = numIRArgsOf(GAI);
+      if (NAI.isIgnore()) {
+        GoIRArg += GoN;
+        continue;
       }
-      IRArg += N;
+      // (1) Rebuild the native-type memory image from F's GoABI0 args.
+      llvm::Type *MemTy = getTypes().ConvertTypeForMem(A.type);
+      llvm::Value *Slot = B.CreateAlloca(MemTy, nullptr, "argimg");
+      if (GoN == 1) {
+        B.CreateStore(F->getArg(GoIRArg), Slot); // scalar or whole aggregate
+      } else {
+        // GoABI0 flattened a record: one IR arg per top-level field, at offset.
+        llvm::SmallVector<AbiWord, 8> GW;
+        coerceWordsOf(GAI.getCoerceToType(), 0, GW);
+        for (unsigned k = 0; k < GoN && k < GW.size(); ++k)
+          B.CreateAlignedStore(
+              F->getArg(GoIRArg + k),
+              B.CreateConstInBoundsGEP1_64(Int8Ty, Slot, GW[k].Off),
+              llvm::Align(1));
+      }
+      GoIRArg += GoN;
+
+      // (2) Read the image back per the native slot kind.
+      if (NAI.isDirect() || NAI.isExtend()) {
+        llvm::SmallVector<AbiWord, 4> W;
+        coerceWordsOf(NAI.getCoerceToType(), NAI.getDirectOffset(), W);
+        bool Sext = NAI.isExtend() && NAI.isSignExt() && W.size() == 1;
+        for (const AbiWord &w : W) {
+          llvm::Type *WT =
+              w.Float
+                  ? (w.Sz == 4 ? (llvm::Type *)llvm::Type::getFloatTy(
+                                     getLLVMContext())
+                               : (llvm::Type *)llvm::Type::getDoubleTy(
+                                     getLLVMContext()))
+                  : (llvm::Type *)llvm::IntegerType::get(getLLVMContext(),
+                                                         w.Sz * 8);
+          llvm::Value *V = B.CreateAlignedLoad(
+              WT, B.CreateConstInBoundsGEP1_64(Int8Ty, Slot, w.Off),
+              llvm::Align(1));
+          llvm::Value *Word = toWord(V, Sext);
+          w.Float ? addFloat(Word) : addInt(Word);
+        }
+      } else if (NAI.getIndirectByVal()) {
+        // SysV memory class: split the struct image into 8-byte stack words.
+        uint64_t Sz = getContext().getTypeSizeInChars(A.type).getQuantity();
+        for (uint64_t k = 0, n = (Sz + 7) / 8; k < n; ++k)
+          addStack(B.CreateLoad(
+              Int64Ty, B.CreateConstInBoundsGEP1_64(Int64Ty, Slot, k)));
+      } else {
+        // Indirect (AAPCS large aggregate): the pointer rides an int register.
+        addInt(B.CreatePtrToInt(Slot, Int64Ty));
+      }
     }
 
     // runtime.cgocall(trampoline, &block)
@@ -4794,9 +4895,13 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
     Cgo->setCallingConv(llvm::CallingConv::GoABI0);
 
     // Reconstruct the result.
-    if (RI.isIgnore() || RetSret) {
-      // void, or memory-class struct return (already written into *sret).
+    if (RI.isIgnore()) {
       B.CreateRetVoid();
+    } else if (RetSret) {
+      // GoABI0 returns the record BY VALUE; the native call wrote it into the
+      // result buffer. Load it and return — the backend lays the record on the
+      // caller's ABI0 result slots.
+      B.CreateRet(B.CreateLoad(F->getReturnType(), SretBuf));
     } else {
       // Direct/Extend return: the native result lands in a1/a2 (integer) and
       // f1..f4 (float), in word order.
@@ -4848,7 +4953,14 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
 // destFn GoABI0 frame. Scalar/float/pointer signatures only; struct-by-value /
 // sret targets get no converter (link-fails = fail-closed) pending a follow-up.
 bool CodeGenModule::isC2GoExternWindows() const {
-  return C2GoExternOS == "windows";
+  // The extern-dispatch OS follows the target triple's OS by default (windows ->
+  // syscall.SyscallN; otherwise -> runtime.cgocall). The -c2go-extern-os flag is
+  // only an explicit override (e.g. forcing the windows path from a neutral host
+  // triple). The manifest records goos/goarch (CodeGenAction), so c2go-bind
+  // derives the same dispatch from the outputs — no matching flag is required.
+  if (C2GoExternOS.getNumOccurrences())
+    return C2GoExternOS == "windows";
+  return getTriple().isOSWindows();
 }
 
 std::optional<llvm::SmallVector<bool, 4>>

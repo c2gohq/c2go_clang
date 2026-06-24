@@ -23,12 +23,12 @@ typedef struct {
   void *b;
 } TupAB;
 
-// GoABI0 boundary returning the tuple struct. The `c2go_return_type`
+// GoABI0 boundary returning the tuple struct. The `c2go_returntype`
 // attribute documents multi-return intent for Sema; this test pins it as an
 // IR no-op.
 extern TupAB FuncTwoRet(int x)
     c2go_linkname("pkg.FuncTwoRet", C2GO_GOABI0)
-    c2go_return_type(TupAB);
+    c2go_returntype(TupAB);
 
 int caller(int x) {
   TupAB r = FuncTwoRet(x);

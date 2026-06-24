@@ -1,0 +1,43 @@
+# c2go-bind multi-value return (#518). A GoABI0 boundary returning a record is
+# rendered (by clang's go_sig, gated on c2go_returntype) as a Go multi-value
+# tuple `(t1, t2, ...)` — each field is its own ABI0 result slot, the same stack
+# layout as the by-value struct return, and the Go decl then needs no definition
+# of the C struct. This pins the c2go-bind half: an import-direction linkname
+# whose go_sig is a tuple must emit the alias-then-wrap bridge forwarding the
+# tuple verbatim (pulled-in bodyless decl + nosplit wrapper, both carrying the
+# `(int32, unsafe.Pointer)` result list, `return imp(x)` body).
+#
+# The clang half (record return -> tuple go_sig) is pinned by
+# clang/test/CodeGen/c2go-returntype-noop-codegen.c.
+#
+# The c2go-bind binary lives outside llvm-project; see lit.local.cfg for path
+# discovery / the unsupported fallback.
+
+# RUN: rm -rf %t && split-file %s %t
+# RUN: %c2gobind -pkg example.com/demo -dry-run --sidecar %t/m.json %t/x.s > %t/emit.go
+# RUN: FileCheck %s --input-file=%t/emit.go
+
+# The pulled-in private target keeps the tuple result, and the exposed nosplit
+# wrapper forwards it verbatim. (The local symbol name is sanitised from the
+# linkname, hence the wildcard.)
+# CHECK:      //go:linkname _c2go_imp_{{[A-Za-z0-9_]+}} example.com/peer.Imp
+# CHECK-NEXT: func _c2go_imp_[[L:[A-Za-z0-9_]+]](x int32) (int32, unsafe.Pointer)
+# CHECK:      //go:nosplit
+# CHECK-NEXT: func [[L]](x int32) (int32, unsafe.Pointer) {
+# CHECK-NEXT:   return _c2go_imp_[[L]](x)
+
+#--- m.json
+{
+  "pkgpath": "example.com/demo",
+  "min_go_version": "go1.22",
+  "max_go_version": "go1.26",
+  "symbols": [],
+  "types": [],
+  "linknames": [
+    {"name":"imp","kind":"func","go_sig":"func imp(x int32) (int32, unsafe.Pointer)","asm_symbol":"·example_com_peer_Imp","linkname":"example.com/peer.Imp","imported":true}
+  ]
+}
+
+#--- x.s
+TEXT ·use(SB), $0-8
+	RET

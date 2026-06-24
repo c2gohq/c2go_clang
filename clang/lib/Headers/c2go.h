@@ -58,13 +58,13 @@
  */
 #define c2go_linkname(...) __attribute__((c2go_linkname(__VA_ARGS__)))
 
-/* c2go_return_type(struct X): marks a c2go_linkname/c2go_extern function as
+/* c2go_returntype(struct X): marks a c2go_linkname/c2go_extern function as
  * returning a Go multi-value tuple. The named C struct's fields correspond
  * 1:1 (order + type) to the called Go function's return values; the call
  * lowers each field as its own Go ABI0 result slot (placed after the args
  * on the caller's frame) instead of a hidden sret pointer. The function's
  * declared return type must be that same struct. See design.md §P5. */
-#define c2go_return_type(T) __attribute__((c2go_returntype(T)))
+#define c2go_returntype(T) __attribute__((c2go_returntype(T)))
 
 /*===-- C heap -------------------------------------------------------------
  * Use plain malloc/free from <stdlib.h> for unmanaged C-heap memory

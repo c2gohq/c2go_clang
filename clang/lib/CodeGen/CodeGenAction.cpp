@@ -457,6 +457,22 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
   Root["min_go_version"] = ("go" + Lo).str();
   Root["max_go_version"] = ("go" + Hi).str();
 
+  // Record the target as Go's GOOS/GOARCH so c2go-bind derives the per-OS
+  // extern dispatch (unix cgocall vs windows syscall.SyscallN) and the
+  // per-(OS,arch) output naming directly from the manifest — no -extern-os flag.
+  const llvm::Triple &TT = Ctx.getTargetInfo().getTriple();
+  StringRef GOOS = TT.isOSWindows() ? "windows"
+                   : TT.isOSDarwin() ? "darwin"
+                   : TT.isOSLinux()  ? "linux"
+                                     : "";
+  StringRef GOARCH = TT.getArch() == llvm::Triple::x86_64    ? "amd64"
+                     : TT.getArch() == llvm::Triple::aarch64 ? "arm64"
+                                                             : "";
+  if (!GOOS.empty())
+    Root["goos"] = GOOS;
+  if (!GOARCH.empty())
+    Root["goarch"] = GOARCH;
+
   llvm::json::Array Symbols;
   llvm::json::Array Types;
 

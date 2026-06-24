@@ -2114,7 +2114,19 @@ static void getTrivialDefaultFunctionAttributes(
     if (!CodeGenOpts.TrapFuncName.empty())
       FuncAttrs.addAttribute("trap-func-name", CodeGenOpts.TrapFuncName);
   } else {
-    switch (CodeGenOpts.getFramePointer()) {
+    auto FPKind = CodeGenOpts.getFramePointer();
+    // c2go: the Go assembler pushes a saved base-pointer word for every framed
+    // TEXT, so a framed c2go function MUST address its args/locals base-pointer-
+    // relative to stay consistent — an SP-relative framed function reads every
+    // slot one word too low (into the saved-BP slot) and crashes (#495 family).
+    // Targets whose default omits the frame pointer (linux, windows) would emit
+    // SP-relative framed functions; force a frame pointer in c2go mode so every
+    // OS matches darwin, which keeps it by default and is the proven baseline.
+    // aarch64 has no saved-BP word (its saved LR sits inside the frame), so the
+    // backend treats this as a no-op there.
+    if (LangOpts.C2GoMode && FPKind == CodeGenOptions::FramePointerKind::None)
+      FPKind = CodeGenOptions::FramePointerKind::All;
+    switch (FPKind) {
     case CodeGenOptions::FramePointerKind::None:
       // This is the default behavior.
       break;
@@ -2123,8 +2135,7 @@ static void getTrivialDefaultFunctionAttributes(
     case CodeGenOptions::FramePointerKind::NonLeaf:
     case CodeGenOptions::FramePointerKind::All:
       FuncAttrs.addAttribute("frame-pointer",
-                             CodeGenOptions::getFramePointerKindName(
-                                 CodeGenOpts.getFramePointer()));
+                             CodeGenOptions::getFramePointerKindName(FPKind));
     }
 
     if (CodeGenOpts.LessPreciseFPMAD)

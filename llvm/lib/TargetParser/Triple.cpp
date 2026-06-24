@@ -982,6 +982,14 @@ static Triple::ObjectFormatType getDefaultFormat(const Triple &T) {
     switch (T.getOS()) {
     case Triple::Win32:
     case Triple::UEFI:
+      // c2go (GoABI environment): the codegen is ELF/Plan 9-flavored — it gets
+      // the ELF MCAsmInfo (DwarfCFI, with an `.ident` directive) regardless of
+      // OS. Use an ELF object container so the asminfo, EH type, and object
+      // streamer agree; a COFF streamer paired with the ELF asminfo hits the
+      // unimplemented MCWinCOFFStreamer::emitIdent. The real artifact is the
+      // OS-tagged Plan 9 .s, and C type sizes still track Win32 (LLP64).
+      if (T.getEnvironment() == Triple::GoABI)
+        return Triple::ELF;
       return Triple::COFF;
     default:
       return T.isOSDarwin() ? Triple::MachO : Triple::ELF;
@@ -2330,6 +2338,14 @@ bool Triple::isValidVersionForOS(OSType OSKind, const VersionTuple &Version) {
 }
 
 ExceptionHandling Triple::getDefaultExceptionHandling() const {
+  // c2go (GoABI environment): the codegen path always uses the ELF-flavored
+  // (DwarfCFI) MCAsmInfo regardless of OS — the real artifact is Plan 9 .s (Go
+  // assembler), which carries no LLVM exception-handling tables. Force DwarfCFI
+  // so the X86TargetMachine init consistency check (MCAsmInfo vs triple default
+  // EH) holds for a windows-OS goabi triple: its OS would otherwise default to
+  // WinEH below, while createX86MCAsmInfo falls through to the ELF asminfo.
+  if (getEnvironment() == GoABI)
+    return ExceptionHandling::DwarfCFI;
   if (isOSBinFormatCOFF()) {
     if (getArch() == Triple::x86 &&
         (isOSCygMing() || isWindowsItaniumEnvironment()))
