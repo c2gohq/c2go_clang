@@ -1,3 +1,7 @@
+/gosrc
+/.claude
+/build
+/build/**
 #==============================================================================#
 # This file specifies intentionally untracked files that git should ignore.
 # See: http://www.kernel.org/pub/software/scm/git/docs/gitignore.html
@@ -85,3 +89,25 @@ pythonenv*
 /clang/utils/analyzer/projects/*/RefScanBuildResults
 # automodapi puts generated documentation files here.
 /lldb/docs/python_api/
+.codex-gpt-session-id
+
+#==============================================================================#
+# c2go local scratch — LOCAL ONLY, do NOT commit this section.
+# Nothing under .build_status/ is tracked (`git ls-files .build_status/` is
+# empty), and the root .gpt_* / .c2go_* files are GPT review packets / design
+# scratch — all untracked. Ignoring them wholesale keeps `git status` fast on
+# this huge tree (the untracked-file walk is a big part of the startup cost over
+# a slow mount). If a gate script ever needs committing, force it with
+# `git add -f <path>`.
+#==============================================================================#
+# LIT %t temp artifacts (root working dir + any test tree)
+%t
+%t.*
+# editor / agent backup files
+*.bak
+.bak_*
+# c2go gate / wave / codex / build scratch (entirely untracked)
+/.build_status/
+# root-level GPT review packets + design scratch (entirely untracked)
+/.gpt_*
+/.c2go_*
