@@ -20,6 +20,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
@@ -37,13 +38,109 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #include <algorithm>
+#include <optional>
 #include <string>
 #include <system_error>
+#include <utility>
 
 using namespace llvm;
 
 namespace llvm {
 namespace c2go {
+
+// c2go (WF2 unification): pull the per-TU manifest JSON that clang embedded as
+// `c2go.manifest.json` operands and merge them into one manifest object. Returns
+// nullopt for pre-embed bitcode carrying no such metadata (caller then falls back
+// to the legacy per-field reconstruction). The embedded JSON is clang's
+// buildC2GoManifest output verbatim, so the WF2 manifest equals WF1's by
+// construction — the only WF2-specific work is this cross-TU merge (the LTO step:
+// one operand per linked TU after llvm-link appends them).
+static std::optional<json::Object>
+extractEmbeddedC2GoManifest(Module &Composite) {
+  NamedMDNode *NMD = Composite.getNamedMetadata("c2go.manifest.json");
+  if (!NMD)
+    return std::nullopt;
+  SmallVector<json::Object, 4> Ms;
+  for (const MDNode *Op : NMD->operands()) {
+    if (Op->getNumOperands() != 1)
+      continue;
+    auto *S = dyn_cast<MDString>(Op->getOperand(0));
+    if (!S)
+      continue;
+    Expected<json::Value> V = json::parse(S->getString());
+    if (!V) {
+      consumeError(V.takeError());
+      continue;
+    }
+    if (json::Object *O = V->getAsObject())
+      Ms.push_back(std::move(*O));
+  }
+  if (Ms.empty())
+    return std::nullopt;
+  if (Ms.size() == 1)
+    return std::move(Ms.front());
+
+  // Multiple linked TUs: keep the module-scalar fields (pkgpath, versions,
+  // goos/goarch) from the first TU; union each per-entity array — concatenate
+  // across TUs, de-duplicate by "name", then re-sort by "name" to match the
+  // per-section ordering WF1 emits.
+  auto nameOf = [](const json::Value &V) -> StringRef {
+    if (const json::Object *O = V.getAsObject())
+      if (std::optional<StringRef> N = O->getString("name"))
+        return *N;
+    return StringRef();
+  };
+  auto byName = [&](const json::Value &A, const json::Value &B) {
+    return nameOf(A) < nameOf(B);
+  };
+  auto mergeArray = [&](StringRef Key) -> json::Array {
+    json::Array Acc;
+    StringSet<> Seen;
+    for (json::Object &M : Ms)
+      if (json::Array *A = M.getArray(Key))
+        for (json::Value &E : *A) {
+          StringRef N = nameOf(E);
+          if (!N.empty() && !Seen.insert(N).second)
+            continue;
+          Acc.push_back(E); // copy: avoids cross-key move-order hazards
+        }
+    llvm::stable_sort(Acc, byName);
+    return Acc;
+  };
+  // module_gcmask is `{ "vars": [ ... ] }`; its vars[] is itself a per-entity
+  // array, unioned the same way.
+  json::Array GCVars;
+  {
+    StringSet<> Seen;
+    for (json::Object &M : Ms)
+      if (json::Object *GC = M.getObject("module_gcmask"))
+        if (json::Array *A = GC->getArray("vars"))
+          for (json::Value &E : *A) {
+            StringRef N = nameOf(E);
+            if (!N.empty() && !Seen.insert(N).second)
+              continue;
+            GCVars.push_back(E);
+          }
+    llvm::stable_sort(GCVars, byName);
+  }
+  json::Array MS = mergeArray("symbols"), ML = mergeArray("linknames"),
+              MC = mergeArray("callbacks"), MT = mergeArray("types");
+  json::Object Out(std::move(Ms.front())); // scalar fields from the first TU
+  // Match WF1's section presence exactly (CodeGenAction::buildC2GoManifest):
+  // symbols / linknames / types are emitted unconditionally (empty [] included);
+  // callbacks only when non-empty.
+  Out["symbols"] = std::move(MS);
+  Out["linknames"] = std::move(ML);
+  Out["types"] = std::move(MT);
+  if (MC.empty())
+    Out.erase("callbacks");
+  else
+    Out["callbacks"] = std::move(MC);
+  json::Object GC;
+  GC["vars"] = std::move(GCVars);
+  Out["module_gcmask"] = std::move(GC);
+  return Out;
+}
 
 ManifestRebuildStatus
 rebuildManifestFromIR(Module &Composite, bool Build,
@@ -51,6 +148,13 @@ rebuildManifestFromIR(Module &Composite, bool Build,
                       std::string &ManifestText) {
   if (!Build)
     return ManifestRebuildStatus::OK;
+
+  // c2go (WF2 unification): when clang embedded the manifest(s) in the bitcode,
+  // they ARE the manifest — merge and emit them, skipping the legacy per-field
+  // reconstruction (which silently drifted from WF1: cabi/callbacks/var-linknames/
+  // imported were all lost). Falls through to reconstruction only for pre-embed
+  // bitcode (Embedded == nullopt).
+  std::optional<json::Object> Embedded = extractEmbeddedC2GoManifest(Composite);
 
   // c2go WF2 (#319, M4 minimal): optional manifest rebuild from combined
   // bitcode. Reads c2go.pkgpath / c2go.target_go_version module flags and the
@@ -487,6 +591,13 @@ rebuildManifestFromIR(Module &Composite, bool Build,
     ModGC["vars"] = llvm::c2go::collectGCMaskVarsFromModule(Composite);
     Root["module_gcmask"] = std::move(ModGC);
   }
+
+  // c2go (WF2 unification): when clang embedded the manifest, discard everything
+  // the legacy reconstruction just built and emit the embedded (and cross-TU-
+  // merged) manifest instead — it is the WF1 builder's output verbatim, so the
+  // WF2 manifest is byte-identical to WF1's by construction.
+  if (Embedded)
+    Root = std::move(*Embedded);
 
   // Render once into the in-memory buffer; file + archive members are
   // served from the same bytes (M5 byte-identical guarantee).

@@ -4607,9 +4607,32 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
     // decl + fn-glue (#517/#525) rather than emit its own dispatch wrapper.
     F->addFnAttr("c2go-wrapper-in-asm");
     F->setCallingConv(llvm::CallingConv::GoABI0); // == decl CC; explicit.
+    // A c2go_extern referenced from several TUs synthesizes this same wrapper
+    // body in each one. In the multi-file WF2 path c2go-lto llvm-links those
+    // TUs, so the wrapper must be mergeable (ODR) rather than a hard external
+    // definition — otherwise the link fails with "symbol multiply defined". The
+    // body is a pure function of the symbol's signature, so every TU's copy is
+    // identical and linkonce_odr dedup is sound: llvm-link keeps one definition
+    // before Plan 9 emission, so the emitted .s (a single `TEXT ·sym(SB)`) is
+    // byte-for-byte what the single-TU WF1 path emits — the linkage only governs
+    // bitcode-level merging and does not alter codegen.
+    F->setLinkage(llvm::GlobalValue::LinkOnceODRLinkage);
 
     llvm::BasicBlock *BB = llvm::BasicBlock::Create(getLLVMContext(), "entry", F);
     llvm::IRBuilder<> B(BB);
+    // All of this wrapper's temporaries must be allocated at the TOP of the
+    // entry block, not interspersed through the straight-line body. The
+    // C2GoSafepoint pass (a GC-safety transform that runs at every -O level)
+    // inserts a zero-init store for each pointer-bearing alloca at a dominating
+    // point; a mid-body alloca would then be used before it is defined and the
+    // IR verifier rejects it ("instruction does not dominate all uses"). At -O2
+    // mem2reg promotes the slot away before this surfaces, which is why it only
+    // bites at -O0 — now reachable since c2go-lto accepts -O0 bitcode.
+    auto entryAlloca = [&](llvm::Type *Ty, llvm::Value *ArraySize,
+                           const llvm::Twine &Name) -> llvm::AllocaInst * {
+      llvm::IRBuilder<> AB(BB, BB->begin());
+      return AB.CreateAlloca(Ty, ArraySize, Name);
+    };
 
     // ---- Windows: positional args -> syscall.SyscallN (purego windows path).
     // Win64: every arg occupies ONE positional slot. A scalar's bits go in the
@@ -4641,7 +4664,7 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
       bool RetInRax = RetIsRecord && IsRegSize(RetSz);   // <=8B struct -> RAX
       llvm::Value *WSretBuf = nullptr;                   // >8B struct -> sret buf
       if (RetIsRecord && !RetInRax)
-        WSretBuf = B.CreateAlloca(RetTy, nullptr, "wsretbuf");
+        WSretBuf = entryAlloca(RetTy, nullptr, "wsretbuf");
 
       // Build the positional slot list. sret pointer (if any) leads.
       llvm::SmallVector<llvm::Value *, 8> Slots;
@@ -4673,7 +4696,7 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
           // Record: rebuild its memory image from F's GoABI0 fields, then apply
           // the Win64 size rule (<=8B as bytes in one slot, else by pointer).
           llvm::Type *MemTy = getTypes().ConvertTypeForMem(A.type);
-          llvm::Value *Img = B.CreateAlloca(MemTy, nullptr, "argimg");
+          llvm::Value *Img = entryAlloca(MemTy, nullptr, "argimg");
           if (GoN == 1) {
             B.CreateStore(F->getArg(GoIRArg), Img); // whole aggregate / 1 word
           } else {
@@ -4700,7 +4723,7 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
 
       unsigned N = Slots.size();
       llvm::Type *ArgsTy = llvm::ArrayType::get(Int64Ty, N ? N : 1);
-      llvm::Value *ArgsArr = B.CreateAlloca(ArgsTy, nullptr, "winargs");
+      llvm::Value *ArgsArr = entryAlloca(ArgsTy, nullptr, "winargs");
       for (unsigned I = 0; I < N; ++I)
         B.CreateStore(Slots[I], B.CreateConstInBoundsGEP2_64(ArgsTy, ArgsArr, 0, I));
       llvm::Value *ArgsPtr = B.CreateConstInBoundsGEP2_64(ArgsTy, ArgsArr, 0, 0);
@@ -4729,7 +4752,7 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
       } else if (RetInRax) {
         // <=8B struct: reinterpret r1's low RetSz bytes as the record.
         llvm::Value *R1 = B.CreateExtractValue(R, 0);
-        llvm::Value *RB = B.CreateAlloca(RetTy, nullptr, "wretbuf");
+        llvm::Value *RB = entryAlloca(RetTy, nullptr, "wretbuf");
         B.CreateAlignedStore(
             B.CreateZExtOrTrunc(
                 R1, llvm::IntegerType::get(getLLVMContext(), RetSz * 8)),
@@ -4750,7 +4773,7 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
       continue;
     }
 
-    llvm::Value *Block = B.CreateAlloca(BlockTy, nullptr, "syscallargs");
+    llvm::Value *Block = entryAlloca(BlockTy, nullptr, "syscallargs");
     auto slotPtr = [&](unsigned Idx) -> llvm::Value * {
       return B.CreateConstInBoundsGEP2_64(BlockTy, Block, 0, Idx);
     };
@@ -4815,7 +4838,7 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
     // from it after the call.
     llvm::Value *SretBuf = nullptr;
     if (RetSret) {
-      SretBuf = B.CreateAlloca(F->getReturnType(), nullptr, "sretbuf");
+      SretBuf = entryAlloca(F->getReturnType(), nullptr, "sretbuf");
       llvm::Value *W = B.CreatePtrToInt(SretBuf, Int64Ty);
       if (IsAMD64)
         addInt(W);
@@ -4842,7 +4865,7 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
       }
       // (1) Rebuild the native-type memory image from F's GoABI0 args.
       llvm::Type *MemTy = getTypes().ConvertTypeForMem(A.type);
-      llvm::Value *Slot = B.CreateAlloca(MemTy, nullptr, "argimg");
+      llvm::Value *Slot = entryAlloca(MemTy, nullptr, "argimg");
       if (GoN == 1) {
         B.CreateStore(F->getArg(GoIRArg), Slot); // scalar or whole aggregate
       } else {
@@ -4927,7 +4950,7 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
       } else {
         // Multi-word / aggregate return: stitch the result words into an image
         // of the wrapper's return type, then load + return it.
-        llvm::Value *Img = B.CreateAlloca(RetTy, nullptr, "ret");
+        llvm::Value *Img = entryAlloca(RetTy, nullptr, "ret");
         unsigned Ni = 0, Nf = 0;
         for (const AbiWord &W : RW) {
           unsigned Slot = W.Float ? (kFloatSlot0 + Nf++) : (kIntSlot0 + Ni++);

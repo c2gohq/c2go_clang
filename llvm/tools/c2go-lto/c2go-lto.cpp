@@ -154,6 +154,17 @@ static cl::opt<std::string>
             cl::desc("Emit Plan 9 .s (via MCPlan9AsmStreamer) to <file>"),
             cl::value_desc("file"), cl::init(""));
 
+// c2go: stack->heap escapes are normally reported via exit code 1 so a build
+// step can gate on them. When c2go-lto runs INSIDE the clang driver (the WF2
+// path for an ordinary `-fc2go` compile), an escape is a diagnostic, not a build
+// failure — the legacy cc1-direct emit ran no escape audit at all, so gating
+// here would be a new, surprising hard error. This flag keeps the per-escape
+// diagnostics but returns 0; the standalone tool (build-gating callers such as
+// the WF2 archive build) leaves it off and keeps the exit-1 contract.
+static cl::opt<bool> EscapeNonFatal(
+    "c2go-escape-nonfatal", cl::init(false),
+    cl::desc("report stack->heap escapes as diagnostics but exit 0"));
+
 // c2go WF2 (#319, M5): emit a real Unix `ar` archive bundling the same
 // Plan 9 .s + manifest .json that --c2go-emit-asm / --c2go-emit-manifest
 // would produce, as the two named members `<base>.s` and
@@ -572,39 +583,20 @@ int main(int argc, char **argv) {
     return ExitToolError;
   }
 
-  // c2go #433: SQLite WF2 e2e gate hardening — the Plan-9 codegen pipeline
-  // here assumes OptLevel >= 2 (RS4GC + GCSetup + FoldAlloca ran upstream
-  // at OptimizerLastEP, which clang's PassBuilder only schedules at -O>=2),
-  // and refuses bc carrying any `optnone` function because that attribute
-  // disables the C2GoCommon CC enforcement passes the Go linker depends on.
-  // The flag is stamped by clang `-fc2go -emit-llvm` (CodeGenModule.cpp:1442);
-  // absent flag = pre-#433 bc, treated as ">=O2" so we don't break older
-  // bitcode round-trips.
-  {
-    auto OptLevelFlag = Composite->getModuleFlag(c2go::kOptLevelFlag);
-    int OptLevel = 3;
-    if (OptLevelFlag) {
-      if (auto *CAM = dyn_cast<ConstantAsMetadata>(OptLevelFlag))
-        if (auto *CI = dyn_cast<ConstantInt>(CAM->getValue()))
-          OptLevel = (int)CI->getZExtValue();
-    }
-    if (OptLevel < 2) {
-      errs() << argv[0] << ": error: bitcode '" << InputFiles[0]
-             << "' was compiled at -O" << OptLevel
-             << "; c2go-lto requires -O2 or higher (#433)\n";
-      return ExitToolError;
-    }
-    for (const Function &F : *Composite) {
-      if (F.isDeclaration())
-        continue;
-      if (F.hasFnAttribute(Attribute::OptimizeNone)) {
-        errs() << argv[0] << ": error: bitcode '" << InputFiles[0]
-               << "' contains optnone function '" << F.getName()
-               << "'; c2go-lto requires -O2 (no optnone) (#433)\n";
-        return ExitToolError;
-      }
-    }
-  }
+  // c2go: c2go-lto behaves as a bitcode LINKER — it PRESERVES the entry
+  // pipeline's optimization level instead of imposing one. The codegen TM is
+  // already created at the bitcode's recorded -O level (kOptLevelFlag, see the
+  // emit helper), so at -O0 the c2go OptimizerLast transforms (RS4GC / GCSetup /
+  // the ABIInternal leaf-flip) — which clang only schedules at -O>=2 — simply
+  // stayed disabled and c2go-lto links + emits a plain stack-ABI0 .s. The
+  // cross-TU inliner + late-leaf replay below is therefore gated on -O>=2 too.
+  // (This supersedes the old #433 hard -O2 / no-optnone requirement, which is
+  // incompatible with c2go-lto being a drop-in bitcode linker.)
+  int BitcodeOptLevel = 3; // flag-absent (pre-#433 bc) => treat as -O>=2
+  if (auto *F = Composite->getModuleFlag(c2go::kOptLevelFlag))
+    if (auto *CAM = dyn_cast<ConstantAsMetadata>(F))
+      if (auto *CI = dyn_cast<ConstantInt>(CAM->getValue()))
+        BitcodeOptLevel = (int)CI->getZExtValue();
 
   // Q2 fix: capture per-input c2go-boundary attrs BEFORE IRMover merges
   // declarations into definitions. IRMover does not diagnose c2go string
@@ -683,7 +675,16 @@ int main(int argc, char **argv) {
   // `<N> stack-address escape point(s)` summary to outs(); the bool return
   // is N==0 (clean audit), which we cache for the ExitEscapesFound decision
   // at the end of main().
-  bool EscapeClean = c2go::runAndersenEscapeAudit(*Composite, outs());
+  //
+  // In --c2go-escape-nonfatal mode (the clang-driver path, where escapes do not
+  // gate the build) the diagnostics are sent to a null stream: the legacy
+  // cc1-direct -fc2go emit ran no audit and printed nothing, so a plain compile
+  // keeps stdout clean. Standalone build-gating callers leave the flag off and
+  // get the full report on stdout.
+  llvm::raw_null_ostream NullOS;
+  raw_ostream &EscapeOS = EscapeNonFatal ? static_cast<raw_ostream &>(NullOS)
+                                         : static_cast<raw_ostream &>(outs());
+  bool EscapeClean = c2go::runAndersenEscapeAudit(*Composite, EscapeOS);
 
   // c2go #303: cross-TU inlining via NewPM ModuleInlinerWrapperPass.
   //
@@ -701,8 +702,10 @@ int main(int argc, char **argv) {
   // We do NOT call buildLTODefaultPipeline: that brings in IPO transforms
   // (GlobalOpt, DAE, ArgPromotion, etc.) which can break c2go invariants
   // (CSR_AArch64_NoRegs contract, FUNCDATA/PCDATA pairing, RS4GC results).
-  // Just the inliner is the minimum surface area #303 asks for.
-  if (RunInliner) {
+  // Just the inliner is the minimum surface area #303 asks for. Gated on
+  // -O>=2: at -O0 c2go-lto is a pure linker and runs no optimization/late
+  // passes (the entry pipeline did not run them either).
+  if (RunInliner && BitcodeOptLevel >= 2) {
     LoopAnalysisManager LAM;
     FunctionAnalysisManager FAM;
     CGSCCAnalysisManager CGAM;
@@ -974,5 +977,5 @@ int main(int argc, char **argv) {
   // disk. The gate is no longer here.
 
   // Non-zero exit when escapes were found, so the tool can gate a build.
-  return EscapeClean ? ExitOK : ExitEscapesFound;
+  return (EscapeClean || EscapeNonFatal) ? ExitOK : ExitEscapesFound;
 }

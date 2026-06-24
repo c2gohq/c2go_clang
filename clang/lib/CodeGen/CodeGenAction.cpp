@@ -1182,6 +1182,24 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
   return Root;
 }
 
+// c2go (WF2 unification): embed the WF1 manifest JSON verbatim into the module
+// as a `c2go.manifest.json` named-metadata operand. c2go-lto extracts and merges
+// these instead of reconstructing the manifest field-by-field from per-symbol
+// metadata (which silently drifts from this builder — e.g. cabi/callbacks/var-
+// linknames/imported were all lost). Each TU stamps one operand; llvm-link
+// appends them across TUs, so the Composite carries one operand per linked TU and
+// c2go-lto merges them. Stamped whenever c2go mode is on (independent of whether
+// a manifest FILE is requested), so a plain `-emit-llvm-bc` carries it for WF2.
+static void embedC2GoManifest(llvm::Module &M, const llvm::json::Object &Root) {
+  llvm::json::Object Copy(Root);
+  llvm::json::Value V(std::move(Copy));
+  std::string S;
+  llvm::raw_string_ostream(S) << V; // compact; c2go-lto re-pretty-prints to match
+  llvm::LLVMContext &Ctx = M.getContext();
+  llvm::NamedMDNode *NMD = M.getOrInsertNamedMetadata("c2go.manifest.json");
+  NMD->addOperand(llvm::MDNode::get(Ctx, llvm::MDString::get(Ctx, S)));
+}
+
 // writeC2GoManifest serializes the prebuilt manifest to `OutPath`.
 static void writeC2GoManifest(const llvm::json::Object &Root,
                               StringRef OutPath, DiagnosticsEngine &Diags) {
@@ -1228,6 +1246,9 @@ void BackendConsumer::HandleTranslationUnit(ASTContext &C) {
     C2GoManifest =
         buildC2GoManifest(C, CI.getLangOpts(), Diags, getModule(), &Gen->CGM());
     C2GoManifestBuilt = true;
+    // Carry the manifest into the bitcode so the WF2 path (c2go-lto) reads it
+    // back verbatim rather than reconstructing (and drifting from) it.
+    embedC2GoManifest(*getModule(), C2GoManifest);
     if (!CI.getLangOpts().C2GoEmitManifestPath.empty())
       writeC2GoManifest(C2GoManifest,
                         CI.getLangOpts().C2GoEmitManifestPath, Diags);
