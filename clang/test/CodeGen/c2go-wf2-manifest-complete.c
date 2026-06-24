@@ -30,11 +30,13 @@
 #  error "needs -fc2go"
 #endif
 #define c2go_extern        __attribute__((c2go_extern))
+#define unmanaged          __attribute__((c2go_unmanaged))
 #define c2go_linkname(...) __attribute__((c2go_linkname(__VA_ARGS__)))
 #define c2go_callback(fn)  (__c2go_callback(fn))
 
-// extern boundary -> symbols[] entry carrying cabi + wrapper_in_asm.
-c2go_extern void reg_cb(void *cb);
+// unmanaged extern import (external host symbol) -> symbols[] entry carrying
+// cabi + wrapper_in_asm (the .s dispatch wrapper, since it is referenced below).
+unmanaged extern void reg_cb(void *cb);
 
 // path-b linknames (hyphenated package path is not Plan 9-direct): an exported
 // (definition here -> imported=false) and an imported (declaration only ->

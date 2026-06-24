@@ -8485,7 +8485,7 @@ ExprResult InitializationSequence::Perform(Sema &S,
       // reject managed→unmanaged pointer init that would silently drop the
       // AS1 GC discriminator. Skip param / return / stmt-expr-result paths;
       // those have dedicated diagnostics
-      // (err_c2go_managed_to_unmanaged_call/return) with better wording.
+      // (warn_c2go_managed_to_unmanaged_call/return) with better wording.
       if (S.getLangOpts().C2GoMode && !Entity.isParameterKind() &&
           Entity.getKind() != InitializedEntity::EK_Result &&
           Entity.getKind() != InitializedEntity::EK_StmtExprResult) {

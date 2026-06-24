@@ -1,5 +1,5 @@
 // Passing a c2go_managed pointer to an unmanaged extern parameter (e.g. void*)
-// drops the addrspace(1) GC discriminator, so Sema rejects it. The escape
+// drops the addrspace(1) GC discriminator, so Sema warns (it is allowed but lossy). The escape
 // hatch is an explicit (__attribute__((c2go_managed)) T *) cast; passing to a
 // managed parameter is fine.
 //
@@ -12,7 +12,7 @@ extern void libc_free(void *p);
 extern void libc_take_n(struct N *n); // managed param: OK
 
 void caller(struct N *managed) {
-  libc_free(managed); // expected-error{{drops the Go GC discriminator}}
+  libc_free(managed); // expected-warning{{allowed but lossy}}
   libc_take_n(managed); // OK (managed parameter)
   // Explicit cast back to managed is the in-source escape hatch.
   libc_free((__attribute__((c2go_managed)) void *)managed);

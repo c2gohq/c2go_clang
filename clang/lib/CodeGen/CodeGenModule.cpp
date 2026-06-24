@@ -903,9 +903,12 @@ bool CodeGenModule::usesC2GoVoidPtrVararg(const FunctionType *FnType,
   const auto *FPT = dyn_cast_or_null<FunctionProtoType>(FnType);
   if (!FPT || !FPT->isVariadic())
     return false;
-  // GoABI0 boundary symbols (c2go_extern / c2go_linkname) keep the platform
-  // ABI; everything else internal uses the void** tagged argument pack.
-  if (D && (D->hasAttr<C2GoExternAttr>() || D->hasAttr<C2GoLinknameAttr>()))
+  // GoABI0 boundary symbols (c2go_extern / c2go_linkname) and unmanaged-extern
+  // imports keep the platform ABI; everything else internal uses the void**
+  // tagged argument pack.
+  if (D && (D->hasAttr<C2GoExternAttr>() || D->hasAttr<C2GoLinknameAttr>() ||
+            clang::c2go::isC2GoUnmanagedExternImport(
+                dyn_cast_or_null<FunctionDecl>(D))))
     return false;
   return true;
 }
@@ -914,9 +917,12 @@ bool CodeGenModule::useC2GoGoABI0CC(const Decl *D) const {
   if (!getLangOpts().C2GoMode)
     return false;
   // GoABI0 boundary symbols keep the platform ABI (the Go side calls them
-  // through an ABI0 wrapper / the external host-ABI bridge). Everything else
-  // internal uses GoABI0 stack passing.
-  if (D && (D->hasAttr<C2GoExternAttr>() || D->hasAttr<C2GoLinknameAttr>()))
+  // through an ABI0 wrapper / the external host-ABI bridge). Unmanaged-extern
+  // imports are likewise boundaries (called through the synthesized GoABI0
+  // dispatch wrapper). Everything else internal uses GoABI0 stack passing.
+  if (D && (D->hasAttr<C2GoExternAttr>() || D->hasAttr<C2GoLinknameAttr>() ||
+            clang::c2go::isC2GoUnmanagedExternImport(
+                dyn_cast_or_null<FunctionDecl>(D))))
     return false;
   return true;
 }
@@ -926,8 +932,12 @@ bool CodeGenModule::useC2GoGoABI0CallingConv(const Decl *D) const {
     return false;
   // Boundary symbols are excluded by useC2GoGoABI0CC (void** vararg path), but
   // Go calls them via ABI0, so their definitions/call sites still need the
-  // GoABI0 LLVM calling convention. Add them back here.
-  if (D && (D->hasAttr<C2GoExternAttr>() || D->hasAttr<C2GoLinknameAttr>()))
+  // GoABI0 LLVM calling convention. Add them back here — including
+  // unmanaged-extern imports, whose call sites must match the GoABI0 signature
+  // of the synthesized dispatch wrapper.
+  if (D && (D->hasAttr<C2GoExternAttr>() || D->hasAttr<C2GoLinknameAttr>() ||
+            clang::c2go::isC2GoUnmanagedExternImport(
+                dyn_cast_or_null<FunctionDecl>(D))))
     return true;
   return useC2GoGoABI0CC(D);
 }
@@ -1207,29 +1217,14 @@ void CodeGenModule::Release() {
   // c2go_callback(fn) target (reverse marshal: foreign C-ABI args -> destFn).
   if (LangOpts.C2GoMode)
     EmitC2GoCallbackConverters();
-  // c2go WF2 (#319, C5): materialize and pin every c2go_extern function
-  // declaration so it survives dead-stripping into the bitcode. Without this,
-  // unreferenced unmanaged externs (e.g. raw_read prototype) and
-  // c2go_linkname path-b bridges (e.g. hyphen_helper) get dropped by clang's
-  // dead-decl elimination, and c2go-lto cannot rebuild the corresponding
-  // manifest entries from combined bitcode. Use appendToCompilerUsed so the
-  // pin is LTO-droppable once c2go-lto has read the symbol; appendToUsed
-  // would survive into the final linker output (we do not want that).
+  // c2go: under the export-only c2go_extern model (docs/c2go_design.md
+  // §2.0.3) there is nothing to force-keep here. A declared-only c2go_extern is
+  // a pure ABI0 marker with no manifest entry, and an unmanaged-extern import
+  // earns a manifest entry + dispatch wrapper ONLY when actually referenced —
+  // so a used import is already held live by its call sites (and its
+  // synthesized linkonce_odr wrapper body), while an unreferenced prototype is
+  // intentionally dropped rather than pinned into the bitcode.
   if (LangOpts.C2GoMode) {
-    llvm::SmallVector<llvm::GlobalValue *, 8> KeepAlive;
-    for (const Decl *D : Context.getTranslationUnitDecl()->decls()) {
-      const auto *FD = dyn_cast<FunctionDecl>(D);
-      if (!FD || !FD->hasAttr<C2GoExternAttr>())
-        continue;
-      if (FD->doesThisDeclarationHaveABody())
-        continue;
-      llvm::Constant *C = GetAddrOfFunction(FD);
-      if (auto *GV = dyn_cast_or_null<llvm::GlobalValue>(C))
-        KeepAlive.push_back(GV);
-    }
-    if (!KeepAlive.empty())
-      llvm::appendToCompilerUsed(getModule(), KeepAlive);
-
     // c2go WF2 (#319 C4a): walk every c2go_struct RecordDecl in the TU and
     // emit `c2go.struct.<X>.meta` (managed/scheme/ptr_offset/linkname). The
     // existing lazy emit in CodeGenTypes::ConvertRecordDeclType only fires
@@ -3007,11 +3002,14 @@ void CodeGenModule::SetLLVMFunctionAttributes(GlobalDecl GD,
                      llvm::utostr(clang::c2go::computeC2GoArgSize(
                          FD, getContext())));
       }
-      // c2go WF2 (#319 C2 follow-up): stamp the three remaining manifest-
-      // grade attrs that affect symbol "world" (managed vs. unmanaged) and
-      // linkname-host bridging. These are applied to every GoABI0 function,
-      // not just boundaries — e.g. a static helper marked c2go_unmanaged
-      // still flips its return world. param-worlds is a packed
+      // c2go WF2 (#319 C2 follow-up): stamp the remaining manifest-grade attrs
+      // that carry symbol "world" (managed vs. unmanaged) and linkname-host
+      // bridging into the bitcode (read back by c2go-lto's fallback rebuilder).
+      // c2go_unmanaged on a function marks it unmanaged-world — i.e. an external
+      // import; the func-level return-world marking was removed (#268), and a
+      // DEFINED c2go_unmanaged function is rejected by Sema, so this only fires
+      // for imports. (The attr name is historical; it feeds the manifest
+      // `managed` bit, not a per-return decision.) param-worlds is a packed
       // "p<i>=u" CSV; absent attr means "all managed", matching
       // computeC2GoArgPtrMask's default.
       if (FD->hasAttr<C2GoUnmanagedAttr>())
@@ -4517,11 +4515,12 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
 
   for (const Decl *D : Context.getTranslationUnitDecl()->decls()) {
     const auto *FD = dyn_cast<FunctionDecl>(D);
-    if (!FD || !FD->hasAttr<C2GoExternAttr>() ||
-        FD->hasAttr<C2GoLinknameAttr>())
+    // Synthesize a wrapper only for an unmanaged-extern *import* (an external
+    // C symbol the c2go world calls). c2go_extern is export-only and gets no
+    // import wrapper; the predicate already excludes it (and c2go_linkname,
+    // and any DEFINED function — a definition is not an import).
+    if (!clang::c2go::isC2GoUnmanagedExternImport(FD))
       continue;
-    if (FD->doesThisDeclarationHaveABody() || FD->isDefined())
-      continue; // a DEFINED c2go_extern is a normal "func" export, not extern
     if (FD->isVariadic() || !FD->getType()->getAs<FunctionProtoType>())
       continue; // variadic / K&R: fall back to the Go-dispatch wrapper
 

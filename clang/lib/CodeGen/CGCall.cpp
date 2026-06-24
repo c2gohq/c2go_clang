@@ -15,6 +15,7 @@
 #include "ABIInfo.h"
 #include "ABIInfoImpl.h"
 #include "CGBlocks.h"
+#include "CGC2GoManifestHelpers.h"
 #include "CGCXXABI.h"
 #include "CGCleanup.h"
 #include "CGDebugInfo.h"
@@ -688,6 +689,10 @@ CodeGenTypes::arrangeMSCtorClosure(const CXXConstructorDecl *CD,
 ///
 /// This holds for:
 ///   * GoABI0 boundary symbols (c2go_extern / c2go_linkname) — v15 §P5;
+///   * unmanaged-extern imports — same boundary lowering (the synthesized
+///     GoABI0 dispatch wrapper expects the GoABI0 by-value record-return
+///     form, so the import must arrange record returns the GoABI0 way, not the
+///     native sret way);
 ///   * every internal c2go function (ABI foundation) — args/results on the
 ///     Go ABI0 stack frame, mirroring the IR-level CC override at the call
 ///     site (CommonEmitCall) and definition (SetLLVMFunctionAttributes).
@@ -699,7 +704,9 @@ CodeGenTypes::arrangeMSCtorClosure(const CXXConstructorDecl *CD,
 /// with GoABI0 so the packed args land on the stack.
 static bool isC2GoABI0Function(CodeGenModule &CGM, const Decl *D,
                                const FunctionType *fnType) {
-  if (D && (D->hasAttr<C2GoExternAttr>() || D->hasAttr<C2GoLinknameAttr>()))
+  if (D && (D->hasAttr<C2GoExternAttr>() || D->hasAttr<C2GoLinknameAttr>() ||
+            clang::c2go::isC2GoUnmanagedExternImport(
+                dyn_cast_or_null<FunctionDecl>(D))))
     return true;
   if (!CGM.useC2GoGoABI0CC(D))
     return false;

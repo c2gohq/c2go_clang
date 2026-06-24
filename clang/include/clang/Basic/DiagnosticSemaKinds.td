@@ -2331,24 +2331,35 @@ def err_c2go_unmanaged_record_has_managed_field : Error<
 // into an unmanaged location, returning it as void*, or passing it to an
 // extern void* parameter would let it escape RS4GC root tracking. The
 // in-source escape hatch is an explicit cast back to managed.
-def err_c2go_managed_to_unmanaged_store : ExtWarn<
+def warn_c2go_managed_to_unmanaged_store : ExtWarn<
   "storing a c2go_managed pointer into an unmanaged location of type %0 "
-  "drops the Go GC discriminator (AS1) and is not safe: the pointer will "
-  "not be tracked across GC safepoints. Cast back to managed at the load "
-  "site, or pin the object via runtime.KeepAlive">,
-  InGroup<C2GoManagedAS1>, DefaultError;
-def err_c2go_managed_to_unmanaged_return : ExtWarn<
+  "drops its managed (AS1) write-barrier tracking; the pointer is still "
+  "conservatively GC-scanned (as an unsafe.Pointer), so this is allowed "
+  "but lossy. Cast back to managed at the load site to restore precise "
+  "tracking">,
+  InGroup<C2GoManagedAS1>;
+def warn_c2go_managed_to_unmanaged_return : ExtWarn<
   "returning a c2go_managed pointer through unmanaged return type %0 "
-  "drops the Go GC discriminator (AS1) and is not safe: callers will not "
-  "track this pointer across safepoints. Mark the return type managed, "
-  "or copy the pointee into the caller's managed memory">,
-  InGroup<C2GoManagedAS1>, DefaultError;
-def err_c2go_managed_to_unmanaged_call : ExtWarn<
+  "drops its managed (AS1) write-barrier tracking; callers get a "
+  "conservatively GC-scanned unsafe.Pointer, so this is allowed but "
+  "lossy. Mark the return type managed to restore precise tracking">,
+  InGroup<C2GoManagedAS1>;
+def warn_c2go_managed_to_unmanaged_call : ExtWarn<
   "passing a c2go_managed pointer to %select{parameter %1|extern parameter %1}0 "
-  "of unmanaged type %2 drops the Go GC discriminator (AS1) and is not "
-  "safe: the callee will not track the pointer across safepoints. Mark the "
-  "parameter managed, or pass an unmanaged copy">,
-  InGroup<C2GoManagedAS1>, DefaultError;
+  "of unmanaged type %2 drops its managed (AS1) write-barrier tracking; the "
+  "callee gets a conservatively GC-scanned unsafe.Pointer, so this is allowed "
+  "but lossy. Mark the parameter managed to restore precise tracking">,
+  InGroup<C2GoManagedAS1>;
+// c2go (docs/c2go_design.md §2.0.3 / §0 line "func bit deprecated #268): a
+// function marked c2go_unmanaged (spelled `unmanaged extern`) names an external
+// imported symbol dispatched through the host-ABI bridge; it has no in-c2go
+// definition. Defining one is a contradiction (the func-level managed/unmanaged
+// "world" marking was removed — c2go_unmanaged on a function means import, not
+// an unmanaged-return local function).
+def err_c2go_define_unmanaged_extern : Error<
+  "cannot define %0: it is marked 'c2go_unmanaged' (an external imported symbol "
+  "with no in-c2go definition). Remove the 'c2go_unmanaged' marking to define "
+  "it as a local function">;
 // c2go v15 §3.5 D4: ptrtoint of a managed pointer escapes AS1 — the
 // integer carries no GC discriminator, so if it outlives a safepoint
 // and is later cast back to a pointer, RewriteStatepointsForGC cannot

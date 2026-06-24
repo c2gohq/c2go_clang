@@ -24,6 +24,19 @@
 namespace clang {
 namespace c2go {
 
+bool isC2GoUnmanagedExternImport(const FunctionDecl *FD) {
+  if (!FD || !FD->hasAttr<C2GoUnmanagedAttr>())
+    return false;
+  // c2go_extern is export-only; c2go_linkname owns its own bridge path.
+  if (FD->hasAttr<C2GoExternAttr>() || FD->hasAttr<C2GoLinknameAttr>())
+    return false;
+  // Declared-only: no body in this declaration and no definition anywhere in
+  // the redecl chain. A c2go_unmanaged function names an external import, so it
+  // must never be defined in c2go (Sema rejects a definition); this test keeps
+  // the predicate precise for the codegen paths regardless.
+  return !FD->doesThisDeclarationHaveABody() && !FD->isDefined();
+}
+
 std::string mapC2GoType(QualType QT, const ASTContext &Ctx, bool IsUnmanaged) {
   QT = QT.getCanonicalType();
   if (QT->isVoidType()) return "";

@@ -10951,7 +10951,7 @@ Sema::CheckReturnValExpr(Expr *RetValExp, QualType lhsType,
     QualType RetTy = RetValExp->IgnoreParenImpCasts()->getType();
     if (c2goTypeIsManagedPtr(RetTy) &&
         !c2goExprIsExplicitManagedCast(RetValExp))
-      Diag(ReturnLoc, diag::err_c2go_managed_to_unmanaged_return) << lhsType;
+      Diag(ReturnLoc, diag::warn_c2go_managed_to_unmanaged_return) << lhsType;
   }
 }
 

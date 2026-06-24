@@ -4446,7 +4446,7 @@ public:
   /// RHS into an unmanaged pointer LHS (drops the AS1 GC discriminator).
   /// Used by both assignment (CheckAssignmentOperands) and initialization
   /// (SemaInit SK_CAssignment) paths; call/return paths have their own
-  /// dedicated diagnostics (err_c2go_managed_to_unmanaged_call/return).
+  /// dedicated diagnostics (warn_c2go_managed_to_unmanaged_call/return).
   void checkC2GoManagedToUnmanagedStore(QualType LHSType, Expr *RHSExpr,
                                         SourceLocation Loc);
 

@@ -6175,7 +6175,7 @@ bool Sema::GatherArgumentsForCall(SourceLocation CallLoc, FunctionDecl *FDecl,
           bool IsExtern =
               FDecl && (FDecl->getStorageClass() == SC_Extern ||
                         !FDecl->hasBody());
-          Diag(Arg->getBeginLoc(), diag::err_c2go_managed_to_unmanaged_call)
+          Diag(Arg->getBeginLoc(), diag::warn_c2go_managed_to_unmanaged_call)
               << (IsExtern ? 1 : 0) << (i + 1) << ProtoArgType;
         }
       }
@@ -14560,7 +14560,7 @@ void Sema::checkC2GoManagedToUnmanagedStore(QualType LHSType, Expr *RHSExpr,
   // Allow explicit user-acknowledged AS1 → void* via cast on the RHS.
   if (c2goExprIsExplicitManagedCast(RHSExpr))
     return;
-  Diag(Loc, diag::err_c2go_managed_to_unmanaged_store) << LHSType;
+  Diag(Loc, diag::warn_c2go_managed_to_unmanaged_store) << LHSType;
 }
 
 QualType Sema::CheckAssignmentOperands(Expr *LHSExpr, ExprResult &RHS,

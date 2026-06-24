@@ -49,8 +49,8 @@ std::string mapC2GoType(QualType QT, const ASTContext &Ctx,
                         bool IsUnmanaged = false);
 
 /// Build a Go-style "func Name(arg, ...) ret" signature string for \p FD.
-/// Honors c2go_unmanaged distinctly on the function (return) versus on each
-/// parameter (per-parameter world, v14 spec).
+/// A function-level c2go_unmanaged (an import) maps its return type as
+/// unmanaged; a per-parameter c2go_unmanaged maps that parameter as unmanaged.
 std::string buildC2GoGoSig(const FunctionDecl *FD, const ASTContext &Ctx);
 
 /// Compute Go ABI0 frame size for \p FD's signature. Mirrors Go's
@@ -59,6 +59,25 @@ std::string buildC2GoGoSig(const FunctionDecl *FD, const ASTContext &Ctx);
 /// RegSize. v0 only handles scalars and pointers (no aggregate-by-value
 /// alignment recursion).
 uint64_t computeC2GoArgSize(const FunctionDecl *FD, const ASTContext &Ctx);
+
+/// True when \p FD is an *unmanaged extern import*: an external C symbol the
+/// c2go world calls through the host-ABI bridge (purego SyscallN / cgocall),
+/// spelled `unmanaged extern <ret> f(...);` (the c2go.h `unmanaged` macro
+/// expands to `__attribute__((c2go_unmanaged))` on a body-less declaration).
+/// This is the ONLY import form: `c2go_extern` is export-only — an ABI0
+/// function c2go *emits* for Go to call — and is never an import
+/// (docs/c2go_design.md §2.0.3).
+///
+/// The predicate holds iff \p FD:
+///   * carries `c2go_unmanaged`, AND
+///   * is declared-only (no definition in any redeclaration of its chain), AND
+///   * is neither `c2go_extern` (export) nor `c2go_linkname` (its own bridge).
+///
+/// The declared-only test is load-bearing: `c2go_unmanaged` on a function
+/// names an external import (host bridge), which is never defined in c2go —
+/// Sema rejects defining one — so a c2go_unmanaged function is always
+/// declared-only by the time codegen runs.
+bool isC2GoUnmanagedExternImport(const FunctionDecl *FD);
 
 /// WF2 (#319 C4a): emit the `c2go.struct.<RecName>.meta` named MD describing
 /// a c2go_struct/c2go_managed record so c2go-lto can rebuild the manifest

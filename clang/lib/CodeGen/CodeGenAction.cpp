@@ -488,29 +488,40 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
 
   for (const Decl *D : Ctx.getTranslationUnitDecl()->decls()) {
     if (const auto *FD = dyn_cast<FunctionDecl>(D)) {
-      // Only emit user's c2go_extern symbols. c2go_linkname decls
-      // (e.g. <stdlib.h>'s cmalloc/atoi/...) bind to symbols that
-      // live in c2go-libc; the Go side does not need redeclarations.
-      if (!FD->hasAttr<C2GoExternAttr>())
+      const FunctionDecl *DefFD = nullptr;
+      bool HasBody = FD->hasBody(DefFD);
+      // Two symbol classes reach the manifest (docs/c2go_design.md §2.0.3):
+      //   * EXPORT — a c2go_extern function DEFINITION (the attr may be
+      //     inherited from a forward declaration). It emits a Plan 9 .s ABI0
+      //     entry that c2gobind turns into a Go export stub. A declared-only
+      //     c2go_extern is a pure ABI0 *marker* with no metadata and is
+      //     intentionally NOT emitted here.
+      //   * IMPORT — an `unmanaged extern` external C symbol (libsystem_kernel
+      //     `read`, libcurl `curl_easy_init`, ...) the c2go world calls
+      //     through the host-ABI bridge. The call-site IR uses GoABI0 because
+      //     c2gobind emits an ABI0-entry dispatch wrapper that walks the frame,
+      //     packs args and dispatches through `c2go-libc/external` (purego
+      //     SyscallN + dlsym).
+      // c2go_linkname decls (e.g. <stdlib.h>'s cmalloc/atoi/...) bind to
+      // symbols in c2go-libc and are excluded from both classes.
+      const bool IsExport = FD->hasAttr<C2GoExternAttr>() && HasBody;
+      const bool IsImport = clang::c2go::isC2GoUnmanagedExternImport(FD);
+      if (!IsExport && !IsImport)
         continue;
+      // Every user-declared import earns a manifest entry so c2gobind can bind
+      // it for the Go side (which may call it even when the C TU does not). The
+      // *.s dispatch wrapper*, by contrast, is synthesized only for imports
+      // actually referenced in C (EmitC2GoUnmanagedExternWrappers' use_empty
+      // gate); `wrapper_in_asm` below records which path applies, so a
+      // C-unreferenced import simply falls back to c2gobind's Go-side
+      // dispatcher rather than bloating the .s.
       const Decl *Canonical = FD->getCanonicalDecl();
       if (!Emitted.insert(Canonical).second)
         continue;
-      // c2go §E1: a c2go_extern function declaration with no body in
-      // any TU declaration chain means "this symbol is implemented by
-      // an external system library (e.g. libsystem_kernel `read`,
-      // libcurl `curl_easy_init`)". The call-site IR still uses GoABI0
-      // because c2gobind generates an ABI0-entry Go wrapper that walks
-      // its frame, packs args into `uintptr` and dispatches through
-      // `c2go-libc/external` (purego SyscallN + dlsym). Mark with a
-      // distinct `kind` so c2gobind picks the wrapper-emit path
-      // instead of treating the symbol as a Plan 9 .s export.
-      const FunctionDecl *DefFD = nullptr;
-      bool HasBody = FD->hasBody(DefFD);
       llvm::json::Object Sym;
       std::string CName = FD->getNameAsString();
       Sym["name"] = CName;
-      Sym["kind"] = HasBody ? "func" : "unmanaged_extern";
+      Sym["kind"] = IsImport ? "unmanaged_extern" : "func";
       Sym["go_sig"] = c2goBuildGoSig(FD, Ctx);
       // c2go (#269): the generated Go function name, casing controlled
       // by c2go_extern's optional int (1=exported/upper-first default,
@@ -528,7 +539,12 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
       // capitalized form for `init`/`main` happens to be `Init`/`Main`.
       StringRef RenamedSym = c2goInitMainRenamedSymbol(CName);
       {
-        int Export = FD->getAttr<C2GoExternAttr>()->getExportCase();
+        // Exports carry c2go_extern (and its export-case knob). Imports
+        // (`unmanaged extern`) have no c2go_extern attr, so default to the
+        // upper-first export case (1) — c2gobind names the dispatch wrapper
+        // the same capitalized way.
+        const auto *EA = FD->getAttr<C2GoExternAttr>();
+        int Export = EA ? EA->getExportCase() : 1;
         std::string GoName = c2goExportGoName(CName, Export);
         Sym["go_name"] = GoName;
         // The on-symbol name to link against: the renamed bare symbol for
@@ -608,7 +624,7 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
       // generates a real (float / struct-aware) dispatch wrapper instead of a
       // panic stub. Falls back silently (legacy has_float/has_aggregate stay)
       // for not-yet-wired ABI forms or when no CodeGenModule is available.
-      if (CGM && !HasBody) {
+      if (CGM && IsImport) {
         if (auto Abi = c2goBuildAbiDesc(*CGM, FD))
           Sym["cabi"] = std::move(*Abi);
         // By-value struct params/returns of an unmanaged_extern need their Go

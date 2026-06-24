@@ -3328,6 +3328,15 @@ void Sema::mergeDeclAttributes(NamedDecl *New, Decl *Old,
           << NewA << OldA << /*HasAttributeKeyword (=> " attributes")=*/0;
       Diag(OldA->getLocation(), diag::note_conflicting_attribute);
     }
+    // Note: the "reverse not allowed" direction for c2go_extern (a non-extern
+    // declaration followed by a c2go_extern (re)declaration / definition) is
+    // already a hard error via clang's calling-convention compatibility check
+    // — c2go_extern is a CC type attribute (CC_GoABI0), so adding it on a
+    // redeclaration trips err_function_redeclared_with_different_cc. No bespoke
+    // c2go diagnostic is needed here. The dual rule for c2go_unmanaged — an
+    // import (c2go_unmanaged function) must not be DEFINED — is enforced at the
+    // definition site in ActOnStartOfFunctionDef
+    // (err_c2go_define_unmanaged_extern).
   }
 
   // This redeclaration adds a section attribute.
@@ -16321,6 +16330,19 @@ Decl *Sema::ActOnStartOfFunctionDef(Scope *FnBodyScope, Decl *D,
       Diag(FD->getLocation(), diag::err_builtin_definition) << FD;
       FD->setInvalidDecl();
     }
+  }
+
+  // c2go: a function marked c2go_unmanaged (spelled `unmanaged extern`) names
+  // an external imported symbol dispatched through the host-ABI bridge; it has
+  // no in-c2go definition. The func-level managed/unmanaged "world" marking was
+  // removed (#268) — c2go_unmanaged on a function means import, not an
+  // unmanaged-return local function — so defining one is a contradiction.
+  // c2go_extern (export) and c2go_linkname (its own bridge) are not imports and
+  // may be defined.
+  if (getLangOpts().C2GoMode && FD->hasAttr<C2GoUnmanagedAttr>() &&
+      !FD->hasAttr<C2GoExternAttr>() && !FD->hasAttr<C2GoLinknameAttr>()) {
+    Diag(FD->getLocation(), diag::err_c2go_define_unmanaged_extern) << FD;
+    FD->setInvalidDecl();
   }
 
   // The return type of a function definition must be complete (C99 6.9.1p3).
