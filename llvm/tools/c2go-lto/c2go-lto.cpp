@@ -124,7 +124,7 @@ static cl::list<std::string> InputFiles(cl::Positional, cl::OneOrMore,
 // bitcode's c2go.* module flags and per-function "c2go-..." string attrs.
 // Minimal v0 reads: pkgpath, target_go_version, and for every function with
 // the "c2go-boundary" attr: name (c-name), kind (boundary vs unmanaged_extern
-// boundary, decided from c2go-unmanaged-return / linkage), go_sig.
+// boundary, decided from c2go-unmanaged-world / linkage), go_sig.
 static cl::opt<std::string>
     EmitManifest("c2go-emit-manifest",
                  cl::desc("Rebuild a c2go manifest JSON from combined bitcode "

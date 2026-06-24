@@ -338,10 +338,10 @@ rebuildManifestFromIR(Module &Composite, bool Build,
       // Kind: declare-only c2go_extern is "unmanaged_extern" (raw_read,
       // c2go_linkname stubs, etc.); defined boundary is "func".
       Sym["kind"] = F->isDeclaration() ? "unmanaged_extern" : "func";
-      // Managed world: default true. A function annotated c2go_unmanaged
-      // flips the return world bit (raw_read in cov.c). buildC2GoManifest
-      // applies the same rule.
-      Sym["managed"] = !F->hasFnAttribute("c2go-unmanaged-return");
+      // Managed world: default true. A c2go_unmanaged function (an import) is
+      // unmanaged-world, so c2go-unmanaged-world clears the bit.
+      // buildC2GoManifest applies the same rule.
+      Sym["managed"] = !F->hasFnAttribute("c2go-unmanaged-world");
       Sym["abi"] = "abi0";
       // ExportCase: presence-checked first so missing attr (very old bc)
       // defaults to Export==1 (the WF1 default), preserving prior fallback

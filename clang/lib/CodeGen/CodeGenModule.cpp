@@ -3008,12 +3008,11 @@ void CodeGenModule::SetLLVMFunctionAttributes(GlobalDecl GD,
       // c2go_unmanaged on a function marks it unmanaged-world — i.e. an external
       // import; the func-level return-world marking was removed (#268), and a
       // DEFINED c2go_unmanaged function is rejected by Sema, so this only fires
-      // for imports. (The attr name is historical; it feeds the manifest
-      // `managed` bit, not a per-return decision.) param-worlds is a packed
-      // "p<i>=u" CSV; absent attr means "all managed", matching
-      // computeC2GoArgPtrMask's default.
+      // for imports. The attr feeds the manifest `managed` bit (managed =
+      // !c2go-unmanaged-world). param-worlds is a packed "p<i>=u" CSV; absent
+      // attr means "all managed", matching computeC2GoArgPtrMask's default.
       if (FD->hasAttr<C2GoUnmanagedAttr>())
-        F->addFnAttr("c2go-unmanaged-return");
+        F->addFnAttr("c2go-unmanaged-world");
       if (const auto *LN = FD->getAttr<C2GoLinknameAttr>()) {
         F->addFnAttr("c2go-linkname", LN->getName());
         // #304: teach native LLVM DSE/GVN that c2go_libc.GCMalloc returns
