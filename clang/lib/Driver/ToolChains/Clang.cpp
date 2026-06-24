@@ -6767,8 +6767,25 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
   // cc1 and claim them to suppress "argument unused" warnings.
   Args.AddLastArg(CmdArgs, options::OPT_fc2go);
   Args.AddLastArg(CmdArgs, options::OPT_fc2go_package_EQ);
-  Args.AddLastArg(CmdArgs, options::OPT_fc2go_emit_manifest_EQ);
-  Args.AddLastArg(CmdArgs, options::OPT_fc2go_emit_plan9_asm_EQ);
+  // When this cc1 emits bitcode for the c2go-lto routing (a -fc2go compile that
+  // requested the .s/manifest outputs), it must NOT also write those files: the
+  // driver's c2go-lto job produces them from the linked bitcode. The manifest
+  // still rides in the bitcode (CodeGenAction embeds it whenever -fc2go is on),
+  // so only the file-writing emit flags are withheld here; they are claimed so
+  // no "unused argument" warning fires. A standalone `clang -cc1 -emit-llvm-bc
+  // -fc2go-emit-manifest=` (e.g. a LIT reference) bypasses this driver path and
+  // still writes its file.
+  const bool C2GoLtoRoutedBC =
+      JA.getType() == types::TY_LLVM_BC && Args.hasArg(options::OPT_fc2go) &&
+      (Args.hasArg(options::OPT_fc2go_emit_manifest_EQ) ||
+       Args.hasArg(options::OPT_fc2go_emit_plan9_asm_EQ));
+  if (C2GoLtoRoutedBC) {
+    Args.ClaimAllArgs(options::OPT_fc2go_emit_manifest_EQ);
+    Args.ClaimAllArgs(options::OPT_fc2go_emit_plan9_asm_EQ);
+  } else {
+    Args.AddLastArg(CmdArgs, options::OPT_fc2go_emit_manifest_EQ);
+    Args.AddLastArg(CmdArgs, options::OPT_fc2go_emit_plan9_asm_EQ);
+  }
   Args.AddLastArg(CmdArgs, options::OPT_fc2go_target_go_version_EQ);
 
   const XRayArgs &XRay = TC.getXRayArgs(Args);
