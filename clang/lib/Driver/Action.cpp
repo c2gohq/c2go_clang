@@ -33,6 +33,7 @@ const char *Action::getClassName(ActionClass AC) {
   case BackendJobClass: return "backend";
   case AssembleJobClass: return "assembler";
   case IfsMergeJobClass: return "interface-stub-merger";
+  case C2GoLtoJobClass: return "c2go-lto";
   case LinkJobClass: return "linker";
   case LipoJobClass: return "lipo";
   case DsymutilJobClass: return "dsymutil";
@@ -396,6 +397,11 @@ void IfsMergeJobAction::anchor() {}
 
 IfsMergeJobAction::IfsMergeJobAction(ActionList &Inputs, types::ID Type)
     : JobAction(IfsMergeJobClass, Inputs, Type) {}
+
+void C2GoLtoJobAction::anchor() {}
+
+C2GoLtoJobAction::C2GoLtoJobAction(ActionList &Inputs, types::ID Type)
+    : JobAction(C2GoLtoJobClass, Inputs, Type) {}
 
 void LinkJobAction::anchor() {}
 

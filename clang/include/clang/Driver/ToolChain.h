@@ -163,6 +163,7 @@ private:
   mutable std::unique_ptr<Tool> Link;
   mutable std::unique_ptr<Tool> StaticLibTool;
   mutable std::unique_ptr<Tool> IfsMerge;
+  mutable std::unique_ptr<Tool> C2GoLto;
   mutable std::unique_ptr<Tool> OffloadBundler;
   mutable std::unique_ptr<Tool> OffloadPackager;
   mutable std::unique_ptr<Tool> LinkerWrapper;
@@ -173,6 +174,7 @@ private:
   Tool *getLink() const;
   Tool *getStaticLibTool() const;
   Tool *getIfsMerge() const;
+  Tool *getC2GoLto() const;
   Tool *getClangAs() const;
   Tool *getOffloadBundler() const;
   Tool *getOffloadPackager() const;

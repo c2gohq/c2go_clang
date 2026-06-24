@@ -4379,6 +4379,20 @@ void Driver::BuildActions(Compilation &C, DerivedArgList &Args,
   ExtractAPIJobAction *ExtractAPIAction = nullptr;
   ActionList LinkerInputs;
   ActionList MergerInputs;
+  ActionList C2GoLtoInputs;
+
+  // c2go: a `-fc2go` compile that requests the Plan 9 .s / manifest outputs is
+  // routed internally through c2go-lto (the WF2 bitcode linker) — the SINGLE
+  // internal code path. Each TU is compiled to bitcode (carrying its embedded
+  // manifest) and c2go-lto links them, emitting the .s + manifest (one set, even
+  // for several inputs). This holds for a single TU too: the emitted .s/manifest
+  // are byte-identical to the old cc1-direct emit (same bitcode, same codegen),
+  // so single-file just joins the same path rather than keeping a parallel one.
+  // A `-fc2go` compile WITHOUT the emit flags keeps the ordinary object pipeline.
+  const bool C2GoLtoMode =
+      Args.hasArg(options::OPT_fc2go) &&
+      (Args.hasArg(options::OPT_fc2go_emit_plan9_asm_EQ) ||
+       Args.hasArg(options::OPT_fc2go_emit_manifest_EQ));
 
   for (auto &I : Inputs) {
     types::ID InputType = I.first;
@@ -4434,6 +4448,17 @@ void Driver::BuildActions(Compilation &C, DerivedArgList &Args,
       if (Phase == phases::IfsMerge) {
         assert(Phase == PL.back() && "merging must be final compilation step.");
         MergerInputs.push_back(Current);
+        Current = nullptr;
+        break;
+      }
+
+      // c2go: stop each TU at bitcode (running the full per-TU middle-end,
+      // including the -O2 c2go OptimizerLast passes that embed the manifest) and
+      // queue it; c2go-lto links the set below (one TU or several). Mirrors the
+      // -flto bitcode emit, but the "linker" is c2go-lto.
+      if (C2GoLtoMode && Phase == phases::Backend) {
+        Current = C.MakeAction<BackendJobAction>(Current, types::TY_LLVM_BC);
+        C2GoLtoInputs.push_back(Current);
         Current = nullptr;
         break;
       }
@@ -4526,6 +4551,13 @@ void Driver::BuildActions(Compilation &C, DerivedArgList &Args,
   if (!MergerInputs.empty())
     Actions.push_back(
         C.MakeAction<IfsMergeJobAction>(MergerInputs, types::TY_Image));
+
+  // c2go: combine the per-TU bitcodes into one merged Plan 9 .s + manifest via
+  // c2go-lto. TY_Nothing — the real outputs are the -fc2go-emit-* paths the tool
+  // writes itself, so there is no driver-managed -o product to name.
+  if (!C2GoLtoInputs.empty())
+    Actions.push_back(
+        C.MakeAction<C2GoLtoJobAction>(C2GoLtoInputs, types::TY_Nothing));
 
   if (Args.hasArg(options::OPT_emit_interface_stubs)) {
     auto PhaseList = types::getCompilationPhases(

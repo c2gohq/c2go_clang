@@ -77,9 +77,10 @@ public:
     BinaryAnalyzeJobClass,
     BinaryTranslatorJobClass,
     ObjcopyJobClass,
+    C2GoLtoJobClass,
 
     JobClassFirst = PreprocessJobClass,
-    JobClassLast = ObjcopyJobClass
+    JobClassLast = C2GoLtoJobClass
   };
 
   // The offloading kind determines if this action is binded to a particular
@@ -502,6 +503,20 @@ public:
 
   static bool classof(const Action *A) {
     return A->getKind() == IfsMergeJobClass;
+  }
+};
+
+// c2go: combine the per-TU bitcodes of a multi-file `-fc2go` compile by running
+// c2go-lto (the internal WF2 bitcode linker), which emits one merged Plan 9 .s +
+// GC manifest. Mirrors IfsMergeJobAction (a combine-via-tool final step).
+class C2GoLtoJobAction : public JobAction {
+  void anchor() override;
+
+public:
+  C2GoLtoJobAction(ActionList &Inputs, types::ID Type);
+
+  static bool classof(const Action *A) {
+    return A->getKind() == C2GoLtoJobClass;
   }
 };
 

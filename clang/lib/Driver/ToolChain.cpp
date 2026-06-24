@@ -10,6 +10,7 @@
 #include "ToolChains/Arch/AArch64.h"
 #include "ToolChains/Arch/ARM.h"
 #include "ToolChains/Arch/RISCV.h"
+#include "ToolChains/C2Go.h"
 #include "ToolChains/Clang.h"
 #include "ToolChains/Flang.h"
 #include "ToolChains/InterfaceStubs.h"
@@ -614,6 +615,12 @@ Tool *ToolChain::getIfsMerge() const {
   return IfsMerge.get();
 }
 
+Tool *ToolChain::getC2GoLto() const {
+  if (!C2GoLto)
+    C2GoLto.reset(new tools::c2go::Linker(*this));
+  return C2GoLto.get();
+}
+
 Tool *ToolChain::getOffloadBundler() const {
   if (!OffloadBundler)
     OffloadBundler.reset(new tools::OffloadBundler(*this));
@@ -639,6 +646,9 @@ Tool *ToolChain::getTool(Action::ActionClass AC) const {
 
   case Action::IfsMergeJobClass:
     return getIfsMerge();
+
+  case Action::C2GoLtoJobClass:
+    return getC2GoLto();
 
   case Action::LinkJobClass:
     return getLink();
