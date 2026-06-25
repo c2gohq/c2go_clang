@@ -3,7 +3,7 @@
 ; period is then independent of TTI noise and stays tight enough to preserve a
 ; ~10 ms cooperative pause.
 ;
-; RUN: opt < %s -passes=c2go-loop-poll -c2go-loop-poll=1 -S | FileCheck %s
+; RUN: opt < %s -passes=c2go-loop-poll -c2go-loop-poll=1 -c2go-loop-poll-target-ns=10000000 -S | FileCheck %s
 
 target triple = "aarch64-unknown-linux-gnu"
 

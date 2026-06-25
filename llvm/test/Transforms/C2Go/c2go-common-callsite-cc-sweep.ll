@@ -14,7 +14,7 @@
 ; RUN: opt < %s -passes=c2go-write-barriers -S 2>%t.wb.err | FileCheck %s --check-prefix=WB
 ; RUN: FileCheck %s --check-prefix=WB-WARN < %t.wb.err
 ;
-; RUN: opt < %s -passes=c2go-loop-poll -c2go-loop-poll=1 -S 2>%t.lp.err | FileCheck %s --check-prefix=LP
+; RUN: opt < %s -passes=c2go-loop-poll -c2go-loop-poll=1 -c2go-loop-poll-target-ns=10000000 -S 2>%t.lp.err | FileCheck %s --check-prefix=LP
 ; RUN: FileCheck %s --check-prefix=LP-WARN < %t.lp.err
 
 target triple = "aarch64-unknown-linux-gnu"

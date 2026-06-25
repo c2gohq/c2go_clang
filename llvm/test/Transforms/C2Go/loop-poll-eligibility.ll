@@ -4,7 +4,7 @@
 ;   - c2go-boundary function                      -> not touched
 ;   - loop body already has a real call           -> not touched
 ;
-; RUN: opt < %s -passes=c2go-loop-poll -c2go-loop-poll=1 -S | FileCheck %s
+; RUN: opt < %s -passes=c2go-loop-poll -c2go-loop-poll=1 -c2go-loop-poll-target-ns=10000000 -S | FileCheck %s
 
 target triple = "aarch64-unknown-linux-gnu"
 

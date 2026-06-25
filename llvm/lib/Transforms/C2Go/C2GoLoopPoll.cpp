@@ -65,11 +65,13 @@ static cl::opt<bool>
                               "(BL c2go-libc.Gosched every M iterations). "
                               "Set to 0 to disable."));
 
-// Target wall-clock period between polls, in nanoseconds. Default 10 ms,
-// matching Go's forcePreemptNS sysmon tick.
+// Target wall-clock period between polls, in nanoseconds. 0 = DISABLED (the
+// default: cooperative loop-poll preemption is opt-in). Set to N to enable —
+// Go's sysmon forcePreemptNS tick is 10 ms (10000000).
 static cl::opt<unsigned> ClTargetNs(
-    "c2go-loop-poll-target-ns", cl::init(10000000), cl::Hidden,
-    cl::desc("Target nanoseconds between c2go cooperative loop polls"));
+    "c2go-loop-poll-target-ns", cl::init(0), cl::Hidden,
+    cl::desc("Target nanoseconds between c2go cooperative loop polls "
+             "(0 = disable the pass)"));
 
 // Approximate cycles per nanosecond assuming a ~3 GHz core. TTI returns cost
 // in abstract cycles; multiplying by NS_PER_CYCLE recovers a rough wall-clock
@@ -257,7 +259,9 @@ static bool shouldProcess(Function &F) {
 }
 
 PreservedAnalyses C2GoLoopPollPass::run(Module &M, ModuleAnalysisManager &AM) {
-  if (!ClEnableLoopPoll)
+  // ClTargetNs == 0 disables the pass (the default — cooperative preemption is
+  // opt-in); ClEnableLoopPoll is the legacy on/off knob.
+  if (!ClEnableLoopPoll || ClTargetNs == 0)
     return PreservedAnalyses::all();
   if (!M.getModuleFlag(llvm::c2go::kGoabiModuleFlag))
     return PreservedAnalyses::all();

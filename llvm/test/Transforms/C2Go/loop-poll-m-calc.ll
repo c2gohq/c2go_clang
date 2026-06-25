@@ -1,7 +1,7 @@
 ; For a light body and a known-large trip count, the poll period M hits the
 ; upper clamp (1 << 16 = 65536), so the modulo lowers to `and i64 %cnt, 65535`.
 ;
-; RUN: opt < %s -passes=c2go-loop-poll -c2go-loop-poll=1 -S | FileCheck %s
+; RUN: opt < %s -passes=c2go-loop-poll -c2go-loop-poll=1 -c2go-loop-poll-target-ns=10000000 -S | FileCheck %s
 
 target triple = "aarch64-unknown-linux-gnu"
 
