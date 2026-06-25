@@ -2312,7 +2312,7 @@ void PragmaC2GoHandler::HandlePragma(Preprocessor &PP,
     PP.LexUnexpandedToken(Tok);
     if (Tok.isNot(tok::numeric_constant)) {
       PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_integer)
-          << "flags" << "c2go";
+          << 0 << 7 << "c2go";
       return;
     }
     SmallString<16> IntBuf;
@@ -2320,7 +2320,7 @@ void PragmaC2GoHandler::HandlePragma(Preprocessor &PP,
     StringRef Spelling = PP.getSpelling(Tok, IntBuf, &Invalid);
     if (Invalid || Spelling.getAsInteger(0, Flags)) {
       PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_integer)
-          << "flags" << "c2go";
+          << 0 << 7 << "c2go";
       return;
     }
     PP.LexUnexpandedToken(Tok);
