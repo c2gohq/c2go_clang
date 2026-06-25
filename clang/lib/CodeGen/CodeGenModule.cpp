@@ -104,15 +104,6 @@ static llvm::cl::opt<bool> C2GoExternWrappers(
     "c2go-extern-wrappers", llvm::cl::Hidden, llvm::cl::init(true),
     llvm::cl::desc("c2go: synthesize unmanaged_extern dispatch wrappers in .s"));
 
-// c2go §E: the unmanaged_extern dispatch differs by target OS, but the Plan 9
-// machine codegen stays on the neutral goabi triple (the windows triple drops
-// the GoABI0 CC). So the wrapper's TARGET OS is passed here, separately from
-// the codegen triple: "unix" -> runtime·cgocall + purego syscallX block;
-// "windows" -> a positional arg list + syscall.SyscallN (via external.SyscallN).
-static llvm::cl::opt<std::string> C2GoExternOS(
-    "c2go-extern-os", llvm::cl::Hidden, llvm::cl::init("unix"),
-    llvm::cl::desc("c2go: target OS for unmanaged_extern wrappers (unix|windows)"));
-
 static const char AnnotationSection[] = "llvm.metadata";
 static constexpr auto ErrnoTBAAMDName = "llvm.errno.tbaa";
 
@@ -5000,13 +4991,10 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
 // destFn GoABI0 frame. Scalar/float/pointer signatures only; struct-by-value /
 // sret targets get no converter (link-fails = fail-closed) pending a follow-up.
 bool CodeGenModule::isC2GoExternWindows() const {
-  // The extern-dispatch OS follows the target triple's OS by default (windows ->
-  // syscall.SyscallN; otherwise -> runtime.cgocall). The -c2go-extern-os flag is
-  // only an explicit override (e.g. forcing the windows path from a neutral host
-  // triple). The manifest records goos/goarch (CodeGenAction), so c2go-bind
-  // derives the same dispatch from the outputs — no matching flag is required.
-  if (C2GoExternOS.getNumOccurrences())
-    return C2GoExternOS == "windows";
+  // The extern-dispatch OS follows the target triple's OS (windows ->
+  // syscall.SyscallN; otherwise -> runtime.cgocall). The manifest records
+  // goos/goarch (CodeGenAction), so c2go-bind derives the same dispatch from
+  // the outputs.
   return getTriple().isOSWindows();
 }
 

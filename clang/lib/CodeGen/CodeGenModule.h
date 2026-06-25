@@ -1775,7 +1775,7 @@ public:
   /// lands on the stack). \p D may be null (an indirect call).
   bool useC2GoGoABI0CallingConv(const Decl *D) const;
 
-  /// c2go #541: true when generating windows extern glue (-c2go-extern-os=
+  /// c2go #541: true when generating windows extern glue (target triple OS is
   /// windows). A windows c2go_callback target resolves to a syscall.NewCallback
   /// var (load), not a .s cdecl trampoline (function address).
   bool isC2GoExternWindows() const;
