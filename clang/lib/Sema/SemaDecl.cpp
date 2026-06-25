@@ -6756,14 +6756,6 @@ NamedDecl *Sema::HandleDeclarator(Scope *S, Declarator &D,
   // region's default pointer world (Ptr bit → managed, else unmanaged) onto
   // unannotated pointer-shaped *parameter* and *variable* declarations.
   // Explicit per-decl annotation still wins.
-  //
-  // NOTE: we do NOT stamp the FunctionDecl itself for its return type. The
-  // "c2go_unmanaged on a function == unmanaged return" semantics is
-  // deprecated; the FunctionDecl-level attr denotes the *function* world
-  // (e.g. the manifest "managed" flag, CodeGenAction). Stamping it from the
-  // return type would mis-mark an internal function that merely returns an
-  // unmanaged pointer. (The function world is decided by #290's default CC +
-  // c2go_extern/c2go_managed attributes; the pragma's func bit is inert, #268.)
   if (getLangOpts().C2GoMode && !C2GoStack.empty()) {
     const auto &Top = C2GoStack.back();
     auto stampPtrWorld = [&](Decl *D, QualType QT) {
@@ -6781,6 +6773,33 @@ NamedDecl *Sema::HandleDeclarator(Scope *S, Declarator &D,
         stampPtrWorld(PVD, PVD->getType());
     } else if (auto *VD = dyn_cast<VarDecl>(New)) {
       stampPtrWorld(VD, VD->getType());
+    }
+  }
+
+  // c2go (model B, docs/c2go_design.md "v15 转折点"): the DEFAULT world for a
+  // function is UNMANAGED. A function DECLARATION with no explicit c2go world
+  // attr (and not c2go_extern / c2go_linkname) is an `unmanaged extern` import
+  // by default; the `#pragma c2go managed(N)` func bit (1) opts declared-only
+  // functions in scope INTO the internal c2go world. We stamp an *implicit*
+  // C2GoUnmanagedAttr so the existing import machinery
+  // (isC2GoUnmanagedExternImport, manifest, the .s dispatch wrapper, boundary
+  // CC) picks it up. A DEFINITION is always internal — isC2GoUnmanagedExternImport
+  // checks isDefined(), so a forward decl that is later defined safely becomes
+  // internal; the inherited implicit attr is benign (the define-import error is
+  // guarded on !isImplicit()). Builtins / compiler-synthesized decls are left
+  // alone.
+  if (getLangOpts().C2GoMode) {
+    if (auto *FD = dyn_cast<FunctionDecl>(New)) {
+      const bool InFuncBitRegion =
+          !C2GoStack.empty() && C2GoStack.back().funcManaged();
+      if (!FD->isThisDeclarationADefinition() && !InFuncBitRegion &&
+          !FD->isImplicit() && FD->getBuiltinID() == 0 &&
+          !FD->hasAttr<C2GoManagedAttr>() && !FD->hasAttr<C2GoUnmanagedAttr>() &&
+          !FD->hasAttr<C2GoExternAttr>() && !FD->hasAttr<C2GoLinknameAttr>()) {
+        SourceLocation L =
+            C2GoStack.empty() ? FD->getLocation() : C2GoStack.back().Loc;
+        FD->addAttr(C2GoUnmanagedAttr::CreateImplicit(Context, L));
+      }
     }
   }
 
@@ -16332,17 +16351,21 @@ Decl *Sema::ActOnStartOfFunctionDef(Scope *FnBodyScope, Decl *D,
     }
   }
 
-  // c2go: a function marked c2go_unmanaged (spelled `unmanaged extern`) names
-  // an external imported symbol dispatched through the host-ABI bridge; it has
-  // no in-c2go definition. The func-level managed/unmanaged "world" marking was
-  // removed (#268) — c2go_unmanaged on a function means import, not an
-  // unmanaged-return local function — so defining one is a contradiction.
-  // c2go_extern (export) and c2go_linkname (its own bridge) are not imports and
-  // may be defined.
-  if (getLangOpts().C2GoMode && FD->hasAttr<C2GoUnmanagedAttr>() &&
-      !FD->hasAttr<C2GoExternAttr>() && !FD->hasAttr<C2GoLinknameAttr>()) {
-    Diag(FD->getLocation(), diag::err_c2go_define_unmanaged_extern) << FD;
-    FD->setInvalidDecl();
+  // c2go: an EXPLICIT `c2go_unmanaged` / `unmanaged extern` on a function names
+  // an external imported symbol (host-ABI bridge) with no in-c2go definition, so
+  // defining one is a contradiction. Only the *explicit* marking is an error:
+  // the default unmanaged world (model B) is applied as an *implicit*
+  // C2GoUnmanagedAttr on declarations, and a declared-only function that is then
+  // defined is simply internal (defined ⇒ internal) — no error. c2go_extern
+  // (export) and c2go_linkname (its own bridge) are not imports and may be
+  // defined.
+  if (getLangOpts().C2GoMode) {
+    const auto *UA = FD->getAttr<C2GoUnmanagedAttr>();
+    if (UA && !UA->isImplicit() && !FD->hasAttr<C2GoExternAttr>() &&
+        !FD->hasAttr<C2GoLinknameAttr>()) {
+      Diag(FD->getLocation(), diag::err_c2go_define_unmanaged_extern) << FD;
+      FD->setInvalidDecl();
+    }
   }
 
   // The return type of a function definition must be complete (C99 6.9.1p3).

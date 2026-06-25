@@ -2092,14 +2092,16 @@ public:
   /// controls which worlds default to managed inside the region.
   struct C2GoPragmaEntry {
     SourceLocation Loc;
-    unsigned Flags; // bitmask: Ptr=2, Record=4
-    // NOTE (#268): the func bit (value 1) is DEPRECATED/INERT. The function
-    // world is now decided entirely by #290 (default CC_C2GoInternal +
-    // c2go_extern/c2go_managed CC attributes), so funcManaged() had zero
-    // consumers and was removed. `managed(1)` still parses (Flags=1) but,
-    // with neither Ptr (2) nor Record (4) set, it is a no-op region — exactly
-    // its prior runtime behavior. Do not reuse value 1 for a new bit.
-    enum : unsigned { Ptr = 2, Record = 4 };
+    unsigned Flags; // bitmask: Func=1, Ptr=2, Record=4
+    // c2go (model B / docs/c2go_design.md "v15 转折点"): the DEFAULT function
+    // world is unmanaged — a declared-only function is an `unmanaged extern`
+    // import. The func bit (1) opts declared-only functions in scope INTO the
+    // internal c2go world. (#268 had deprecated this bit on the wrong premise —
+    // it conflated the decl-world axis with the type-CC axis #290; reverted.)
+    enum : unsigned { Func = 1, Ptr = 2, Record = 4 };
+    /// func bit: unannotated declared-only functions in scope default to the
+    /// internal c2go world; otherwise they are unmanaged-extern imports.
+    bool funcManaged() const { return Flags & Func; }
     /// ptr bit: unannotated pointers in scope (incl. struct fields) default
     /// to managed; otherwise unmanaged.
     bool ptrManaged() const { return Flags & Ptr; }

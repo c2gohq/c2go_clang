@@ -508,13 +508,25 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
       const bool IsImport = clang::c2go::isC2GoUnmanagedExternImport(FD);
       if (!IsExport && !IsImport)
         continue;
-      // Every user-declared import earns a manifest entry so c2gobind can bind
-      // it for the Go side (which may call it even when the C TU does not). The
-      // *.s dispatch wrapper*, by contrast, is synthesized only for imports
-      // actually referenced in C (EmitC2GoUnmanagedExternWrappers' use_empty
-      // gate); `wrapper_in_asm` below records which path applies, so a
-      // C-unreferenced import simply falls back to c2gobind's Go-side
-      // dispatcher rather than bloating the .s.
+      // An import earns a manifest entry when it is EXPLICIT (`unmanaged extern`
+      // — the user declared an import to bind for Go, which may call it even
+      // when this C TU does not) OR when it is actually referenced in C. Under
+      // model B every plain declared-only function is an implicit-default import;
+      // without this gate a header full of prototypes would bloat the manifest
+      // with imports the program never uses. The *.s dispatch wrapper* stays
+      // gated on use_empty (EmitC2GoUnmanagedExternWrappers); `wrapper_in_asm`
+      // below records which path applies, so a C-unreferenced explicit import
+      // falls back to c2gobind's Go-side dispatcher rather than bloating the .s.
+      if (IsImport) {
+        const auto *UA = FD->getAttr<C2GoUnmanagedAttr>();
+        const bool Explicit = UA && !UA->isImplicit();
+        bool Referenced = false;
+        if (Mod)
+          if (llvm::Function *IF = Mod->getFunction(FD->getNameAsString()))
+            Referenced = !IF->use_empty();
+        if (!Explicit && !Referenced)
+          continue;
+      }
       const Decl *Canonical = FD->getCanonicalDecl();
       if (!Emitted.insert(Canonical).second)
         continue;
@@ -1251,10 +1263,13 @@ void BackendConsumer::HandleTranslationUnit(ASTContext &C) {
   // c2go: build the sidecar manifest JSON while the AST is still live
   // (ClearASTBeforeBackend wipes it below). Keep the object alive so
   // the Plan 9 emit pass at the end of HandleTranslationUnit can use
-  // it.
+  // it. Skip the whole manifest path when an error already occurred: the
+  // output is invalid anyway, and walking a half-formed AST (e.g. an
+  // error-invalidated function definition, like defining an `unmanaged extern`
+  // import) through the manifest builder can crash.
   llvm::json::Object C2GoManifest;
   bool C2GoManifestBuilt = false;
-  if (CI.getLangOpts().C2GoMode) {
+  if (CI.getLangOpts().C2GoMode && !Diags.hasErrorOccurred()) {
     // §B4 phase 2: pass the LLVM module so buildC2GoManifest can
     // scoop up the `@c2go.global.gcmask.<var>` bitmaps emitted by
     // CodeGenModule::emitC2GoGlobalGCMask into the manifest's
