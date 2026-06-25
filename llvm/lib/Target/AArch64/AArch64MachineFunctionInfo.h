@@ -260,8 +260,7 @@ class AArch64FunctionInfo final : public MachineFunctionInfo {
     std::optional<c2go::C2GoFrameInfo> FI;
 
     /// c2go #376: per-MF staged metadata aggregate written by the producer
-    /// (AArch64FrameLowering's c2go prologue and the stkobj collector in
-    /// AArch64AsmPrinter) and consumed by AArch64AsmPrinter::
+    /// (AArch64FrameLowering's c2go prologue) and consumed by AArch64AsmPrinter::
     /// emitFunctionEntryLabel — at which point we have a streamer pointer
     /// and can call MCPlan9AsmStreamer::publishC2GoFunction. Replaces the
     /// pre-#376 static side-channel that the producer published into

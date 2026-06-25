@@ -991,8 +991,8 @@ static void appendC2GoPtrSpillSlotOffsets(const MachineFunction &MF,
     // the function uses the X86 BASE POINTER (RBX) — dynamic stack realignment
     // PLUS dynamic allocas (X86FrameLowering::getFrameIndexReference →
     // getBaseRegister()). x86C2GoBitmapOffFromAnchor has no RBX case, and the
-    // existing explicit-gc-operand paths (c2goExpandDirectAllocaFields, the
-    // funcdata2 matcher) merely `continue` past such slots — i.e. the ENTIRE
+    // existing explicit-gc-operand path (c2goExpandDirectAllocaFields) merely
+    // `continue`s past such slots — i.e. the ENTIRE
     // X86 c2go locals bitmap silently under-marks base-pointer frames today.
     // For an M5-tracked live ptr slot, silently dropping it is a copystack
     // relocation miss (dangling pointer), so we abort loudly rather than
@@ -1025,109 +1025,6 @@ static void appendC2GoPtrSpillSlotOffsets(const MachineFunction &MF,
       AddSlot(KV.first);
     }
   }
-}
-
-namespace llvm {
-namespace c2go {
-// Defined in X86AsmPrinter.cpp; backs the `-x86-c2go-funcdata2` cl::opt
-// gate so this TU can decide whether to populate the AsmPrinter's stkobj
-// accumulator from Direct(SP, off) statepoint locations.
-bool isX86C2GoFuncData2Enabled();
-} // namespace c2go
-} // namespace llvm
-
-// c2go #298 Wave AC.2 — X86 mirror of AArch64 `c2goCollectStkObjEntry`
-// (AArch64AsmPrinter.cpp:2034-2128). Given a `Direct(SP, off)` statepoint
-// location's SP-relative offset `SpOff` and its owning alloca, build a
-// `StkObjEntry` describing the on-stack object for FUNCDATA $2.
-//
-// X86 amd64 deviations from the AArch64 version (mirror of frame
-// contract — X86C2GoFrameEmitter.cpp:186-192):
-//   * `SavedLinkSize = 0` on X86 (no software-spilled LR — the CALL-pushed
-//     return PC lives ABOVE the declared `$framesize`, not inside it).
-//     AArch64 anchors `varp = SP + funcspdelta - 8` because of its
-//     hardware LR slot at SP+0; on X86 `varp = SP + funcspdelta` (no -8
-//     bump).  The locals-region branch therefore uses `SpOff - FrameSize`
-//     instead of AArch64's `SpOff - (FrameSize - 8)`.
-//
-// Returns nullopt for: vararg-pack allocas (#327 mirror), unsized types,
-// non-struct allocas, struct types lacking a `c2go.gcbitmap.<RecName>`
-// symbol, and pure-data records (no pointer fields). Sound under-marking
-// is preserved for all skipped cases — the Approach B 摊平 path in
-// FUNCDATA $1 remains the safety net.
-static std::optional<llvm::StkObjEntry>
-c2goCollectStkObjEntryX86(const MachineFunction &MF, int64_t SpOff,
-                          const llvm::AllocaInst *AI) {
-  if (!AI)
-    return std::nullopt;
-  // #327 mirror: never include vararg-pack allocas.
-  if (AI->getMetadata(llvm::c2go::kVaPackMD))
-    return std::nullopt;
-
-  llvm::Type *Ty = AI->getAllocatedType();
-  if (!Ty || !Ty->isSized())
-    return std::nullopt;
-
-  const llvm::DataLayout &DL = MF.getDataLayout();
-  uint64_t SizeBytes = DL.getTypeAllocSize(Ty).getFixedValue();
-  if (SizeBytes == 0)
-    return std::nullopt;
-
-  // gcdata sym: only recognise structs whose CGC2GoTypeInfo already emitted
-  // `c2go.gcbitmap.<RecName>`. LLVM struct names look like `struct.<X>` or
-  // `union.<X>`; the bitmap is keyed by the *source* record name.
-  auto *ST = llvm::dyn_cast<llvm::StructType>(Ty);
-  if (!ST || !ST->hasName())
-    return std::nullopt;
-  llvm::StringRef LLVMName = ST->getName();
-  llvm::StringRef RecName = LLVMName;
-  if (RecName.consume_front("struct."))
-    ;
-  else if (RecName.consume_front("union."))
-    ;
-  std::string BitmapName = ("c2go.gcbitmap." + RecName).str();
-  const llvm::Module *M = MF.getFunction().getParent();
-  const llvm::GlobalVariable *GV =
-      M ? M->getNamedGlobal(BitmapName) : nullptr;
-  if (!GV)
-    return std::nullopt; // no bitmap emitted for this type — skip safely
-
-  // ptrBytes = pointer-containing prefix length, computed as
-  // 8 × (highest pointer-word index + 1). Reuses the existing field-offset
-  // walker (`c2goAppendPtrFieldOffsets` defined earlier in this TU).
-  llvm::SmallVector<int64_t, 8> Tmp;
-  llvm::DenseSet<int64_t> NoSkip;
-  c2goAppendPtrFieldOffsets(Ty, /*Base=*/0, DL, NoSkip, Tmp);
-  uint32_t PtrBytes = 0;
-  for (int64_t O : Tmp) {
-    uint64_t End = uint64_t(O) + 8;
-    if (End > PtrBytes)
-      PtrBytes = static_cast<uint32_t>(End);
-  }
-  // Pure-data records carry no GC interest — skip.
-  if (PtrBytes == 0)
-    return std::nullopt;
-
-  // X86 contract: SavedLinkSize=0 (no LR slot), so `varp = SP + funcspdelta`
-  // and `argp = SP + funcspdelta` coincide at the SP+funcspdelta boundary
-  // (callee args live above, locals below). FrameSize = MFI.getStackSize()
-  // = funcspdelta on the c2go Plan-9 surface (X86C2GoFrameEmitter publishes
-  // the rounded value via `MF.getFrameInfo().setStackSize(FrameSize)`).
-  //
-  // The two AArch64 branches collapse into one on X86 because the -8 LR
-  // bump that distinguished varp from argp on AArch64 is absent here:
-  //   locals (SpOff < FrameSize):  FrameOffset = SpOff - FrameSize  (< 0)
-  //   args   (SpOff ≥ FrameSize):  FrameOffset = SpOff - FrameSize  (≥ 0)
-  int64_t FrameSize =
-      static_cast<int64_t>(MF.getFrameInfo().getStackSize());
-  int32_t FrameOffset = static_cast<int32_t>(SpOff - FrameSize);
-
-  llvm::StkObjEntry E;
-  E.frameOffset = FrameOffset;
-  E.size = static_cast<uint32_t>(SizeBytes);
-  E.ptrBytes = PtrBytes;
-  E.gcdataSymName = std::move(BitmapName);
-  return E;
 }
 
 void X86AsmPrinter::LowerSTATEPOINT(const MachineInstr &MI,
@@ -1209,51 +1106,6 @@ void X86AsmPrinter::LowerSTATEPOINT(const MachineInstr &MI,
         SpOffsets.push_back(*BitOff);
       else if (Loc.Type == StackMaps::Location::Direct) {
         c2goExpandDirectAllocaFields(*MF, *BitOff, SpOffsets);
-        // c2go #298 Wave AC.2: ALSO collect a StkObjEntry candidate for
-        // FUNCDATA $2. Gated by `-x86-c2go-funcdata2`; OFF path retains
-        // Approach B 摊平 exactly (the call above still runs; the entry
-        // collection is a pure addition). Per-alloca dedup via
-        // `C2GoStkObjSeen` so multiple Direct locations on the same
-        // alloca contribute at most one entry. Mirror of
-        // AArch64AsmPrinter.cpp:2260-2287.
-        //
-        // c2go #489 (Wave AO.1): matcher converted to the locals-bitmap
-        // coordinate (same anchor-independent compare as
-        // c2goExpandDirectAllocaFields — the raw `FrameReg != X86::RSP`
-        // test never matched on framed/hasFP functions). NOTE the gated
-        // c2goCollectStkObjEntryX86 helper still carries the pre-rework
-        // "varp = argp = SP + funcspdelta" boundary comment; its locals
-        // branch (`SpOff - FrameSize`) stays correct in the new coordinate
-        // (varp = realSP + FrameSize), the args-boundary semantics are a
-        // gated-off follow-up (gate default OFF, no production effect).
-        if (llvm::c2go::isX86C2GoFuncData2Enabled()) {
-          const MachineFrameInfo &MFI = MF->getFrameInfo();
-          const TargetFrameLowering *TFL =
-              MF->getSubtarget().getFrameLowering();
-          for (int FI = MFI.getObjectIndexBegin(),
-                   FE = MFI.getObjectIndexEnd();
-               FI < FE; ++FI) {
-            if (MFI.isDeadObjectIndex(FI))
-              continue;
-            const AllocaInst *AI = MFI.getObjectAllocation(FI);
-            if (!AI)
-              continue;
-            Register FrameReg;
-            StackOffset SO = TFL->getFrameIndexReference(*MF, FI, FrameReg);
-            if (FrameReg != X86::RSP && FrameReg != X86::RBP)
-              continue;
-            std::optional<int64_t> RefBitOff = x86C2GoBitmapOffFromAnchor(
-                C2GoFrameSize, C2GoFrameUsesFP, FrameReg == X86::RSP,
-                SO.getFixed());
-            if (!RefBitOff || *RefBitOff != *BitOff)
-              continue;
-            if (!C2GoStkObjSeen.insert(AI))
-              break; // already accounted
-            if (auto E = c2goCollectStkObjEntryX86(*MF, *BitOff, AI))
-              C2GoStkObjEntries.push_back(std::move(*E));
-            break;
-          }
-        }
       }
     }
     // c2go GC Approach B (#330) M5 (X86 port, #298): OR-in derived/interior ptr

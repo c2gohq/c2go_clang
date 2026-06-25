@@ -14,7 +14,6 @@
 #include "llvm/CodeGen/AsmPrinter.h"
 #include "llvm/CodeGen/FaultMaps.h"
 #include "llvm/CodeGen/StackMaps.h"
-#include "llvm/MC/MCPlan9StackObjects.h"
 
 // Implemented in X86MCInstLower.cpp
 namespace {
@@ -22,7 +21,6 @@ namespace {
 }
 
 namespace llvm {
-class AllocaInst;
 class MCCodeEmitter;
 class MCStreamer;
 class X86Subtarget;
@@ -40,21 +38,6 @@ private:
   bool ShouldEmitWeakSwiftAsyncExtendedFramePointerFlags = false;
   bool IndCSPrefix = false;
   bool EnableImportCallOptimization = false;
-
-  // c2go #298 Wave AC.2 — X86 mirror of AArch64AsmPrinter's per-function
-  // FUNCDATA $2 stkobj accumulator. Populated by LowerSTATEPOINT (in
-  // X86MCInstLower.cpp) for Direct(RSP, off) statepoint locations whose
-  // owning alloca is a structured pointer-bearing type with a known
-  // `c2go.gcbitmap.<X>` symbol; consumed by `publishC2GoStackObjects` in
-  // emitFunctionBodyEnd. Keyed by alloca pointer for cross-statepoint
-  // dedup. Only used when `-c2go-funcdata2` is ON; otherwise stays empty
-  // (zero cost). Mirrors AArch64AsmPrinter.cpp:135-147.
-  SmallSetVector<const AllocaInst *, 8> C2GoStkObjSeen;
-  SmallVector<StkObjEntry, 8> C2GoStkObjEntries;
-
-  // Helper: publish (and clear) the accumulator to MCPlan9AsmStreamer.
-  // Called from emitFunctionBodyEnd; no-op when accumulator is empty.
-  void publishC2GoStackObjects();
 
   enum ImportCallKind : unsigned {
     IMAGE_RETPOLINE_AMD64_IMPORT_BR = 0x02,

@@ -7,8 +7,8 @@
 //===----------------------------------------------------------------------===//
 //
 // c2go #376: shared POD aggregate describing per-function metadata that
-// flows from the producer (AArch64FrameLowering's c2go prologue, AArch64
-// AsmPrinter's stkobj collector, clang's manifest pass) to the consumer
+// flows from the producer (AArch64FrameLowering's c2go prologue, clang's
+// manifest pass) to the consumer
 // (MCPlan9AsmStreamer's TEXT-directive / FUNCDATA emit). Lives in its
 // own header so MCContext and MCPlan9AsmStreamer can share the type
 // without entangling header dependencies (MCContext.h needs the type
@@ -16,7 +16,7 @@
 // hand-off; MCPlan9AsmStreamer.h needs it for the publish API).
 //
 // Storage convention: this struct OWNS its variable-length payload
-// (vector<uint8_t> mask bytes, vector<StkObjEntry>). The legacy
+// (vector<uint8_t> mask bytes). The legacy
 // ArrayRef<>-based shape was replaced as part of the
 // thread_local-to-instance-member migration (#376) so callers no longer
 // need to keep a parallel storage buffer alive until publish time.
@@ -26,7 +26,6 @@
 #ifndef LLVM_MC_MCC2GOFUNCTIONMETADATA_H
 #define LLVM_MC_MCC2GOFUNCTIONMETADATA_H
 
-#include "llvm/MC/MCPlan9StackObjects.h"
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -38,7 +37,7 @@ namespace llvm {
 /// source-of-truth site then submitted via
 /// MCPlan9AsmStreamer::publishC2GoFunction(). Collapses 6 separate
 /// thread_local maps (framesize/argsize, NOSPLIT, args ptr-mask, locals
-/// agg/ambig masks, stkobj table) into one entry per function.
+/// agg/ambig masks) into one entry per function.
 ///
 /// Field semantics:
 ///   * Name             — Mach-O-mangled (or LLVM IR) function symbol;
@@ -57,8 +56,6 @@ namespace llvm {
 ///                         publishes; empty preserves the prior value.
 ///   * LocalsAggMaskBytes / LocalsAmbigMaskBytes — same non-empty-publishes
 ///                         convention.
-///   * StackObjects     — std::nullopt preserves; an empty vector erases
-///                         the prior entry; a non-empty vector publishes.
 ///   * SavedLinkSize    — c2go #298 Wave AA Track A (F3 contract lock):
 ///                         size in bytes of the saved-LR slot inside the
 ///                         physical frame the producer reports as
@@ -70,12 +67,10 @@ namespace llvm {
 ///                         address is pushed by CALL onto rsp+0 but is
 ///                         NOT counted in `$framesize` per obj6.go).
 ///                         Wave AA GPT NEEDS_FIX (Fix 1 / A3): the field
-///                         is `std::optional<unsigned>` so that secondary
-///                         publishers (e.g. AArch64AsmPrinter's stkobj
-///                         harvest at body end, which constructs a fresh
-///                         metadata aggregate to forward only the
-///                         StackObjects payload) can leave it nullopt
-///                         and the streamer-side aggregate PRESERVES the
+///                         is `std::optional<unsigned>` so that a secondary
+///                         publisher forwarding only a subset of fields can
+///                         leave it nullopt and the streamer-side aggregate
+///                         PRESERVES the
 ///                         value the primary producer (FrameLowering /
 ///                         X86C2GoFrameMetaStager) published earlier.
 ///                         publishC2GoFunction has partial-update
@@ -99,9 +94,9 @@ namespace llvm {
 ///                         is NOT subtracted from the declared value).
 ///                         Wave AA GPT NEEDS_FIX (Fix 1 / A3): same
 ///                         `std::optional<unsigned>` preserve-on-nullopt
-///                         semantics as SavedLinkSize above — keeps the
-///                         X86 stkobj second-publish from silently
-///                         resetting an X86 producer's `0` back to the
+///                         semantics as SavedLinkSize above — keeps a
+///                         subset-publish from silently resetting an X86
+///                         producer's `0` back to the
 ///                         AArch64 `16` default. The Stage-1 TEXT
 ///                         directive consumer falls back to 16 when
 ///                         nothing has been published; declared
@@ -116,11 +111,10 @@ struct C2GoFunctionMetadata {
   std::vector<uint8_t> ArgPtrMaskBytes;
   std::vector<uint8_t> LocalsAggMaskBytes;
   std::vector<uint8_t> LocalsAmbigMaskBytes;
-  std::optional<std::vector<StkObjEntry>> StackObjects;
   // c2go #298 Wave AA Track A (F3 contract lock) + Wave AA GPT NEEDS_FIX
   // Fix 1 (A3 publishC2GoFunction API foot-gun): per-arch frame layout
   // contract. nullopt = "preserve the prior published value" (partial-
-  // update semantics, matching ArgSize / StackObjects / mask-byte fields
+  // update semantics, matching ArgSize / mask-byte fields
   // around it). The streamer-side AArch64 fallback uses 8 / 16 — the
   // pre-#NEEDS_FIX struct defaults — when no producer has ever set the
   // field on this function, keeping the AArch64 production path

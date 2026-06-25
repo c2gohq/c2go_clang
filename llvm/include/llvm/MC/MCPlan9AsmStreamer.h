@@ -34,7 +34,6 @@
 #include "llvm/ADT/StringSet.h"
 #include "llvm/MC/MCC2GoFunctionMetadata.h"
 #include "llvm/MC/MCInstPrinter.h"
-#include "llvm/MC/MCPlan9StackObjects.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdint>
@@ -230,15 +229,6 @@ public:
   void emitC2GoFuncDataSymbol(unsigned FuncDataIdx, uint32_t Nbit,
                               ArrayRef<std::vector<uint8_t>> Bitmaps);
 
-  // c2go #284 S4: emit `FUNCDATA $2, gcstkobj·<hash>(SB)` for the current
-  // function plus the symbol's DATA/GLOBL table body (deduped by content
-  // hash via EmittedStkObjSyms). Called from flushC2GoStackmaps when
-  // `g_C2GoStackObjects[FnName]` is non-empty. The 4-byte gcdataoff slot of
-  // each entry is filled via `DATA <sym>+<off>(SB)/4, $<gcdata>(SB)` so the
-  // Go linker performs the SymPtrOff relocation (§4.10.4.1 pt 1).
-  void emitC2GoStackObjectsTable(StringRef FnName,
-                                 ArrayRef<StkObjEntry> Entries);
-
   // c2go Phase 1: flush the gclocals symbol for the most-recently
   // entered c2go function. Called when a new TEXT label arrives in
   // emitLabel(), and from finishImpl() at end of stream. Emits the
@@ -370,12 +360,6 @@ private:
   // to multi-GB RSS during link. Content-hashed dedup matches Go's
   // own `gclocals·<HASH>` convention.
   StringSet<> EmittedGclocalsSyms;
-
-  // c2go #284 S4: cross-function dedup of `gcstkobj·<hex>` RODATA symbols.
-  // Same content-addressable dedup pattern as EmittedGclocalsSyms; only the
-  // first occurrence of a given hash emits DATA/GLOBL, subsequent functions
-  // just reference the symbol via FUNCDATA $2. DUPOK guards re-emit.
-  StringSet<> EmittedStkObjSyms;
 
   // Intern Bits into CurFn.Bitmaps; return the assigned index.
   // The caller has already packed bits LSB-first per byte using

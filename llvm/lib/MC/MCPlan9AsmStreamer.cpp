@@ -246,14 +246,6 @@ void MCPlan9AsmStreamer::publishC2GoFunction(C2GoFunctionMetadata M) {
   if (!M.LocalsAmbigMaskBytes.empty())
     E.LocalsAmbigMaskBytes = std::move(M.LocalsAmbigMaskBytes);
 
-  // ---- StackObjects (nullopt preserve / empty erase / non-empty publish) ----
-  if (M.StackObjects.has_value()) {
-    if (M.StackObjects->empty())
-      E.StackObjects.reset();
-    else
-      E.StackObjects = std::move(*M.StackObjects);
-  }
-
   // ---- Frame contract (c2go #298 Wave AA Track A / F3) ----
   // Wave AA GPT NEEDS_FIX Fix 1 (A3 publishC2GoFunction API foot-gun):
   // partial-update semantics — nullopt preserves the prior published
@@ -1178,115 +1170,11 @@ void MCPlan9AsmStreamer::emitC2GoFuncDataSymbol(
   }
 }
 
-// c2go #284 S4: emit `FUNCDATA $2, gcstkobj·<hash>(SB)` + the stkobj table
-// body. Wire format = §4.10.4.1 (header uintptr N + N×16-byte entries; entry
-// = int32 frameOffset / uint32 size / uint32 ptrBytes / uint32 SymPtrOff).
-//
-// Two tricky bits:
-//   1. `frameOffset` is varp/argp-relative (NOT SP-relative). The collector
-//      in AArch64AsmPrinter performs the conversion; we trust the field. We
-//      do a sanity assert under NDEBUG-off that locals < 0 and args >= 0.
-//      §4.10.4.1 pt 2.
-//   2. `gcdataoff` (4 bytes at +12 within each entry) is a SymPtrOff
-//      relocation, not a literal mask. We emit
-//        `DATA <sym>+<off>(SB)/4, $<gcdataSymName>(SB)`
-//      and the Go linker patches it to the rodata offset (§4.10.4.1 pt 1).
-//
-// Symbol naming: `gcstkobj·<hash16hex>` (UTF-8 middle dot, U+00B7), matching
-// the `gclocals·` convention for content-addressable cross-function dedup.
-// Hash input = (N, per-entry frameOffset/size/ptrBytes/gcdataSymName-bytes);
-// gcdata CONTENTS are *not* hashed since they may not exist yet at the
-// emission point — §4.10.4.1 pt 4.
-void MCPlan9AsmStreamer::emitC2GoStackObjectsTable(
-    StringRef FnName, ArrayRef<StkObjEntry> Entries) {
-  uint32_t N = static_cast<uint32_t>(Entries.size());
-  if (N == 0)
-    return; // §4.10.4.1 pt 3 — no $2 for empty table.
-
-  // FNV-1a 64-bit content hash. Same hash family as gclocals dedup.
-  uint64_t Hash = 0xcbf29ce484222325ULL;
-  auto MixByte = [&](uint8_t B) {
-    Hash ^= uint64_t(B);
-    Hash *= 0x100000001b3ULL;
-  };
-  auto MixU32 = [&](uint32_t V) {
-    MixByte(uint8_t(V & 0xff));
-    MixByte(uint8_t((V >> 8) & 0xff));
-    MixByte(uint8_t((V >> 16) & 0xff));
-    MixByte(uint8_t((V >> 24) & 0xff));
-  };
-  auto MixI32 = [&](int32_t V) { MixU32(static_cast<uint32_t>(V)); };
-  auto MixStr = [&](StringRef S) {
-    for (char C : S)
-      MixByte(static_cast<uint8_t>(C));
-    MixByte(0); // terminator so "ab"+"c" != "a"+"bc"
-  };
-  MixU32(N);
-  for (const StkObjEntry &E : Entries) {
-    MixI32(E.frameOffset);
-    MixU32(E.size);
-    MixU32(E.ptrBytes);
-    MixStr(E.gcdataSymName);
-  }
-
-  llvm::SmallString<32> SymBuf;
-  llvm::raw_svector_ostream SymOS(SymBuf);
-  // UTF-8 "·" (U+00B7) middle dot.
-  SymOS << "gcstkobj\xc2\xb7" << format_hex_no_prefix(Hash, 16);
-  std::string Sym(SymBuf.begin(), SymBuf.end());
-
-  // FUNCDATA reference comes first (attached to the just-closed TEXT
-  // block; runtime indexes by FUNCDATA_StackObjects = 2).
-  *OS << "\tFUNCDATA $2, " << Sym << "(SB)\n";
-
-  // Emit DATA/GLOBL body only on first sighting of this content.
-  if (!EmittedStkObjSyms.insert(Sym).second)
-    return;
-
-  // Header: uintptr N (8 bytes on 64-bit). Entries are 16 bytes each.
-  // Total wire size = 8 + 16*N.
-  const uint64_t kEntryBytes = 16;
-  uint64_t TotalSize = 8 + uint64_t(N) * kEntryBytes;
-  *OS << "DATA " << Sym << "+0(SB)/8, $" << N << "\n";
-
-  uint64_t Off = 8;
-  for (const StkObjEntry &E : Entries) {
-    // Defensive sanity (matches §4.10.4.1 pt 2). Skipped on NDEBUG so
-    // release builds don't pay the branch; the constraint is documented.
-    assert((E.frameOffset < 0 || E.frameOffset >= 0) &&
-           "frameOffset sign convention: locals<0, args>=0 — converted by "
-           "collector");
-
-    // +0..+3: int32 frameOffset. Plan 9 .s has no native i32 signed
-    // directive in this dialect; we emit as raw u32 via reinterpretation
-    // (same wire bytes).
-    uint32_t FrameOffU32 = static_cast<uint32_t>(E.frameOffset);
-    *OS << "DATA " << Sym << "+" << Off << "(SB)/4, $0x"
-        << format_hex_no_prefix(FrameOffU32, 8) << "\n";
-    Off += 4;
-    // +4..+7: uint32 size.
-    *OS << "DATA " << Sym << "+" << Off << "(SB)/4, $" << E.size << "\n";
-    Off += 4;
-    // +8..+11: uint32 ptrBytes.
-    *OS << "DATA " << Sym << "+" << Off << "(SB)/4, $" << E.ptrBytes << "\n";
-    Off += 4;
-    // +12..+15: uint32 SymPtrOff to gcdata (Go linker patches). Plan 9 .s
-    // syntax: `$<sym>(SB)` on the RHS asks the linker to compute the
-    // rodata-relative offset. (§4.10.4.1 pt 1.)
-    *OS << "DATA " << Sym << "+" << Off << "(SB)/4, $" << E.gcdataSymName
-        << "(SB)\n";
-    Off += 4;
-  }
-  // DUPOK (2) | RODATA (8) = 10 — same flags as gclocals dedup.
-  *OS << "GLOBL " << Sym << "(SB), DUPOK|RODATA, $" << TotalSize << "\n\n";
-  (void)FnName; // currently used only for diagnostics.
-}
-
 void MCPlan9AsmStreamer::flushC2GoStackmaps() {
   if (!CurFn)
     return;
   // c2go #376: single lookup into per-function metadata; reused for the
-  // args mask, locals agg mask, ambig scrub, and stkobj table below.
+  // args mask, locals agg mask, and ambig scrub.
   const C2GoFunctionMetadata *Meta = nullptr;
   {
     auto MetaIt = C2GoFnMeta.find(CurFn->FnName);
@@ -1371,15 +1259,6 @@ void MCPlan9AsmStreamer::flushC2GoStackmaps() {
   }
   emitC2GoFuncDataSymbol(/*FUNCDATA_LocalsPointerMaps=*/1, CurFn->Nbit,
                          CurFn->Bitmaps);
-
-  // FUNCDATA $2 — STACK OBJECTS (FUNCDATA_StackObjects). Populated by
-  // AArch64AsmPrinter::LowerSTATEPOINT when `-c2go-funcdata2` is ON;
-  // absent / empty entries => no emit (matches Go `emitStackObjects`
-  // short-circuit on `len(vars)==0`, §4.10.4.1 pt 3). Emitted AFTER $0/$1
-  // so the file is structurally consistent (all FUNCDATAs grouped after
-  // the locals/args maps; assembler is order-agnostic, but readability).
-  if (Meta && Meta->StackObjects.has_value() && !Meta->StackObjects->empty())
-    emitC2GoStackObjectsTable(CurFn->FnName, *Meta->StackObjects);
 
   CurFn.reset();
 }

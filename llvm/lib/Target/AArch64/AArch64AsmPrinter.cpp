@@ -102,21 +102,6 @@ static cl::opt<PtrauthCheckMode> PtrauthAuthChecks(
     cl::desc("Check pointer authentication auth/resign failures"),
     cl::init(Default));
 
-// c2go #284 (S5): gate emission of FUNCDATA $2 (per-function stack-objects
-// table). Default OFF: the existing Approach B摊平 path (`c2goExpandDirect-
-// AllocaFields` field-fanout into FUNCDATA $1) remains the sole GC root
-// reporter — 900/900 SQLite-robust. ON: also collect alloca→StkObjEntry and
-// publish to the Plan 9 streamer; the FUNCDATA $1 摊平 is left intact (real
-// tightening of $1 is deferred until S6 stale-field probe + SQLite 6×150
-// GOGC=1 stress regression certifies equivalence). The flag therefore opts
-// in to *additional* emit only — zero behavior change for default OFF.
-// See docs/c2go_design.md §4.10.4.2 S5.
-static cl::opt<bool> C2GoFuncData2(
-    "c2go-funcdata2", cl::Hidden,
-    cl::desc("c2go #284: emit FUNCDATA $2 (stack-objects table). Default OFF; "
-             "default ON awaits S6 stale-field probe + SQLite stress soak."),
-    cl::init(false));
-
 namespace {
 
 class AArch64AsmPrinter : public AsmPrinter {
@@ -131,20 +116,6 @@ class AArch64AsmPrinter : public AsmPrinter {
   DenseMap<MCSection *, std::vector<std::pair<MCSymbol *, MCSymbol *>>>
       SectionToImportedFunctionCalls;
   unsigned PAuthIFuncNextUniqueID = 1;
-
-  // c2go #284 S2.2: per-function FUNCDATA $2 stkobj accumulator. Populated
-  // by LowerSTATEPOINT for Direct(SP, off) locations whose owning alloca is
-  // a structured pointer-bearing type with a known `c2go.gcbitmap.<X>`
-  // symbol. Cleared in emitFunctionBodyStart / published in
-  // emitFunctionBodyEnd (publishC2GoStackObjects). Keyed by alloca pointer
-  // for cross-statepoint dedup. Only used when `-c2go-funcdata2` is ON;
-  // otherwise stays empty (zero cost).
-  SmallSetVector<const AllocaInst *, 8> C2GoStkObjSeen;
-  SmallVector<StkObjEntry, 8> C2GoStkObjEntries;
-
-  // Helper: publish (and clear) the accumulator to MCPlan9AsmStreamer.
-  // Called from emitFunctionBodyEnd; no-op when accumulator is empty.
-  void publishC2GoStackObjects();
 
 public:
   static char ID;
@@ -1169,32 +1140,6 @@ void AArch64AsmPrinter::emitLOHs() {
 void AArch64AsmPrinter::emitFunctionBodyEnd() {
   if (!AArch64FI->getLOHRelated().empty())
     emitLOHs();
-  // c2go #284 S2.2: hand off accumulated stkobj entries to the Plan 9
-  // streamer (which emits FUNCDATA $2 in flushC2GoStackmaps). No-op when
-  // -c2go-funcdata2 is OFF (accumulator stays empty) or when the function
-  // has no qualifying alloca.
-  publishC2GoStackObjects();
-}
-
-void AArch64AsmPrinter::publishC2GoStackObjects() {
-  if (C2GoStkObjEntries.empty()) {
-    // Always clear in case a prior function populated and then was emitted
-    // with empty entries (defensive).
-    C2GoStkObjSeen.clear();
-    return;
-  }
-  if (OutStreamer->isPlan9AsmStreamer()) {
-    // c2go #376: publish via the streamer instance (was a static call into
-    // a thread_local side-channel). The stkobj table is collected at body
-    // end so we have a streamer pointer; route directly.
-    C2GoFunctionMetadata M;
-    M.Name = std::string(MF->getName());
-    M.StackObjects.emplace(C2GoStkObjEntries.begin(), C2GoStkObjEntries.end());
-    static_cast<MCPlan9AsmStreamer *>(OutStreamer.get())
-        ->publishC2GoFunction(std::move(M));
-  }
-  C2GoStkObjEntries.clear();
-  C2GoStkObjSeen.clear();
 }
 
 /// GetCPISymbol - Return the symbol for the specified constant pool entry.
@@ -2013,120 +1958,6 @@ static void c2goAppendPtrFieldOffsets(Type *Ty, int64_t Base,
   // Scalars contribute no pointer word.
 }
 
-// c2go #284 (S2-S3): given a Direct(SP, Off) statepoint location and the
-// owning MachineFunction, derive a per-function StkObjEntry candidate for
-// FUNCDATA $2. Returns std::nullopt when the alloca is not a tracked stkobj
-// candidate (vararg-pack alloca, no pointer fields, or no recognized
-// `c2go.gcbitmap.<X>` sym in the module). Only called when
-// `-c2go-funcdata2` is ON. Per-function dedup (one entry per AI) is the
-// caller's responsibility.
-//
-// `Off` is SP-relative; the entry stores `varp`-relative (locals < 0) or
-// `argp`-relative (args >= 0) per §4.10.4.1 pt 2. Conversion uses the c2go
-// framesize (MFI.getStackSize() — c2GoFrameSize already set it).
-//
-// gcdata symbol name: we restrict to record types whose typeinfo path
-// already produced `c2go.gcbitmap.<recname>` (via CGC2GoTypeInfo). Scalar
-// pointer / array allocas are skipped in this v0 — under-marking is sound
-// (Approach B 摊平 still emits them into FUNCDATA $1 since `c2goExpand-
-// DirectAllocaFields` is still called); precision tightening for those is a
-// follow-up (S6 stale probe).
-static std::optional<llvm::StkObjEntry>
-c2goCollectStkObjEntry(const MachineFunction &MF, int64_t SpOff,
-                       const llvm::AllocaInst *AI) {
-  if (!AI)
-    return std::nullopt;
-  // #327 mirror: never include vararg-pack allocas — RS4GC liveness over-
-  // reports them at unrelated safepoints and stack-coloring reuses their
-  // slot for other packs. Same conservative skip as the摊平 path.
-  if (AI->getMetadata(llvm::c2go::kVaPackMD))
-    return std::nullopt;
-
-  llvm::Type *Ty = AI->getAllocatedType();
-  if (!Ty || !Ty->isSized())
-    return std::nullopt;
-
-  const llvm::DataLayout &DL = MF.getDataLayout();
-  uint64_t SizeBytes = DL.getTypeAllocSize(Ty).getFixedValue();
-  if (SizeBytes == 0)
-    return std::nullopt;
-
-  // gcdata sym: only recognize structs whose CGC2GoTypeInfo already emitted
-  // `c2go.gcbitmap.<RecName>`. Probe Module::getNamedGlobal so we never
-  // reference a sym the linker can't resolve. LLVM struct type names look
-  // like `struct.<X>` or `union.<X>`; CGC2GoTypeInfo names the bitmap by
-  // the *source* record name (e.g. `c2go.gcbitmap.struct.foo`). We try the
-  // raw LLVM struct name first (covers SQLite's `struct.<X>` pattern).
-  auto *ST = llvm::dyn_cast<llvm::StructType>(Ty);
-  if (!ST || !ST->hasName())
-    return std::nullopt;
-  llvm::StringRef LLVMName = ST->getName();
-  // Strip leading `struct.` / `union.` if present so the bitmap name
-  // matches CGC2GoTypeInfo's convention (`c2go.gcbitmap.<X>`).
-  llvm::StringRef RecName = LLVMName;
-  if (RecName.consume_front("struct."))
-    ; // RecName now bare
-  else if (RecName.consume_front("union."))
-    ;
-  std::string BitmapName = ("c2go.gcbitmap." + RecName).str();
-  const llvm::Module *M = MF.getFunction().getParent();
-  const llvm::GlobalVariable *GV =
-      M ? M->getNamedGlobal(BitmapName) : nullptr;
-  if (!GV)
-    return std::nullopt; // no bitmap emitted for this type — skip safely
-
-  // ptrBytes = pointer-containing prefix length. Compute as 8 × (highest
-  // pointer-word index + 1). Cheap via the existing field-offset walker
-  // (c2goAppendPtrFieldOffsets), which yields SP-relative byte offsets;
-  // we strip the SP base by subtracting SpOff.
-  llvm::SmallVector<int64_t, 8> Tmp;
-  llvm::DenseSet<int64_t> NoSkip;
-  c2goAppendPtrFieldOffsets(Ty, /*Base=*/0, DL, NoSkip, Tmp);
-  uint32_t PtrBytes = 0;
-  for (int64_t O : Tmp) {
-    uint64_t End = uint64_t(O) + 8;
-    if (End > PtrBytes)
-      PtrBytes = static_cast<uint32_t>(End);
-  }
-  // Pure-data records (no pointer fields) carry no GC interest — skip per
-  // §4.10.4.1 pt 5 spirit (would just inflate the table for no gain).
-  if (PtrBytes == 0)
-    return std::nullopt;
-
-  // §4.10.4.1 pt 2: convert SP-relative -> varp/argp-relative.
-  //
-  // Use `MFI.getStackSize()` (= funcspdelta in Go traceback terminology, the
-  // physical SP decrement performed by c2goEmitPrologue, == c2GoFrameSize()).
-  // This is the value the Go runtime's `varp = SP + funcspdelta - 8` /
-  // `argp = SP + funcspdelta` uses (see runtime/stack.go scanstack +
-  // runtime/traceback.go). It is NOT the same as the TEXT directive's
-  // declared framesize `$N` (= MFI.getStackSize() - 16, the value go asm
-  // sees after it adds back its own 16-byte LR-save + alignment). The
-  // FUNCDATA $1 locals bitmap also uses funcspdelta (Nbit =
-  // (MFI.getStackSize() - 8)/8 — see MCPlan9AsmStreamer::emitC2GoFuncData-
-  // Preamble), so stkobj and stackmap stay symmetric.
-  //
-  // Example: MFI.getStackSize()=48, declared TEXT $32, alloca at SP+24
-  //   → varp = SP+40, frameOffset = 24 - 40 = -16.
-  int64_t FrameSize =
-      static_cast<int64_t>(MF.getFrameInfo().getStackSize());
-  int32_t FrameOffset;
-  if (SpOff < FrameSize) {
-    // locals region — varp-relative, must be negative.
-    FrameOffset = static_cast<int32_t>(SpOff - (FrameSize - 8));
-  } else {
-    // args region — argp-relative, non-negative.
-    FrameOffset = static_cast<int32_t>(SpOff - FrameSize);
-  }
-
-  llvm::StkObjEntry E;
-  E.frameOffset = FrameOffset;
-  E.size = static_cast<uint32_t>(SizeBytes);
-  E.ptrBytes = PtrBytes;
-  E.gcdataSymName = std::move(BitmapName);
-  return E;
-}
-
 // c2go #327: given a Direct StackMap location (the live value IS the address
 // SP+`Off`, i.e. an alloca that RewriteStatepointsForGC tracks as a base), find
 // the owning alloca and append the SP-relative offsets of its pointer FIELDS to
@@ -2257,34 +2088,6 @@ void AArch64AsmPrinter::LowerSTATEPOINT(MCStreamer &OutStreamer, StackMaps &SM,
         SpOffsets.push_back(Off);
       else if (Loc.Type == StackMaps::Location::Direct) {
         c2goExpandDirectAllocaFields(*MF, Off, SpOffsets);
-        // c2go #284 S2.2: ALSO collect a StkObjEntry candidate for FUNCDATA
-        // $2. Gated by `-c2go-funcdata2`; OFF path retains Approach B
-        // 摊平 exactly (above call still runs; the entry collection is a
-        // pure addition). Per-alloca dedup via C2GoStkObjSeen so multiple
-        // Direct locations on the same alloca contribute one entry.
-        if (C2GoFuncData2) {
-          const MachineFrameInfo &MFI = MF->getFrameInfo();
-          const TargetFrameLowering *TFL =
-              MF->getSubtarget().getFrameLowering();
-          for (int FI = MFI.getObjectIndexBegin(),
-                   FE = MFI.getObjectIndexEnd();
-               FI < FE; ++FI) {
-            if (MFI.isDeadObjectIndex(FI))
-              continue;
-            const AllocaInst *AI = MFI.getObjectAllocation(FI);
-            if (!AI)
-              continue;
-            Register FrameReg;
-            StackOffset SO = TFL->getFrameIndexReference(*MF, FI, FrameReg);
-            if (FrameReg != AArch64::SP || SO.getFixed() != Off)
-              continue;
-            if (!C2GoStkObjSeen.insert(AI))
-              break; // already accounted
-            if (auto E = c2goCollectStkObjEntry(*MF, Off, AI))
-              C2GoStkObjEntries.push_back(std::move(*E));
-            break;
-          }
-        }
       }
     }
     // c2go GC Approach B (#330): OR-in derived/interior ptr spill slots that

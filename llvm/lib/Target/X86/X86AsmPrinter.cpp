@@ -56,29 +56,6 @@
 
 using namespace llvm;
 
-// c2go #298 Wave AC.2: gate emission of FUNCDATA $2 (per-function stack-
-// objects table) on X86. Mirror of the AArch64 `-c2go-funcdata2` flag
-// (AArch64AsmPrinter.cpp:105-118). Default OFF — the existing Approach B
-// 摊平 path (c2goExpandDirectAllocaFields field-fanout into FUNCDATA $1)
-// remains the sole GC root reporter; ON also collects alloca→StkObjEntry
-// and publishes to the Plan-9 streamer.
-static cl::opt<bool>
-    X86C2GoFuncData2("x86-c2go-funcdata2", cl::Hidden,
-                     cl::desc("c2go #298 X86 mirror: emit FUNCDATA $2 "
-                              "(stack-objects table). Default OFF."),
-                     cl::init(false));
-
-namespace llvm {
-namespace c2go {
-// Visible to X86MCInstLower.cpp's LowerSTATEPOINT so the Direct(SP, off)
-// stkobj collection branch checks the same flag the AsmPrinter-side
-// publisher uses (mirror of AArch64's C2GoFuncData2). Kept in
-// llvm::c2go:: to avoid colliding with the cl::opt symbol while still
-// sharing the same backing storage.
-bool isX86C2GoFuncData2Enabled() { return X86C2GoFuncData2; }
-} // namespace c2go
-} // namespace llvm
-
 X86AsmPrinter::X86AsmPrinter(TargetMachine &TM,
                              std::unique_ptr<MCStreamer> Streamer)
     : AsmPrinter(TM, std::move(Streamer), ID), FM(*this) {}
@@ -197,37 +174,6 @@ void X86AsmPrinter::emitFunctionBodyEnd() {
         static_cast<X86TargetStreamer *>(OutStreamer->getTargetStreamer());
     XTS->emitFPOEndProc();
   }
-  // c2go #298 Wave AC.2: hand off accumulated stkobj entries to the Plan-9
-  // streamer (which emits FUNCDATA $2 in flushC2GoStackmaps). No-op when
-  // `-x86-c2go-funcdata2` is OFF (accumulator stays empty) or when the
-  // function has no qualifying alloca. Mirrors AArch64AsmPrinter.cpp:1169.
-  publishC2GoStackObjects();
-}
-
-void X86AsmPrinter::publishC2GoStackObjects() {
-  if (C2GoStkObjEntries.empty()) {
-    // Defensive clear in case a prior function populated but was emitted
-    // without reaching this hook (mirror of AArch64 #376 path).
-    C2GoStkObjSeen.clear();
-    return;
-  }
-  if (OutStreamer->isPlan9AsmStreamer()) {
-    // Fresh aggregate carrying ONLY the StackObjects payload — every
-    // other field stays nullopt so Wave AA Fix 1's partial-update
-    // semantics in `MCPlan9AsmStreamer::publishC2GoFunction` preserves
-    // the primary producer's earlier publish (FrameSize / ArgSize /
-    // SavedLinkSize=0 / FrameAlignment=0 staged by the X86 c2go frame
-    // emitter — see X86C2GoFrameEmitter.cpp). A non-optional struct
-    // here would silently reset those back to defaults (the foot-gun
-    // Wave AA Fix 1 closed).
-    C2GoFunctionMetadata M;
-    M.Name = std::string(MF->getName());
-    M.StackObjects.emplace(C2GoStkObjEntries.begin(), C2GoStkObjEntries.end());
-    static_cast<MCPlan9AsmStreamer *>(OutStreamer.get())
-        ->publishC2GoFunction(std::move(M));
-  }
-  C2GoStkObjEntries.clear();
-  C2GoStkObjSeen.clear();
 }
 
 uint32_t X86AsmPrinter::MaskKCFIType(uint32_t Value) {
