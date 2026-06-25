@@ -521,9 +521,17 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
         const auto *UA = FD->getAttr<C2GoUnmanagedAttr>();
         const bool Explicit = UA && !UA->isImplicit();
         bool Referenced = false;
-        if (Mod)
+        if (Mod) {
           if (llvm::Function *IF = Mod->getFunction(FD->getNameAsString()))
             Referenced = !IF->use_empty();
+          // `&import` redirects to the c2go_stub_<name> trampoline (the raw host
+          // address) instead of the wrapper @<name>, so the import is referenced
+          // even when @<name> itself is unused — count the stub's uses too.
+          if (!Referenced)
+            if (llvm::Function *SF =
+                    Mod->getFunction("c2go_stub_" + FD->getNameAsString()))
+              Referenced = !SF->use_empty();
+        }
         if (!Explicit && !Referenced)
           continue;
       }

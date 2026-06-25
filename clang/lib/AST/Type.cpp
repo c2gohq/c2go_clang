@@ -3641,6 +3641,7 @@ StringRef FunctionType::getNameForCallConv(CallingConv CC) {
     // clang-format on
   case CC_GoABI0: return "goabi0";
   case CC_C2GoInternal: return "c2go_internal";
+  case CC_C2GoExternImport: return "c2go_extern_import";
   }
 
   llvm_unreachable("Invalid calling convention.");

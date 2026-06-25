@@ -1188,6 +1188,11 @@ void TypePrinter::printFunctionAfter(const FunctionType::ExtInfo &Info,
       // mirroring CC_C, so desugared type spellings / -ast-dump / diagnostics
       // stay identical to pre-#290 output (c2gobind consumes these).
       break;
+    case CC_C2GoExternImport:
+      // The extern-import host-fp world: print a marker so the reason an
+      // assignment is rejected (incompatible-function-pointer-types) is visible.
+      OS << " /*c2go: extern_import*/";
+      break;
     }
   }
 

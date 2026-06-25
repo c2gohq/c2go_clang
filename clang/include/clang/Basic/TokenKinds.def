@@ -483,6 +483,11 @@ KEYWORD(__c2go_typeinfo             , KEYALL)
 // re-enters `fn` through runtime.cgocallback so a foreign C thread can call it.
 // The user-facing `c2go_callback(fn)` macro in <c2go.h> forwards to it.
 KEYWORD(__c2go_callback             , KEYALL)
+// c2go: __c2go_callout(fp)(args) invokes an extern-import host fp through the
+// c2go-to-host bridge (the symmetric dual of __c2go_callback). The user-facing
+// `c2go_callout(fp)` macro in <c2go.h> forwards to it; the trailing `(args)` is
+// required (call-position-only).
+KEYWORD(__c2go_callout              , KEYALL)
 KEYWORD(__extension__               , KEYALL)
 KEYWORD(__float128                  , KEYALL)
 KEYWORD(__ibm128                    , KEYALL)

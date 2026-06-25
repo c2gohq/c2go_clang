@@ -6532,6 +6532,55 @@ bool Sema::diagnoseQualifiedDeclaration(CXXScopeSpec &SS, DeclContext *DC,
   return false;
 }
 
+// c2go (site 2): re-type a host import's function-pointer parameter/return as
+// the CC_C2GoExternImport host-fp world. A function pointer the host receives
+// (callback param) or hands back (fp return) is a host fp: only a host fp
+// (`&import`) or a c2go function wrapped via c2go_callback (whose result is
+// CC_C2GoExternImport) may flow through it — a raw c2go internal fp
+// (CC_C2GoInternal) is rejected, since the host cannot call it directly. Non-fp
+// types are returned unchanged.
+static QualType c2goAsHostFpType(ASTContext &Ctx, QualType T) {
+  const auto *PT = T->getAs<PointerType>();
+  const auto *FT = PT ? PT->getPointeeType()->getAs<FunctionType>() : nullptr;
+  if (!FT || FT->getCallConv() == CC_C2GoExternImport)
+    return T;
+  QualType NewFT;
+  if (const auto *FPT = dyn_cast<FunctionProtoType>(FT)) {
+    FunctionProtoType::ExtProtoInfo EPI = FPT->getExtProtoInfo();
+    EPI.ExtInfo = EPI.ExtInfo.withCallingConv(CC_C2GoExternImport);
+    NewFT = Ctx.getFunctionType(FPT->getReturnType(), FPT->getParamTypes(), EPI);
+  } else {
+    const auto *FNPT = cast<FunctionNoProtoType>(FT);
+    NewFT = Ctx.getFunctionNoProtoType(
+        FNPT->getReturnType(),
+        FNPT->getExtInfo().withCallingConv(CC_C2GoExternImport));
+  }
+  return Ctx.getPointerType(NewFT);
+}
+
+// Rewrite every function-pointer parameter AND a function-pointer return of an
+// unmanaged-extern import FD to the host-fp world (site 2). Updates the function
+// type and the matching ParmVarDecls; a no-op when no fp appears in the
+// signature.
+static void c2goRewriteImportCallbackParams(ASTContext &Ctx, FunctionDecl *FD) {
+  const auto *FPT = FD->getType()->getAs<FunctionProtoType>();
+  if (!FPT)
+    return;
+  QualType NewRet = c2goAsHostFpType(Ctx, FPT->getReturnType());
+  llvm::SmallVector<QualType, 8> NewParams;
+  bool Changed = NewRet != FPT->getReturnType();
+  for (QualType P : FPT->getParamTypes()) {
+    QualType NP = c2goAsHostFpType(Ctx, P);
+    Changed |= NP != P;
+    NewParams.push_back(NP);
+  }
+  if (!Changed)
+    return;
+  FD->setType(Ctx.getFunctionType(NewRet, NewParams, FPT->getExtProtoInfo()));
+  for (unsigned I = 0, N = FD->getNumParams(); I < N; ++I)
+    FD->getParamDecl(I)->setType(NewParams[I]);
+}
+
 NamedDecl *Sema::HandleDeclarator(Scope *S, Declarator &D,
                                   MultiTemplateParamsArg TemplateParamLists) {
   // TODO: consider using NameInfo for diagnostic.
@@ -6800,6 +6849,15 @@ NamedDecl *Sema::HandleDeclarator(Scope *S, Declarator &D,
             C2GoStack.empty() ? FD->getLocation() : C2GoStack.back().Loc;
         FD->addAttr(C2GoUnmanagedAttr::CreateImplicit(Context, L));
       }
+      // c2go (site 2): re-type host-callback fp params for an EXPLICIT
+      // `unmanaged extern` import — definitively a never-defined import (Sema
+      // rejects defining one). Implicit (plain-extern) imports are left alone: a
+      // plain forward decl may be DEFINED later as an internal function, whose
+      // fp params must stay CC_C2GoInternal.
+      if (auto *UA = FD->getAttr<C2GoUnmanagedAttr>())
+        if (!UA->isImplicit() && !FD->isThisDeclarationADefinition() &&
+            !FD->hasAttr<C2GoExternAttr>() && !FD->hasAttr<C2GoLinknameAttr>())
+          c2goRewriteImportCallbackParams(Context, FD);
     }
   }
 

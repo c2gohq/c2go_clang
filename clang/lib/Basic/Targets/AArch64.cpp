@@ -1418,6 +1418,7 @@ AArch64TargetInfo::checkCallingConvention(CallingConv CC) const {
   case CC_Win64:
   case CC_GoABI0:
   case CC_C2GoInternal:
+  case CC_C2GoExternImport:
     return CCCR_OK;
   default:
     return CCCR_Warning;

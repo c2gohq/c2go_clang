@@ -125,6 +125,34 @@ void *gc_malloc(const void *type_info, __SIZE_TYPE__ n)
 
 #define c2go_callback(fn) (__c2go_callback(fn))
 
+/*===-- Callout: extern-import host fn -> internal-callable fn-ptr ---------
+ * c2go_callout(fn) yields an internal-callable function pointer to the
+ * `unmanaged extern` import `fn` — the symmetric dual of c2go_callback. Where
+ * c2go_callback hands a c2go function to the host, c2go_callout hands a host
+ * function to c2go: the result is a normal callable/storable c2go function
+ * pointer that bridges to the host (through the import's generated wrapper) when
+ * called.
+ *
+ * A direct call `fn(...)` ALREADY uses that wrapper automatically — you only
+ * need c2go_callout when you want the function POINTER itself (to store it or
+ * pass it around within c2go). It takes the function NAME, not an address.
+ * (`&fn` is different: that is the RAW host address, of type
+ * `unmanaged import func ptr`, which is NOT callable from c2go and is for
+ * handing back to the host.)
+ *
+ * For an import with a scalar/pointer/float signature the result is a plain
+ * function pointer (assign it directly). For a record-by-value or variadic
+ * signature the result carries the import's stack-ABI calling convention, so
+ * hold it via __typeof__(c2go_callout(fn)).
+ *
+ * Usage:
+ *   extern int host_cmp(const void *, const void *);  // unmanaged extern
+ *   int (*p)(const void *, const void *) = c2go_callout(host_cmp);
+ *   int r = p(a, b);                                  // bridges to the host
+ *===-----------------------------------------------------------------------*/
+
+#define c2go_callout(fn) (__c2go_callout(fn))
+
 /*===-- GC array allocation (v15 §P4) -------------------------------------
  * gc_malloc_array(type_info, elem_size, count) allocates a contiguous,
  * GC-tracked array of `count` elements, each `elem_size` bytes, scanned per

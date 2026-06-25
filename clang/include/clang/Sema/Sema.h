@@ -7677,6 +7677,14 @@ public:
   ExprResult ActOnC2GoCallback(Scope *S, SourceLocation BuiltinLoc,
                                Expr *FnExpr, SourceLocation RParenLoc);
 
+  // c2go: __c2go_callout(fn) — names an unmanaged extern import; yields an
+  // internal-callable (GoABI0) function pointer to that import's generated
+  // bridge wrapper (callable / storable from c2go, bridging to the host on
+  // call). The symmetric dual of __c2go_callback (internal fn -> host-callable
+  // pointer); reuses the existing per-name import wrapper.
+  ExprResult ActOnC2GoCallout(Scope *S, SourceLocation BuiltinLoc, Expr *FnExpr,
+                              SourceLocation RParenLoc);
+
   // __builtin_choose_expr(constExpr, expr1, expr2)
   ExprResult ActOnChooseExpr(SourceLocation BuiltinLoc, Expr *CondExpr,
                              Expr *LHSExpr, Expr *RHSExpr,

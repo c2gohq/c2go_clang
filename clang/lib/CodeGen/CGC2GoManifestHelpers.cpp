@@ -37,6 +37,33 @@ bool isC2GoUnmanagedExternImport(const FunctionDecl *FD) {
   return !FD->doesThisDeclarationHaveABody() && !FD->isDefined();
 }
 
+bool isC2GoScalarRegReturnImport(const FunctionDecl *FD) {
+  // A single scalar/pointer/float word returns/passes in a register, so the
+  // synthesized .s dispatch wrapper for such a signature is reg-return-safe
+  // (the internal ABIInternal-style register return, like any internal c2go
+  // function). Record/complex/vector-by-value or variadic signatures keep the
+  // ABI0 stack return — the wrapper marshals an sret buffer or bails to the
+  // c2go-bind Go-dispatch path. Restricting to an all-scalar signature keeps
+  // this predicate purely AST-based (no CGFunctionInfo arrangement), so Sema
+  // (ActOnC2GoCallout) and CodeGen (shouldUseC2GoRegReturn + the wrapper) can
+  // agree on a function's reg-return-ness with no early/late divergence.
+  if (!isC2GoUnmanagedExternImport(FD))
+    return false;
+  const auto *FPT = FD->getType()->getAs<FunctionProtoType>();
+  if (!FPT || FPT->isVariadic())
+    return false;
+  auto isScalarWord = [](QualType T) {
+    return T->isVoidType() || T->isIntegralOrEnumerationType() ||
+           T->isPointerType() || T->isRealFloatingType();
+  };
+  if (!isScalarWord(FPT->getReturnType()))
+    return false;
+  for (QualType P : FPT->getParamTypes())
+    if (!isScalarWord(P))
+      return false;
+  return true;
+}
+
 std::string mapC2GoType(QualType QT, const ASTContext &Ctx, bool IsUnmanaged) {
   QT = QT.getCanonicalType();
   if (QT->isVoidType()) return "";

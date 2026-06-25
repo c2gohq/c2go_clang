@@ -2431,6 +2431,14 @@ def err_c2go_callback_not_function : Error<
   "'__c2go_callback' requires a function name; the operand must name a c2go "
   "function whose address becomes an unmanaged native callback">;
 
+def err_c2go_call_extern_import_fp : Error<
+  "cannot call an extern-import function pointer directly; an 'unmanaged extern' "
+  "host function pointer must be invoked through c2go_callout(...) so the call "
+  "crosses the c2go-to-host bridge">;
+
+def err_c2go_callout_not_extern_import : Error<
+  "operand of 'c2go_callout' must name an 'unmanaged extern' import function">;
+
 def err_c2go_linkname_abi0_illegal_name : Error<
   "C2GO_GOABI0 (direct reference) cannot be used with the c2go_linkname target "
   "%0: it contains a character the Plan 9 assembler cannot carry in a symbol "

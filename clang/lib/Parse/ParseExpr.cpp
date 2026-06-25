@@ -1071,6 +1071,7 @@ Parser::ParseCastExpression(CastParseKind ParseKind, bool isAddressOfOperand,
   case tok::kw___builtin_offsetof:
   case tok::kw___c2go_typeinfo:
   case tok::kw___c2go_callback:
+  case tok::kw___c2go_callout:
   case tok::kw___builtin_choose_expr:
   case tok::kw___builtin_astype: // primary-expression: [OCL] as_type()
   case tok::kw___builtin_convertvector:
@@ -2386,6 +2387,23 @@ ExprResult Parser::ParseBuiltinPrimaryExpression() {
     else
       Res = Actions.ActOnC2GoCallback(getCurScope(), StartLoc, Fn.get(),
                                       ConsumeParen());
+    break;
+  }
+  case tok::kw___c2go_callout: {
+    // c2go: __c2go_callout(fn) — a single function-name operand naming an
+    // unmanaged extern import; yields an internal-callable function pointer to
+    // that import's generated wrapper (the symmetric dual of __c2go_callback).
+    ExprResult Fn(ParseAssignmentExpression());
+    if (Tok.isNot(tok::r_paren)) {
+      Diag(Tok, diag::err_expected) << tok::r_paren;
+      SkipUntil(tok::r_paren, StopAtSemi);
+      return ExprError();
+    }
+    if (Fn.isInvalid())
+      Res = ExprError();
+    else
+      Res = Actions.ActOnC2GoCallout(getCurScope(), StartLoc, Fn.get(),
+                                     ConsumeParen());
     break;
   }
   case tok::kw___builtin_offsetof: {

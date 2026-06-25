@@ -126,6 +126,10 @@ unsigned CodeGenTypes::ClangCallConvToLLVMCallConv(CallingConv CC) {
   // CodeGenModule::useC2GoGoABI0CallingConv overrides this for real c2go
   // functions, so this only serves as a coherent fallback value.
   case CC_C2GoInternal: return llvm::CallingConv::GoABI0;
+  // c2go: CC_C2GoExternImport (a host fp's type) only reaches here if a value of
+  // that type is materialized into an IR function type; a real call always goes
+  // through c2go_callout's dispatcher, so GoABI0 is the coherent fallback.
+  case CC_C2GoExternImport: return llvm::CallingConv::GoABI0;
   }
 }
 
@@ -6229,7 +6233,21 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
     // internal (no boundary attrs) and just consults the opt-level. Without
     // this, a caller at -O2 would read X0 while a -O0 callee wrote the result
     // slot on the stack.
-    if (CGM.shouldUseC2GoRegReturn(TargetDecl))
+    bool RegRet = CGM.shouldUseC2GoRegReturn(TargetDecl);
+    // c2go: shouldUseC2GoRegReturn defaults an INDIRECT call (TargetDecl is not
+    // a named FunctionDecl — a variable / struct-member / expression callee) to
+    // reg-return, but that is only correct when the pointee returns in
+    // registers. Honor the function pointer's type calling convention: a
+    // GoABI0-typed fp (a c2go_extern function's address, or an unmanaged-extern
+    // import wrapper that kept the ABI0 stack return) points at a stack-return
+    // body, so the caller must NOT claim reg-return — else it would read a
+    // result register the callee never wrote. Internal (CC_C2GoInternal /
+    // default) fps — the common SQLite vtable/callback case — are unchanged.
+    if (RegRet && !isa_and_nonnull<FunctionDecl>(TargetDecl) &&
+        (CallInfo.getASTCallingConvention() == CC_GoABI0 ||
+         CallInfo.getASTCallingConvention() == CC_C2GoExternImport))
+      RegRet = false;
+    if (RegRet)
       CI->addFnAttr(llvm::Attribute::get(CI->getContext(), "c2go-reg-return"));
   }
 

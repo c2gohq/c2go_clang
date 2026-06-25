@@ -79,6 +79,17 @@ uint64_t computeC2GoArgSize(const FunctionDecl *FD, const ASTContext &Ctx);
 /// declared-only by the time codegen runs.
 bool isC2GoUnmanagedExternImport(const FunctionDecl *FD);
 
+/// True iff \p FD is an unmanaged-extern import (isC2GoUnmanagedExternImport)
+/// whose signature is entirely scalar (every parameter and the result is
+/// void/integer/enum/pointer/real-float; non-variadic). Such an import's
+/// synthesized .s dispatch wrapper returns a single register-class word, so it
+/// uses the internal register-return convention (c2go-reg-return) at -O2 like
+/// any internal function — its result fp is then a plain CC_C2GoInternal
+/// pointer, assignable without a calling-convention cast. Record/variadic
+/// imports keep the ABI0 stack return. Purely AST-based so Sema and CodeGen
+/// compute the same answer (no CGFunctionInfo arrangement).
+bool isC2GoScalarRegReturnImport(const FunctionDecl *FD);
+
 /// WF2 (#319 C4a): emit the `c2go.struct.<RecName>.meta` named MD describing
 /// a c2go_struct/c2go_managed record so c2go-lto can rebuild the manifest
 /// `types[]` entry from combined bitcode. Idempotent — re-emission for the

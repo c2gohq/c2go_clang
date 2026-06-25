@@ -256,6 +256,39 @@ static bool CanElideOverflowCheck(const ASTContext &Ctx, const BinOpInfo &Op) {
          (2 * Ctx.getTypeSize(RHSTy)) < PromotedSize;
 }
 
+// c2go: `&import` (or an unmanaged-extern import used as a value) decays to an
+// extern-import host function pointer (CC_C2GoExternImport — only Sema's import
+// address-of / value-decay path produces that CC, so it unambiguously names an
+// import). The HOST expects the RAW host address, not the GoABI0 dispatch
+// wrapper @<name> (a c2go-internal cgocall bridge), so emit the c2go_stub_<name>
+// trampoline (JMP c2go_dyn_<name>) — the same symbol the wrapper's cgocall slot
+// uses, bound by c2go-bind via //go:cgo_import_dynamic. Referencing the stub
+// here also drives the wrapper / WrapperInAsm emission
+// (EmitC2GoUnmanagedExternWrappers) even for an address-taken-but-never-called
+// import. \p PtrTy is the result function-pointer type; returns the bitcast stub
+// address, or null when \p E is not an extern-import function reference.
+static llvm::Value *tryEmitC2GoExternImportStubAddr(CodeGenFunction &CGF,
+                                                    const Expr *E,
+                                                    QualType PtrTy) {
+  if (!CGF.getLangOpts().C2GoMode)
+    return nullptr;
+  const auto *PT = PtrTy->getAs<PointerType>();
+  const auto *FT = PT ? PT->getPointeeType()->getAs<FunctionType>() : nullptr;
+  if (!FT || FT->getCallConv() != CC_C2GoExternImport)
+    return nullptr;
+  const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts());
+  const auto *FD = DRE ? dyn_cast<FunctionDecl>(DRE->getDecl()) : nullptr;
+  if (!FD)
+    return nullptr;
+  llvm::Function *Stub = cast<llvm::Function>(
+      CGF.CGM.getModule()
+          .getOrInsertFunction(
+              ("c2go_stub_" + FD->getName()).str(),
+              llvm::FunctionType::get(CGF.VoidTy, {}, /*isVarArg=*/false))
+          .getCallee());
+  return CGF.Builder.CreateBitCast(Stub, CGF.ConvertType(PtrTy));
+}
+
 class ScalarExprEmitter
   : public StmtVisitor<ScalarExprEmitter, Value*> {
   CodeGenFunction &CGF;
@@ -676,6 +709,9 @@ public:
     if (isa<MemberPointerType>(E->getType())) // never sugared
       return CGF.CGM.getMemberPointerConstant(E);
 
+    if (llvm::Value *Stub = tryEmitC2GoExternImportStubAddr(
+            CGF, E->getSubExpr(), E->getType()))
+      return Stub;
     return EmitLValue(E->getSubExpr()).getPointer(CGF);
   }
   Value *VisitUnaryDeref(const UnaryOperator *E) {
@@ -2807,6 +2843,9 @@ Value *ScalarExprEmitter::VisitCastExpr(CastExpr *CE) {
                 CGF.Int64Ty, GV, CharUnits::fromQuantity(8).getAsAlign());
             return CGF.Builder.CreateIntToPtr(V, CGF.ConvertType(CE->getType()));
           }
+    if (llvm::Value *Stub =
+            tryEmitC2GoExternImportStubAddr(CGF, E, CE->getType()))
+      return Stub;
     return EmitLValue(E).getPointer(CGF);
 
   case CK_NullToPointer:

@@ -943,15 +943,26 @@ bool CodeGenModule::useC2GoGoABI0CallingConv(const Decl *D) const {
 }
 
 bool CodeGenModule::shouldUseC2GoRegReturn(const Decl *D) const {
-  // c2go §2.0.2 (#281): only c2go-mode internal (non-boundary) functions get
-  // the register-return convention, and only at -O2+ (the -O0/-O1 path keeps
-  // ABI0 stack returns for debuggability). Boundary symbols (c2go_extern /
-  // c2go_linkname) are excluded by useC2GoGoABI0CC; indirect calls (D==null)
-  // default to internal — SQLite vtable/callback pointers target internal
-  // static functions.
-  if (!useC2GoGoABI0CC(D))
+  // c2go §2.0.2 (#281): the register-return convention is used at -O2+ only (the
+  // -O0/-O1 path keeps ABI0 stack returns for debuggability).
+  if (CodeGenOpts.OptimizationLevel < 2)
     return false;
-  return CodeGenOpts.OptimizationLevel >= 2;
+  // A scalar-signature unmanaged-extern import is reg-return: its synthesized .s
+  // dispatch wrapper is c2go-internal (only c2go calls it; the host boundary is
+  // the runtime.cgocall inside the wrapper), and a single scalar/pointer/float
+  // result returns in registers like any internal function. This is the only
+  // import form that reg-returns — record/variadic imports keep the ABI0 stack
+  // return (their wrapper uses an sret buffer or falls back to Go dispatch), so
+  // they are excluded by useC2GoGoABI0CC below.
+  if (const auto *FD = dyn_cast_or_null<FunctionDecl>(D))
+    if (clang::c2go::isC2GoScalarRegReturnImport(FD))
+      return true;
+  // Internal (non-boundary) functions reg-return; boundary symbols (c2go_extern
+  // / c2go_linkname) and non-scalar imports are excluded by useC2GoGoABI0CC.
+  // Indirect calls (D==null) default to internal — SQLite vtable/callback
+  // pointers target internal static functions. (CGCall additionally suppresses
+  // reg-return for an indirect call through a GoABI0-typed function pointer.)
+  return useC2GoGoABI0CC(D);
 }
 
 uint64_t CodeGenModule::computeC2GoArgSize(const FunctionDecl *FD,
@@ -4525,7 +4536,15 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
 
     llvm::Constant *C = GetAddrOfFunction(FD);
     auto *F = dyn_cast_or_null<llvm::Function>(C);
-    if (!F || !F->isDeclaration() || F->use_empty())
+    // Also emit the wrapper when only the import's `c2go_stub_<name>` address is
+    // taken (`&import` -> tryEmitC2GoExternImportStubAddr) while the wrapper
+    // symbol @<name> itself is otherwise unused: emitting the wrapper sets
+    // WrapperInAsm, so c2go-bind emits the stub + //go:cgo_import_dynamic glue
+    // that the &import value resolves to.
+    llvm::Function *ExistingStub =
+        getModule().getFunction(("c2go_stub_" + FD->getName()).str());
+    const bool StubUsed = ExistingStub && !ExistingStub->use_empty();
+    if (!F || !F->isDeclaration() || (F->use_empty() && !StubUsed))
       continue; // unreferenced: no wrapper needed (no .s dead weight)
 
     CanQual<FunctionProtoType> CanFT = FD->getType()
@@ -4592,12 +4611,19 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
     //     c2go-argsize from SetFunctionAttributes (it is fed by the manifest
     //     side-channel for the bodyless case); a DEFINED wrapper needs it so
     //     the frame emitter writes `TEXT ·f(SB), $N-M` and FUNCDATA $0 (the
-    //     args pointer map) for copystack. ResultInRegisters=false: boundary
-    //     symbols keep the ABI0 stack return.
+    //     args pointer map) for copystack.
+    //     A scalar-signature import wrapper is reg-return (its scalar result is
+    //     not on the ABI0 stack); shouldUseC2GoRegReturn drives BOTH the attr
+    //     and the ResultInRegisters argsize/mask, and the call site (CGCall)
+    //     uses the same predicate, so callee body and caller cannot disagree on
+    //     the result slot. Record/variadic import wrappers keep the stack return.
+    const bool RegRet = shouldUseC2GoRegReturn(FD);
+    if (RegRet)
+      F->addFnAttr("c2go-reg-return");
     F->addFnAttr("c2go-argsize",
-                 llvm::utostr(computeC2GoArgSize(FD, /*ResultInRegisters=*/false)));
+                 llvm::utostr(computeC2GoArgSize(FD, /*ResultInRegisters=*/RegRet)));
     std::string ArgPtrMask =
-        computeC2GoArgPtrMask(FD, /*ResultInRegisters=*/false);
+        computeC2GoArgPtrMask(FD, /*ResultInRegisters=*/RegRet);
     if (ArgPtrMask.empty())
       ArgPtrMask = "00";
     F->addFnAttr("c2go-argptrmask", ArgPtrMask);
@@ -5110,8 +5136,21 @@ void CodeGenModule::EmitC2GoCallbackConverters() {
     if (!CB || !CB->getTarget())
       continue;
     const FunctionDecl *T = CB->getTarget();
-    if (Seen.insert(T->getCanonicalDecl()).second)
-      Targets.push_back(T);
+    if (!Seen.insert(T->getCanonicalDecl()).second)
+      continue;
+    Targets.push_back(T);
+    // The converter re-enters the target by its asm symbol (·<name>) through an
+    // INDIRECT call (the destFn loaded from the cbFrame), so there is no direct
+    // @<name> IR use. An INTERNAL (static) target with a body would therefore
+    // have no uses and never be emitted, and the c2gobind trampoline's `·<name>`
+    // reference would fail to link. Force its definition. External targets are
+    // always emitted; a declared-only target (no body in this TU) is resolved
+    // elsewhere.
+    if (const FunctionDecl *Def = T->getDefinition()) {
+      auto *F = dyn_cast<llvm::Function>(GetAddrOfFunction(GlobalDecl(Def)));
+      if (F && F->isDeclaration())
+        EmitGlobalDefinition(GlobalDecl(Def), F);
+    }
   }
   if (Targets.empty())
     return;

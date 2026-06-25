@@ -15,6 +15,7 @@
 #include "UsedDeclVisitor.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/Mangle.h"
 #include "clang/AST/ASTDiagnostic.h"
 #include "clang/AST/ASTLambda.h"
 #include "clang/AST/ASTMutationListener.h"
@@ -514,6 +515,36 @@ SourceRange Sema::getExprRange(Expr *E) const {
 //  Standard Promotions and Conversions
 //===----------------------------------------------------------------------===//
 
+// c2go: an `unmanaged extern` import that is address-taken or decayed to a
+// VALUE carries the extern-import host-fp world (CC_C2GoExternImport) — a host
+// address that is NOT directly callable from c2go; it must go through
+// c2go_callout(...). The callee of a call decays via CallExprUnaryConversions (a
+// separate path that is intentionally left alone), so a direct named call keeps
+// the default CC_C2GoInternal and routes to the auto-wrapper. Mirrors
+// clang::c2go::isC2GoUnmanagedExternImport (CGC2GoManifestHelpers) — keep in sync.
+static QualType c2goAdjustImportFnPointee(Sema &S, const Expr *FnRef,
+                                          QualType FnTy) {
+  if (!S.getLangOpts().C2GoMode || FnTy.isNull() || !FnTy->isFunctionType())
+    return FnTy;
+  const auto *DRE = dyn_cast<DeclRefExpr>(FnRef->IgnoreParenImpCasts());
+  const auto *FD = DRE ? dyn_cast<FunctionDecl>(DRE->getDecl()) : nullptr;
+  if (!FD || !FD->hasAttr<C2GoUnmanagedAttr>() ||
+      FD->hasAttr<C2GoExternAttr>() || FD->hasAttr<C2GoLinknameAttr>() ||
+      FD->doesThisDeclarationHaveABody() || FD->isDefined())
+    return FnTy;
+  ASTContext &Ctx = S.Context;
+  if (const auto *FPT = FnTy->getAs<FunctionProtoType>()) {
+    FunctionProtoType::ExtProtoInfo EPI = FPT->getExtProtoInfo();
+    EPI.ExtInfo = EPI.ExtInfo.withCallingConv(CC_C2GoExternImport);
+    return Ctx.getFunctionType(FPT->getReturnType(), FPT->getParamTypes(), EPI);
+  }
+  if (const auto *FNPT = FnTy->getAs<FunctionNoProtoType>())
+    return Ctx.getFunctionNoProtoType(
+        FNPT->getReturnType(),
+        FNPT->getExtInfo().withCallingConv(CC_C2GoExternImport));
+  return FnTy;
+}
+
 /// DefaultFunctionArrayConversion (C99 6.3.2.1p3, C99 6.3.2.1p4).
 ExprResult Sema::DefaultFunctionArrayConversion(Expr *E, bool Diagnose) {
   // Handle any placeholder expressions which made it here.
@@ -532,8 +563,10 @@ ExprResult Sema::DefaultFunctionArrayConversion(Expr *E, bool Diagnose) {
         if (!checkAddressOfFunctionIsAvailable(FD, Diagnose, E->getExprLoc()))
           return ExprError();
 
-    E = ImpCastExprToType(E, Context.getPointerType(Ty),
-                          CK_FunctionToPointerDecay).get();
+    E = ImpCastExprToType(
+            E, Context.getPointerType(c2goAdjustImportFnPointee(*this, E, Ty)),
+            CK_FunctionToPointerDecay)
+            .get();
   } else if (Ty->isArrayType()) {
     // In C90 mode, arrays only promote to pointers if the array expression is
     // an lvalue.  The relevant legalese is C90 6.2.2.1p3: "an lvalue that has
@@ -7035,6 +7068,19 @@ ExprResult Sema::BuildResolvedCallExpr(Expr *Fn, NamedDecl *NDecl,
       if (!FuncT)
         return ExprError(Diag(LParenLoc, diag::err_typecheck_call_not_function)
                          << Fn->getType() << Fn->getSourceRange());
+      // c2go: an extern-import host fp (CC_C2GoExternImport) is NOT directly
+      // callable — it must go through c2go_callout(...). A direct *named*
+      // reference (`imp(x)` or `(&imp)(x)`, where NDecl is the FunctionDecl)
+      // routes to the auto-wrapper: a bare named call's callee even decays via
+      // CallExprUnaryConversions and keeps CC_C2GoInternal. Only an indirect call
+      // through an extern-import fp *value* (a variable, member, or expression —
+      // NDecl is not a FunctionDecl) is rejected here.
+      if (getLangOpts().C2GoMode &&
+          FuncT->getCallConv() == CC_C2GoExternImport &&
+          !dyn_cast_or_null<FunctionDecl>(NDecl))
+        return ExprError(Diag(Fn->getExprLoc(),
+                              diag::err_c2go_call_extern_import_fp)
+                         << Fn->getSourceRange());
     } else if (const BlockPointerType *BPT =
                    Fn->getType()->getAs<BlockPointerType>()) {
       FuncT = BPT->getPointeeType()->castAs<FunctionType>();
@@ -15284,7 +15330,8 @@ QualType Sema::CheckAddressOfOperand(ExprResult &OrigOp, SourceLocation OpLoc) {
 
   CheckAddressOfPackedMember(op);
 
-  return Context.getPointerType(op->getType());
+  return Context.getPointerType(
+      c2goAdjustImportFnPointee(*this, op, op->getType()));
 }
 
 static void RecordModifiableNonNullParam(Sema &S, const Expr *Exp) {
@@ -17099,7 +17146,106 @@ ExprResult Sema::ActOnC2GoCallback(Scope *S, SourceLocation BuiltinLoc,
       DeclarationNameInfo(Tramp->getDeclName(), BuiltinLoc));
   if (Ref.isInvalid())
     return ExprError();
-  return DefaultFunctionArrayConversion(Ref.get());
+  ExprResult Decayed = DefaultFunctionArrayConversion(Ref.get());
+  if (Decayed.isInvalid())
+    return ExprError();
+  // c2go (site 3): the result is a host-callable function pointer in the
+  // CC_C2GoExternImport host-fp world (the symmetric dual of c2go_callout's
+  // import wrapper) — type-compatible with a host import's callback parameter
+  // (site 2) and with &import, and INCOMPATIBLE with a plain c2go internal fp (a
+  // raw c2go function cannot be handed to the host without this trampoline).
+  // Re-type the decayed pointer; lowering is unchanged (front-end CC only).
+  QualType GoTy = FnTy;
+  if (const auto *FPT = FnTy->getAs<FunctionProtoType>()) {
+    FunctionProtoType::ExtProtoInfo EPI = FPT->getExtProtoInfo();
+    EPI.ExtInfo = EPI.ExtInfo.withCallingConv(CC_C2GoExternImport);
+    GoTy =
+        Context.getFunctionType(FPT->getReturnType(), FPT->getParamTypes(), EPI);
+  } else if (const auto *FNPT = FnTy->getAs<FunctionNoProtoType>()) {
+    GoTy = Context.getFunctionNoProtoType(
+        FNPT->getReturnType(),
+        FNPT->getExtInfo().withCallingConv(CC_C2GoExternImport));
+  }
+  QualType ResultPtrTy = Context.getPointerType(GoTy);
+  if (Context.hasSameType(ResultPtrTy, Decayed.get()->getType()))
+    return Decayed;
+  return ImpCastExprToType(Decayed.get(), ResultPtrTy, CK_BitCast);
+}
+
+ExprResult Sema::ActOnC2GoCallout(Scope *S, SourceLocation BuiltinLoc,
+                                  Expr *FnExpr, SourceLocation RParenLoc) {
+  if (!FnExpr)
+    return ExprError();
+
+  // The operand must NAME an unmanaged extern import (a host function), exactly
+  // as c2go_callback names a c2go function. Peel parens/implicit casts to the
+  // FunctionDecl; a runtime function-pointer value is not accepted. (Mirrors
+  // clang::c2go::isC2GoUnmanagedExternImport in CGC2GoManifestHelpers — keep in
+  // sync.)
+  Expr *E = FnExpr->IgnoreParenImpCasts();
+  auto *DRE = dyn_cast<DeclRefExpr>(E);
+  auto *FD = DRE ? dyn_cast<FunctionDecl>(DRE->getDecl()) : nullptr;
+  const bool IsImport =
+      FD && FD->hasAttr<C2GoUnmanagedAttr>() && !FD->hasAttr<C2GoExternAttr>() &&
+      !FD->hasAttr<C2GoLinknameAttr>() &&
+      !FD->doesThisDeclarationHaveABody() && !FD->isDefined();
+  if (!IsImport) {
+    Diag(FnExpr->getExprLoc(), diag::err_c2go_callout_not_extern_import);
+    return ExprError();
+  }
+
+  // Hand back a function pointer to the import's generated bridge wrapper (the
+  // symbol a direct `fn(...)` call already targets). Mark it referenced so the
+  // wrapper is emitted, then re-type the pointer to MATCH the wrapper's calling
+  // convention so an indirect call through the result agrees with it. A
+  // scalar-signature import has a reg-return wrapper (CC_C2GoInternal): the
+  // result is a plain `int(*)(...)` fp, assignable with no calling-convention
+  // cast. A record/variadic import keeps the ABI0 stack return (CC_GoABI0), and
+  // CGCall's pointer-CC rule keeps an indirect call through that GoABI0 fp
+  // stack-return. This is `&fn` re-cast from the not-directly-callable
+  // CC_C2GoExternImport host-address world to the internal-callable boundary
+  // world (the symmetric dual of c2go_callback). Keep this scalar test in sync
+  // with clang::c2go::isC2GoScalarRegReturnImport (CGC2GoManifestHelpers).
+  MarkFunctionReferenced(BuiltinLoc, FD);
+
+  auto isC2GoScalarWord = [](QualType T) {
+    return T->isVoidType() || T->isIntegralOrEnumerationType() ||
+           T->isPointerType() || T->isRealFloatingType();
+  };
+  QualType FnTy = FD->getType();
+  CallingConv TargetCC = CC_GoABI0;
+  QualType GoTy = FnTy;
+  if (const auto *FPT = FnTy->getAs<FunctionProtoType>()) {
+    bool AllScalar =
+        !FPT->isVariadic() && isC2GoScalarWord(FPT->getReturnType());
+    for (QualType P : FPT->getParamTypes())
+      AllScalar = AllScalar && isC2GoScalarWord(P);
+    if (AllScalar)
+      TargetCC = CC_C2GoInternal;
+    FunctionProtoType::ExtProtoInfo EPI = FPT->getExtProtoInfo();
+    EPI.ExtInfo = EPI.ExtInfo.withCallingConv(TargetCC);
+    GoTy =
+        Context.getFunctionType(FPT->getReturnType(), FPT->getParamTypes(), EPI);
+  } else if (const auto *FNPT = FnTy->getAs<FunctionNoProtoType>()) {
+    GoTy = Context.getFunctionNoProtoType(
+        FNPT->getReturnType(), FNPT->getExtInfo().withCallingConv(TargetCC));
+  }
+
+  ExprResult Ref = BuildDeclRefExpr(
+      FD, FnTy, VK_LValue, DeclarationNameInfo(FD->getDeclName(), BuiltinLoc));
+  if (Ref.isInvalid())
+    return ExprError();
+  // Decay to FD's own pointer type DIRECTLY (not via
+  // DefaultFunctionArrayConversion, which re-injects CC_C2GoExternImport for an
+  // import — that is the `&fn` host-address world), then reinterpret to the
+  // wrapper pointer type when the calling convention actually differs.
+  Expr *Ptr = ImpCastExprToType(Ref.get(), Context.getPointerType(FnTy),
+                                CK_FunctionToPointerDecay)
+                  .get();
+  QualType ResultPtrTy = Context.getPointerType(GoTy);
+  if (Context.hasSameType(ResultPtrTy, Ptr->getType()))
+    return Ptr;
+  return ImpCastExprToType(Ptr, ResultPtrTy, CK_BitCast);
 }
 
 ExprResult Sema::ActOnChooseExpr(SourceLocation BuiltinLoc,

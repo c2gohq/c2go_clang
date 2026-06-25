@@ -314,6 +314,7 @@ namespace clang {
     CC_RISCVVLSCall_65536, // __attribute__((riscv_vls_cc(65536)))
     CC_GoABI0,             // c2go-mode: Go runtime ABI0 (all args/results on stack)
     CC_C2GoInternal,       // c2go-mode: internal abi0 (stack args + register return)
+    CC_C2GoExternImport,   // c2go-mode: extern-import host fp (not directly callable; needs c2go_callout)
   };
 
   /// Checks whether the given calling convention supports variadic

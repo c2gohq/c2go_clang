@@ -780,6 +780,7 @@ public:
     case CC_X86RegCall:
     case CC_GoABI0:
     case CC_C2GoInternal:
+    case CC_C2GoExternImport:
       return CCCR_OK;
     case CC_DeviceKernel:
       return IsOpenCL ? CCCR_OK : CCCR_Warning;
@@ -923,6 +924,7 @@ public:
     // calling conventions. Mirror the generic X86_64TargetInfo above.
     case CC_GoABI0:
     case CC_C2GoInternal:
+    case CC_C2GoExternImport:
       return CCCR_OK;
     default:
       return CCCR_Warning;
