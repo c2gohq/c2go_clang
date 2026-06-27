@@ -3265,6 +3265,37 @@ LValue CodeGenFunction::EmitLoadOfPointerLValue(Address PtrAddr,
   return MakeAddrLValue(Addr, PtrTy->getPointeeType(), BaseInfo, TBAAInfo);
 }
 
+// c2go: lower a C thread-local (__thread / _Thread_local) variable access
+// to a goroutine-local storage lookup. C has no ELF/Plan-9 TLS lowering
+// under c2go; instead the variable's global is emitted NON-thread-local
+// (CodeGenModule gates setTLSMode in c2go mode) and used as a descriptor
+// holding the C initializer. __c2go_tls_addr(descriptor, size) returns
+// the calling goroutine's private copy — lazily allocated and initialised
+// from the descriptor bytes on first access — so the C "thread-local"
+// becomes goroutine-local. Emitted as a GoABI0 call to the c2go-libc
+// bridge (mirrors the runtime.cgocall emission in CodeGenModule).
+static llvm::Value *emitC2GoThreadLocalAddr(CodeGenFunction &CGF,
+                                            llvm::Value *Descriptor,
+                                            const VarDecl *VD) {
+  CodeGenModule &CGM = CGF.CGM;
+  uint64_t Size =
+      CGM.getContext().getTypeSizeInChars(VD->getType()).getQuantity();
+  llvm::Type *PtrTy = CGM.VoidPtrTy;
+  llvm::Type *SizeTy = CGM.IntPtrTy;
+  llvm::FunctionType *FnTy =
+      llvm::FunctionType::get(PtrTy, {PtrTy, SizeTy}, /*isVarArg=*/false);
+  llvm::FunctionCallee Callee = CGM.getModule().getOrInsertFunction(
+      "github.com/c2gohq/c2go_libc.__c2go_tls_addr", FnTy);
+  if (auto *F = llvm::dyn_cast<llvm::Function>(Callee.getCallee()))
+    F->setCallingConv(llvm::CallingConv::GoABI0);
+  llvm::Value *Args[] = {CGF.Builder.CreateBitCast(Descriptor, PtrTy),
+                         llvm::ConstantInt::get(SizeTy, Size)};
+  llvm::CallInst *Call =
+      CGF.Builder.CreateCall(FnTy, Callee.getCallee(), Args);
+  Call->setCallingConv(llvm::CallingConv::GoABI0);
+  return Call;
+}
+
 static LValue EmitGlobalVarDeclLValue(CodeGenFunction &CGF,
                                       const Expr *E, const VarDecl *VD) {
   QualType T = E->getType();
@@ -3375,8 +3406,17 @@ static LValue EmitGlobalVarDeclLValue(CodeGenFunction &CGF,
 
   llvm::Value *V = CGF.CGM.GetAddrOfGlobalVar(VD);
 
-  if (VD->getTLSKind() != VarDecl::TLS_None)
-    V = CGF.Builder.CreateThreadLocalAddress(V);
+  if (VD->getTLSKind() != VarDecl::TLS_None) {
+    if (CGF.getLangOpts().C2GoMode)
+      // c2go: a C thread-local has no ELF/Plan-9 TLS lowering. The global
+      // is emitted NON-thread-local (CodeGenModule gates setTLSMode) and
+      // serves as a descriptor holding the C initializer; __c2go_tls_addr
+      // returns the calling goroutine's private copy of it (lazily
+      // allocated + initialised from the descriptor on first access).
+      V = emitC2GoThreadLocalAddr(CGF, V, VD);
+    else
+      V = CGF.Builder.CreateThreadLocalAddress(V);
+  }
 
   llvm::Type *RealVarTy = CGF.getTypes().ConvertTypeForMem(VD->getType());
   CharUnits Alignment = CGF.getContext().getDeclAlign(VD);

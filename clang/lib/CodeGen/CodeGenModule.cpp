@@ -7385,7 +7385,10 @@ CodeGenModule::GetOrCreateLLVMGlobal(StringRef MangledName, llvm::Type *Ty,
 
     setLinkageForGV(GV, D);
 
-    if (D->getTLSKind()) {
+    // c2go: keep C thread-locals NON-thread-local — the global becomes a
+    // descriptor consumed by __c2go_tls_addr (EmitGlobalVarDeclLValue) for
+    // per-goroutine storage. A TLS relocation has no Plan 9 lowering.
+    if (D->getTLSKind() && !LangOpts.C2GoMode) {
       if (D->getTLSKind() == VarDecl::TLS_Dynamic)
         CXXThreadLocals.push_back(D);
       setTLSMode(GV, *D);
@@ -8074,7 +8077,12 @@ void CodeGenModule::EmitGlobalVarDefinition(const VarDecl *D,
 
   setNonAliasAttributes(D, GV);
 
-  if (D->getTLSKind() && !GV->isThreadLocal()) {
+  // c2go: a C thread-local has no ELF/Plan-9 TLS lowering. Leave the
+  // global NON-thread-local — it becomes a descriptor (holding the C
+  // initializer) that EmitGlobalVarDeclLValue passes to __c2go_tls_addr
+  // for per-goroutine storage. Emitting it thread-local would produce a
+  // TLS relocation the Plan 9 emitter cannot lower.
+  if (D->getTLSKind() && !GV->isThreadLocal() && !LangOpts.C2GoMode) {
     if (D->getTLSKind() == VarDecl::TLS_Dynamic)
       CXXThreadLocals.push_back(D);
     setTLSMode(GV, *D);
