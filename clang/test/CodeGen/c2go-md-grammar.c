@@ -166,7 +166,6 @@ int sum_internal(const char *fmt, ...) {
 // RAW-DAG: !"c2go.target-cpu"
 // RAW-DAG: !"c2go.target-features"
 // RAW-DAG: !"c2go.target_go_version"
-// RAW-DAG: !"c2go.pkgname"
 // RAW-DAG: !"c2go.pkgpath"
 //
 // --- NamedMDNode keys ---

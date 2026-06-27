@@ -1470,9 +1470,8 @@ void CodeGenModule::Release() {
   if (LangOpts.C2GoMode) {
     // Use Error (not Warning) so LTO IRMover refuses to merge a c2go
     // module with a non-c2go module instead of silently keeping
-    // inconsistent IR. Same reasoning for the pkgname/pkgpath/version
-    // tags below: they MUST agree across all linked modules of one
-    // c2go package.
+    // inconsistent IR. Same reasoning for the pkgpath/version tags below:
+    // they MUST agree across all linked modules of one c2go package.
     getModule().addModuleFlag(llvm::Module::Error, llvm::c2go::kGoabiModuleFlag,
                               uint32_t(1));
     // c2go #281/#283: publish the clang optimization level so AArch64
@@ -1497,24 +1496,21 @@ void CodeGenModule::Release() {
     getModule().addModuleFlag(llvm::Module::Error,
                               llvm::c2go::kTargetFeaturesFlag,
                               llvm::MDString::get(VMContext, FeaturesJoined));
-    // c2go (#134): the Plan 9 emitter needs the Go package path so it
-    // can rewrite typeinfo references to the standard Go `type:<pkg>.<X>`
-    // form (matching what Go compiler emits for `type X struct {...}`).
-    // We use the LAST path component as the Go package name (Go convention:
-    // import path's tail is the package name unless `package foo` declares
-    // otherwise).
+    // c2go WF2 (#319, C1): publish the full Go package PATH and the version
+    // range so c2go-lto can rebuild the manifest pkgpath / min_go_version /
+    // max_go_version fields without consulting the AST.
+    //
+    // The package NAME is deliberately NOT recorded: nothing in the .s /
+    // codegen path uses it. Same-package symbol refs use the `·name` short
+    // form (the package is supplied at Go-build time by `go tool asm -p
+    // <importpath>`), and typeinfo refs use the current-package `·_typeinfo_
+    // <X>` indirection var (#218). The `Plan9PackageName` typeinfo mechanism
+    // that once consumed the package name was removed in #239. The package
+    // name is purely c2go-bind's `package <name>` codegen concern (its
+    // -pkgname flag), not an artifact fact — so it does not belong here.
     StringRef PkgPath = LangOpts.C2GoPackagePath;
     if (PkgPath.empty())
       PkgPath = "main";
-    StringRef PkgName = PkgPath;
-    if (auto Pos = PkgPath.find_last_of('/'); Pos != StringRef::npos)
-      PkgName = PkgPath.drop_front(Pos + 1);
-    getModule().addModuleFlag(llvm::Module::Error, "c2go.pkgname",
-                              llvm::MDString::get(VMContext, PkgName));
-    // c2go WF2 (#319, C1): publish the full pkgpath and the version range so
-    // c2go-lto can rebuild the manifest pkgpath / min_go_version /
-    // max_go_version fields without consulting the AST. pkgpath differs from
-    // pkgname (e.g. "foo/bar" vs "bar"); both are needed.
     getModule().addModuleFlag(llvm::Module::Error, "c2go.pkgpath",
                               llvm::MDString::get(VMContext, PkgPath));
     StringRef VerRange = LangOpts.C2GoTargetGoVersion;

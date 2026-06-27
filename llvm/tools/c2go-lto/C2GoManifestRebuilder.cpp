@@ -180,8 +180,6 @@ rebuildManifestFromIR(Module &Composite, bool Build,
   };
   std::string PkgPath = getStringFlag("c2go.pkgpath");
   if (PkgPath.empty())
-    PkgPath = getStringFlag("c2go.pkgname"); // fallback
-  if (PkgPath.empty())
     PkgPath = "main";
   Root["pkgpath"] = PkgPath;
 
