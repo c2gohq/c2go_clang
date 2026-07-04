@@ -195,6 +195,14 @@ LLVM_ABI extern char &ShrinkWrapID;
 /// the definition's live range.
 LLVM_ABI extern char &LiveRangeShrinkID;
 
+/// C2GoFrameAddrRemat pass. In c2go goabi modules, rewrite uses of
+/// materialized frame addresses so the value never lives across a call
+/// (copystack cannot relocate an anonymous spill of a frame address).
+LLVM_ABI extern char &C2GoFrameAddrRematID;
+
+/// createC2GoFrameAddrRematPass - see C2GoFrameAddrRematID.
+LLVM_ABI FunctionPass *createC2GoFrameAddrRematPass();
+
 /// Greedy register allocator.
 LLVM_ABI extern char &RAGreedyLegacyID;
 

@@ -70,6 +70,7 @@ LLVM_ABI void initializeBranchProbabilityInfoWrapperPassPass(PassRegistry &);
 LLVM_ABI void initializeBranchRelaxationLegacyPass(PassRegistry &);
 LLVM_ABI void initializeBreakCriticalEdgesPass(PassRegistry &);
 LLVM_ABI void initializeBreakFalseDepsPass(PassRegistry &);
+LLVM_ABI void initializeC2GoFrameAddrRematPass(PassRegistry &);
 LLVM_ABI void initializeCanonicalizeFreezeInLoopsPass(PassRegistry &);
 LLVM_ABI void initializeCFGSimplifyPassPass(PassRegistry &);
 LLVM_ABI void initializeCFGuardPass(PassRegistry &);

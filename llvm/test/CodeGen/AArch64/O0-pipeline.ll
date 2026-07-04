@@ -54,6 +54,7 @@
 ; CHECK-NEXT:       AArch64 Instruction Selection
 ; CHECK-NEXT:       Finalize ISel and expand pseudo-instructions
 ; CHECK-NEXT:       Local Stack Slot Allocation
+; CHECK-NEXT:       C2Go Frame Address Rematerialization
 ; CHECK-NEXT:       Bundle Machine CFG Edges
 ; CHECK-NEXT:       Lazy Machine Block Frequency Analysis
 ; CHECK-NEXT:       Machine Optimization Remark Emitter
@@ -89,6 +90,7 @@
 ; CHECK-NEXT:       Machine Optimization Remark Emitter
 ; CHECK-NEXT:       Stack Frame Layout Analysis
 ; CHECK-NEXT:       Unpack machine instruction bundles
+; CHECK-NEXT:       AArch64 c2go GC #330 M5: per-PC pointer-slot liveness
 ; CHECK-NEXT:       Lazy Machine Block Frequency Analysis
 ; CHECK-NEXT:       Machine Optimization Remark Emitter
 ; CHECK-NEXT:       AArch64 Assembly Printer

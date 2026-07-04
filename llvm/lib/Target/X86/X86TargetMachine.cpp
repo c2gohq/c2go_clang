@@ -583,6 +583,10 @@ bool X86PassConfig::addPreISel() {
 }
 
 void X86PassConfig::addPreRegAlloc() {
+  // c2go #585: mirror of the AArch64 hook — see
+  // llvm/lib/CodeGen/C2GoFrameAddrRemat.cpp. Self-gates on c2go.goabi.
+  addPass(createC2GoFrameAddrRematPass());
+
   if (getOptLevel() != CodeGenOptLevel::None) {
     addPass(&LiveRangeShrinkID);
     addPass(createX86FixupSetCCLegacyPass());

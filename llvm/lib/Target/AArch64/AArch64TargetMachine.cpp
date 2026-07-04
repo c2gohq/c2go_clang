@@ -859,6 +859,12 @@ bool AArch64PassConfig::addILPOpts() {
 }
 
 void AArch64PassConfig::addPreRegAlloc() {
+  // c2go #585: rewrite materialized frame addresses to per-use recomputation
+  // so no RA (FastRA spills everything; greedy may spill under pressure) ever
+  // parks one in an anonymous slot copystack cannot relocate. Self-gates on
+  // the c2go.goabi module flag; runs before the fast/greedy pipeline split.
+  addPass(createC2GoFrameAddrRematPass());
+
   if (TM->getOptLevel() == CodeGenOptLevel::None && EnableNewSMEABILowering)
     addPass(createMachineSMEABIPass(CodeGenOptLevel::None));
 

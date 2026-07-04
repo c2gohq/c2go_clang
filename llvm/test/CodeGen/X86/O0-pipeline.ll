@@ -42,6 +42,7 @@
 ; CHECK-NEXT:       Argument Stack Rebase
 ; CHECK-NEXT:       Finalize ISel and expand pseudo-instructions
 ; CHECK-NEXT:       Local Stack Slot Allocation
+; CHECK-NEXT:       C2Go Frame Address Rematerialization
 ; CHECK-NEXT:       X86 Suppress APX features for relocation
 ; CHECK-NEXT:       X86 speculative load hardening
 ; CHECK-NEXT:       X86 EFLAGS copy lowering
@@ -85,6 +86,8 @@
 ; CHECK-NEXT:       X86 Load Value Injection (LVI) Ret-Hardening
 ; CHECK-NEXT:       Pseudo Probe Inserter
 ; CHECK-NEXT:       Unpack machine instruction bundles
+; CHECK-NEXT:       X86 c2go staged-meta producer (Plan 9 TEXT directive forwarder)
+; CHECK-NEXT:       X86 c2go GC #330 M5: per-PC pointer-slot liveness
 ; CHECK-NEXT:       Lazy Machine Block Frequency Analysis
 ; CHECK-NEXT:       Machine Optimization Remark Emitter
 ; CHECK-NEXT:       X86 Assembly Printer

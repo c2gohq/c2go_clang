@@ -69,6 +69,9 @@
 ; CHECK-NEXT:       Interleaved Access Pass
 ; CHECK-NEXT:       X86 Partial Reduction
 ; CHECK-NEXT:       Expand indirectbr instructions
+; CHECK-NEXT:     X86 c2go leaf c2go-ABIInternal optimization
+; CHECK-NEXT:     FunctionPass Manager
+; CHECK-NEXT:       Dominator Tree Construction
 ; CHECK-NEXT:       Natural Loop Information
 ; CHECK-NEXT:       CodeGen Prepare
 ; CHECK-NEXT:       Dominator Tree Construction
@@ -121,6 +124,7 @@
 ; CHECK-NEXT:       Machine code sinking
 ; CHECK-NEXT:       Peephole Optimizations
 ; CHECK-NEXT:       Remove dead machine instructions
+; CHECK-NEXT:       C2Go Frame Address Rematerialization
 ; CHECK-NEXT:       Live Range Shrink
 ; CHECK-NEXT:       X86 Fixup SetCC
 ; CHECK-NEXT:       Lazy Machine Block Frequency Analysis
@@ -225,14 +229,19 @@
 ; CHECK-NEXT:       X86 Load Value Injection (LVI) Ret-Hardening
 ; CHECK-NEXT:       Pseudo Probe Inserter
 ; CHECK-NEXT:       Unpack machine instruction bundles
+; CHECK-NEXT:       X86 c2go staged-meta producer (Plan 9 TEXT directive forwarder)
+; CHECK-NEXT:       X86 c2go GC #330 M5: per-PC pointer-slot liveness
 ; CHECK-NEXT:       Lazy Machine Block Frequency Analysis
 ; CHECK-NEXT:       Machine Optimization Remark Emitter
 ; CHECK-NEXT:       X86 Assembly Printer
 ; CHECK-NEXT:       Free MachineFunction
 
-; We should only have one function pass manager.
+; We should only have the function pass managers we expect.
 ; In the past, module passes have accidentally been added into the middle of
 ; the codegen pipeline, implicitly creating new function pass managers.
+; The X86 c2go leaf-ABI module pass deliberately sits mid-pipeline and splits
+; the codegen FPM in two, so exactly two are expected.
+; FPM: FunctionPass Manager
 ; FPM: FunctionPass Manager
 ; FPM-NOT: FunctionPass Manager
 

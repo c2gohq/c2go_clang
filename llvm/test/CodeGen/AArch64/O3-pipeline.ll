@@ -96,6 +96,9 @@
 ; CHECK-NEXT:       Interleaved Load Combine Pass
 ; CHECK-NEXT:       Dominator Tree Construction
 ; CHECK-NEXT:       Interleaved Access Pass
+; CHECK-NEXT:     AArch64 c2go leaf c2go-ABIInternal optimization
+; CHECK-NEXT:     FunctionPass Manager
+; CHECK-NEXT:       Dominator Tree Construction
 ; CHECK-NEXT:       Natural Loop Information
 ; CHECK-NEXT:       Type Promotion
 ; CHECK-NEXT:       CodeGen Prepare
@@ -163,6 +166,7 @@
 ; CHECK-NEXT:       Peephole Optimizations
 ; CHECK-NEXT:       Remove dead machine instructions
 ; CHECK-NEXT:       AArch64 MI Peephole Optimization pass
+; CHECK-NEXT:       C2Go Frame Address Rematerialization
 ; CHECK-NEXT:       AArch64 Dead register definitions
 ; CHECK-NEXT:       Detect Dead Lanes
 ; CHECK-NEXT:       Init Undef Pass
@@ -248,6 +252,7 @@
 ; CHECK-NEXT:       Machine Optimization Remark Emitter
 ; CHECK-NEXT:       Stack Frame Layout Analysis
 ; CHECK-NEXT:       Unpack machine instruction bundles
+; CHECK-NEXT:       AArch64 c2go GC #330 M5: per-PC pointer-slot liveness
 ; CHECK-NEXT:       Lazy Machine Block Frequency Analysis
 ; CHECK-NEXT:       Machine Optimization Remark Emitter
 ; CHECK-NEXT:       AArch64 Assembly Printer
