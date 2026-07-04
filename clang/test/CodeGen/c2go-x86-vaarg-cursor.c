@@ -33,9 +33,16 @@ static long g;
 // the referencing non-static test_entry. The CHECK blocks below follow IR
 // emission order (test_entry, then my_config), not source order.
 
-// Caller side packs one argptr slot per vararg (locked here so caller/callee
-// stay in lockstep).
+// Caller side packs one argptr slot per vararg PLUS one trailing sentinel
+// slot (locked here so caller/callee stay in lockstep). #588: the callee's
+// cursor ends one-past-the-end of the consumed arguments and lives in a
+// GC-marked va_list slot across safepoints; the sentinel keeps that final
+// cursor value inside the pack object so Go's precise GC never resolves it as
+// a next-object reference. 2 varargs -> [3 x ptr], sentinel stored null.
 // CHECK-LABEL: define{{.*}} goabi0cc i64 @test_entry()
+// CHECK: %c2go.va.argptrs = alloca [3 x ptr]
+// CHECK: %c2go.va.sentinel = getelementptr inbounds [3 x ptr], ptr %c2go.va.argptrs, i64 0, i64 2
+// CHECK-NEXT: store ptr null, ptr %c2go.va.sentinel
 // CHECK: call goabi0cc void @my_config(i32 noundef 4, ptr noundef %c2go.va.argptrs)
 
 // Callee side: va_start binds the synthetic `void** __c2go_va` cursor

@@ -4477,12 +4477,24 @@ void CodeGenFunction::EmitC2GoVarArgPack(CallArgList &Args, unsigned NumFixed) {
   llvm::Type *PtrTy = llvm::PointerType::getUnqual(getLLVMContext());
   CharUnits PtrAlign = getPointerAlign();
 
-  // The `void* argptrs[N]` array. A fixed-size entry-block alloca (folded into
-  // the frame; no SP movement). It is a pointer array → it must be GC-scanned
-  // so that any managed pointer passed as a vararg stays reachable and is
-  // relocated by copystack. Tag it `!c2go.ptr.managed` like other managed
-  // locals so the §B3 stackmap machinery includes it in gclocals.
-  llvm::ArrayType *ArrTy = llvm::ArrayType::get(PtrTy, NumVarArgs);
+  // The `void* argptrs[N+1]` array. A fixed-size entry-block alloca (folded
+  // into the frame; no SP movement). It is a pointer array → it must be
+  // GC-scanned so that any managed pointer passed as a vararg stays reachable
+  // and is relocated by copystack. Tag it `!c2go.ptr.managed` like other
+  // managed locals so the §B3 stackmap machinery includes it in gclocals.
+  //
+  // #588: the pack carries ONE TRAILING SENTINEL SLOT beyond the last vararg.
+  // The callee's va cursor ends one-past-the-end of the consumed arguments
+  // (C's canonical end-pointer idiom) and lives in a GC-marked va_list slot
+  // across safepoints. Go's precise GC resolves a past-the-end pointer as a
+  // reference to the NEXT object ("marked free object" fatal — see Go's own
+  // runtime/mgcsweep.go reportZombies commentary), so the pack ABI requires
+  // every argptrs allocation to be at least argc+1 slots: the cursor's final
+  // value then still points INSIDE the pack object. This is an ABI contract:
+  // Go-side callers hand-building a pack for a go_sig `argptrs` tail parameter
+  // must equally over-allocate (a heap-allocated pack is where the crash
+  // actually manifests; this stack pack is kept consistent).
+  llvm::ArrayType *ArrTy = llvm::ArrayType::get(PtrTy, NumVarArgs + 1);
   RawAddress ArgPtrs =
       CreateTempAlloca(ArrTy, PtrAlign, "c2go.va.argptrs");
   if (auto *AI = dyn_cast<llvm::AllocaInst>(
@@ -4523,6 +4535,13 @@ void CodeGenFunction::EmitC2GoVarArgPack(CallArgList &Args, unsigned NumFixed) {
     Builder.CreateStore(Storage.getPointer(),
                         Address(Slot, PtrTy, PtrAlign));
   }
+
+  // #588: null-initialize the sentinel slot — the pack is GC-scanned, so it
+  // must never hold frame garbage.
+  llvm::Value *Sentinel = Builder.CreateConstInBoundsGEP2_64(
+      ArrTy, ArgPtrs.getPointer(), 0, NumVarArgs, "c2go.va.sentinel");
+  Builder.CreateStore(llvm::Constant::getNullValue(PtrTy),
+                      Address(Sentinel, PtrTy, PtrAlign));
 
   // Drop the spread varargs and append the single void** array base pointer.
   Args.truncate(NumFixed);
