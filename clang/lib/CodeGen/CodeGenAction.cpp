@@ -448,6 +448,16 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
                        ? "main"
                        : LangOpts.C2GoPackagePath;
 
+  // c2go version anchoring (docs/c2go/versioning.md): stamp the toolchain's
+  // epoch constants into every manifest (carried verbatim into WF2 bitcode).
+  // c2go-bind asserts the consumer's c2go_abi_epoch lies in the linked
+  // c2go-libc's accepted [C2GoABIEpochMin, C2GoABIEpochMax] range; go_contract_
+  // epoch records the Go-internal contract generation this artifact was emitted
+  // for. Bump c2go_abi_epoch ONLY on an intentional c2go ABI break; keep both
+  // in sync with c2go-libc's version consts and c2go-bind's defaults.
+  Root["c2go_abi_epoch"] = 1;
+  Root["go_contract_epoch"] = 1;
+
   // Parse "<lo>-<hi>" from -fc2go-target-go-version (default "1.22-1.25").
   StringRef VerRange = LangOpts.C2GoTargetGoVersion;
   if (VerRange.empty()) VerRange = "1.22-1.25";
