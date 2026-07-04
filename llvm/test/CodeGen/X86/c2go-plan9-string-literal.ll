@@ -52,9 +52,11 @@ declare goabi0cc void @sink(ptr)
 
 ; LEA64r path: address-of a string literal flows through printPlan9MemRef
 ; with Disp.isExpr() and isLocalLabelName(Sym) == true. Pre-fix emitted
-; LEAQ _L_str_0, DI (no SB); the fix emits LEAQ _L_str_0(SB), DI.
+; LEAQ _L_str_0, DI (no SB); the fix emits LEAQ _L_str_0<>(SB), DI (#586 added
+; the `<>` file-local scope so the private literal cannot collide across
+; separately compiled c2go packages).
 ; CHECK-LABEL: TEXT {{[^[:space:]]+}}use_str0(SB)
-; CHECK:       LEAQ _L_str_0(SB), {{[A-Z]+}}
+; CHECK:       LEAQ _L_str_0<>(SB), {{[A-Z]+}}
 ; CHECK:       CALL {{[^[:space:]]+}}sink(SB)
 ; CHECK:       RET
 define internal goabi0cc void @use_str0() #0 {
@@ -67,7 +69,7 @@ define internal goabi0cc void @use_str0() #0 {
 ; a constant immediate; the resulting MOV64rm carries a symbolic disp
 ; that flows through the same printPlan9MemRef local-label branch.
 ; CHECK-LABEL: TEXT {{[^[:space:]]+}}use_str2_load(SB)
-; CHECK:       MOVQ _L_str_2(SB), {{[A-Z]+}}
+; CHECK:       MOVQ _L_str_2<>(SB), {{[A-Z]+}}
 ; CHECK:       RET
 define internal goabi0cc i64 @use_str2_load() #0 {
   %v = load volatile i64, ptr @.str.2, align 1

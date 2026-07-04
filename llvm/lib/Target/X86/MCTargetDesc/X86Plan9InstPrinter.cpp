@@ -198,6 +198,11 @@ static std::string goSymToPlan9(StringRef Name) {
       Name.starts_with("L") || Name.starts_with(".L")) {
     std::string Out = Name.str();
     sanitiseToIdent(Out);
+    // #586: a local symbol reaching goSymToPlan9 is a private DATA symbol
+    // (string literal / constant pool); the streamer emits it file-local
+    // (`name<>(SB)`) to avoid cross-package link collisions, so the reference
+    // must carry the same `<>` scope.
+    Out += "<>";
     return Out;
   }
 
@@ -276,6 +281,15 @@ static std::string sanitizeLocalLabel(StringRef Name) {
           (C >= '0' && C <= '9') || C == '_'))
       C = '_';
   return Out;
+}
+
+// #586: a local symbol used as an (SB) DATA reference (string literal / constant
+// pool) must carry the file-local `<>` scope the streamer emits on its
+// definition (`name<>(SB)`), or two separately-compiled c2go packages collide
+// on a plain global `_L_str` at Go link time. Branch targets (JMP/Jcc, no
+// `(SB)`) keep using sanitizeLocalLabel directly.
+static std::string sanitizeLocalDataRef(StringRef Name) {
+  return sanitizeLocalLabel(Name) + "<>";
 }
 
 // Lookup a Plan 9 register name from the AT&T-style enum-derived name.
@@ -379,7 +393,7 @@ static void printPlan9MemRef(raw_ostream &OS, const MCInst *MI,
       // AArch64Plan9InstPrinter.cpp:580 always emits `goSymToPlan9 + Off
       // + (SB)`), reified per CLAUDE.md §3 cross-arch symmetry.
       if (isLocalLabelName(Sym))
-        OS << sanitizeLocalLabel(Sym);
+        OS << sanitizeLocalDataRef(Sym); // #586: file-local (SB) data ref
       else
         OS << goSymToPlan9(Sym);
       if (Off > 0) OS << "+" << Off;
@@ -867,7 +881,7 @@ bool X86Plan9InstPrinter::tryPrintGOTPCRELLoadAsLEA(const MCInst *MI,
   if (Sym.empty()) return false;
   // Emit `LEAQ ·sym(SB), Rd` — immediate LEA of the symbol's address.
   // The follow-up MOV<W>rm reads from `0(Rd)` with the now-correct base.
-  std::string Plan9 = isLocalLabelName(Sym) ? sanitizeLocalLabel(Sym)
+  std::string Plan9 = isLocalLabelName(Sym) ? sanitizeLocalDataRef(Sym)
                                             : goSymToPlan9(Sym);
   O << "\tLEAQ " << Plan9 << "(SB), ";
   printPlan9Reg(O, MI->getOperand(0).getReg(), MRI);
@@ -1539,7 +1553,7 @@ void X86Plan9InstPrinter::printOperand(const MCInst *MI, unsigned OpNo,
     StringRef Sym = getReferencedSymbolName(Op.getExpr());
     int64_t Off = getReferencedSymbolOffset(Op.getExpr());
     if (!Sym.empty()) {
-      if (isLocalLabelName(Sym)) O << sanitizeLocalLabel(Sym);
+      if (isLocalLabelName(Sym)) O << sanitizeLocalDataRef(Sym); // #586
       else                       O << goSymToPlan9(Sym);
       if (Off > 0) O << "+" << Off;
       else if (Off < 0) O << Off;

@@ -83,6 +83,24 @@ MCPlan9AsmStreamer::~MCPlan9AsmStreamer() = default;
 // of the file alongside its callers.
 static bool isC2GoGoOwnedGlobal(const StringSet<> &Set, StringRef Plan9);
 
+// #586: clang emits anonymous string literals (and constant pools / jump
+// tables) as private/local globals — `.L.str`, `l_.str`, `.LCPI...`. In Plan 9
+// these MUST be file-local (`name<>(SB)`) or they collide across separately
+// compiled c2go packages at Go link time: two packages each define a plain
+// global `_L_str`, and the Go linker rejects the duplicate. The name pattern is
+// the same one symbolToPlan9 / goSymToPlan9 use to detect local labels; when it
+// matches, append `<>` at the DATA definition AND every (SB) reference site
+// (the streamer's data-symbol open + data-to-data ref, and the InstPrinters'
+// goSymToPlan9). Branch/CFI labels never reach those sites (they go through
+// formatBranchTarget / text-label emission), so only real private data symbols
+// are scoped. Keep this predicate in lockstep with the local-label detection in
+// symbolToPlan9 / goSymToPlan9.
+static bool isPlan9LocalDataSym(StringRef Name) {
+  return Name.starts_with("L") || Name.starts_with(".L") ||
+         (Name.size() >= 2 && Name[0] == 'l' &&
+          (Name[1] == '_' || (Name[1] >= 'A' && Name[1] <= 'Z')));
+}
+
 namespace {
 // c2go #376: 6 thread_local side-channels for function metadata
 // (g_C2GoMetadata, g_C2GoArgPtrMask, g_C2GoLocalsAggMask,
@@ -580,6 +598,8 @@ void MCPlan9AsmStreamer::emitC2GoDataLabel(StringRef Name, StringRef Mangled) {
     return;
   }
   CurrentDataSym = symbolToPlan9(Name);
+  if (isPlan9LocalDataSym(Name))
+    CurrentDataSym += "<>"; // #586: file-local scope for private data symbols
   CurrentDataOffset = 0;
   CurrentDataSize = 0;
 }
@@ -779,6 +799,8 @@ void MCPlan9AsmStreamer::emitDataSymDirective(const MCExpr *Expr,
   // symbol from the offset lets us emit the correct `$·sym+N(SB)` form.
   if (const MCSymbol *Sym = referencedSymbol(Expr)) {
     std::string Plan9 = symbolToPlan9(Sym->getName());
+    if (isPlan9LocalDataSym(Sym->getName()))
+      Plan9 += "<>"; // #586: match the file-local data-symbol definition
     int64_t Off = referencedOffset(Expr);
     *OS << "DATA " << CurrentDataSym << "+" << CurrentDataOffset << "(SB)/"
         << Size << ", $" << Plan9;

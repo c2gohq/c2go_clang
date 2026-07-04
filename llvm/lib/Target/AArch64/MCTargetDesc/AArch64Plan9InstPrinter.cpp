@@ -180,6 +180,12 @@ static std::string goSymToPlan9(StringRef Name) {
       Name.starts_with("L") || Name.starts_with(".L")) {
     std::string Out = Name.str();
     sanitiseToIdent(Out);
+    // #586: goSymToPlan9 only ever renders (SB) operands (data / functions);
+    // branch/CFI labels go through formatBranchTarget. A local symbol reaching
+    // here is a private DATA symbol (string literal / constant pool), which the
+    // streamer emits file-local (`name<>(SB)`) to avoid cross-package link
+    // collisions — the reference must carry the same `<>` scope.
+    Out += "<>";
     return Out;
   }
 
