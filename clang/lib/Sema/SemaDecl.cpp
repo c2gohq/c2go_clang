@@ -3404,6 +3404,24 @@ void Sema::mergeDeclAttributes(NamedDecl *New, Decl *Old,
   if (mergeAlignedAttrs(*this, New, Old))
     foundAny = true;
 
+  // c2go: a definition that adds c2go_extern while inheriting a c2go_linkname
+  // (its header declaration named the Go link target and implied the ABI0 CC)
+  // is exported under c2go_extern's OWN symbol. c2go_linkname installs an asm
+  // label renaming the symbol to the Go target's mangled form; the generic
+  // InheritableAttr merge above just copied it onto this definition. Drop it so
+  // the emitted Plan 9 TEXT symbol is the natural ·<name> that the manifest and
+  // the generated .go binding reference — otherwise the .s symbol and the
+  // //go:linkname target diverge and the program fails to link. Only fires for
+  // the c2go_linkname+c2go_extern combination (import-direction linkname
+  // functions are never defined in C and never carry c2go_extern), so it is a
+  // no-op for all other code.
+  if (getLangOpts().C2GoMode && isa<FunctionDecl>(New) &&
+      New->hasAttr<C2GoExternAttr>() &&
+      (New->hasAttr<C2GoLinknameAttr>() || Old->hasAttr<C2GoLinknameAttr>())) {
+    New->dropAttr<AsmLabelAttr>();
+    Old->dropAttr<AsmLabelAttr>();
+  }
+
   if (!foundAny) New->dropAttrs();
 }
 

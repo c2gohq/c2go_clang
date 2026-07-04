@@ -894,12 +894,13 @@ bool CodeGenModule::usesC2GoVoidPtrVararg(const FunctionType *FnType,
   const auto *FPT = dyn_cast_or_null<FunctionProtoType>(FnType);
   if (!FPT || !FPT->isVariadic())
     return false;
-  // GoABI0 boundary symbols (c2go_extern / c2go_linkname) and unmanaged-extern
-  // imports keep the platform ABI; everything else internal uses the void**
-  // tagged argument pack.
-  if (D && (D->hasAttr<C2GoExternAttr>() || D->hasAttr<C2GoLinknameAttr>() ||
-            clang::c2go::isC2GoUnmanagedExternImport(
-                dyn_cast_or_null<FunctionDecl>(D))))
+  // A true unmanaged-extern *import* (real host libc) keeps the platform ABI —
+  // the cgocall bridge converts to the host va_list at the boundary. Everything
+  // else uses the void** tagged argument pack: internal functions AND our own
+  // c2go_extern / c2go_linkname variadic implementations (open / printf / ...).
+  // (Kept in lockstep with isC2GoABI0Function in CGCall.cpp.)
+  if (clang::c2go::isC2GoUnmanagedExternImport(
+          dyn_cast_or_null<FunctionDecl>(D)))
     return false;
   return true;
 }
@@ -2905,6 +2906,14 @@ void CodeGenModule::SetLLVMFunctionAttributes(GlobalDecl GD,
     // CC predicate above.
     if (useC2GoGoABI0CC(GD.getDecl())) {
       if (const auto *FD = dyn_cast_or_null<FunctionDecl>(GD.getDecl())) {
+        // c2go §2.3: a void** tagged-argument-pack variadic function must stay
+        // on the GoABI0 stack — its argsize reserves the trailing void** slot,
+        // and va_arg walks the packed array as a stack object — so it is NOT a
+        // leaf register-ABI candidate. Tag it so the leaf CC-flip pass excludes
+        // it (C2GoLeafEligibility), mirroring the #495 wrapper's variadic skip:
+        // no variadic function ever gets register argument passing.
+        if (usesC2GoVoidPtrVararg(FD->getType()->getAs<FunctionType>(), FD))
+          F->addFnAttr("c2go-void-vararg");
         // c2go §2.0.2 (#281): internal functions return results in registers
         // (ABIInternal) ONLY at -O2+; at -O0/-O1 they keep ABI0 stack returns
         // for debuggability (argsize includes the result slot). The decision
@@ -2965,10 +2974,19 @@ void CodeGenModule::SetLLVMFunctionAttributes(GlobalDecl GD,
       // argsize is fed by the manifest side-channel, emitC2GoPrologue passes
       // ArgSize=-1 to preserve it).
       //
-      // c2go_linkname is a DECLARATION referencing a symbol implemented
-      // elsewhere — no function body to scan here, and the implementing side
-      // publishes the bitmap. Intentionally unchanged.
-      if (FD->hasAttr<C2GoExternAttr>() && !FD->hasAttr<C2GoLinknameAttr>() &&
+      // The discriminator is whether THIS declaration has a body, not the
+      // presence of c2go_linkname: a bodyless c2go_linkname is an IMPORT
+      // reference to a symbol implemented elsewhere (the implementing side
+      // publishes the bitmap — excluded by doesThisDeclarationHaveABody()),
+      // while a c2go_extern function that ALSO carries c2go_linkname AND has a
+      // body is an EXPORT implemented right here (header declares
+      // c2go_linkname naming the Go symbol + the ABI0 CC; the definition is
+      // c2go_extern). That export's incoming managed-pointer args must still be
+      // scanned, so it needs its args pointer mask published just like a plain
+      // c2go_extern definition. Gating on !C2GoLinknameAttr wrongly dropped the
+      // mask for it, leaving an all-zero FUNCDATA $0 (copystack/GC would miss
+      // the pointer args).
+      if (FD->hasAttr<C2GoExternAttr>() &&
           FD->doesThisDeclarationHaveABody()) {
         std::string ArgPtrMask =
             computeC2GoArgPtrMask(FD, /*ResultInRegisters=*/false);

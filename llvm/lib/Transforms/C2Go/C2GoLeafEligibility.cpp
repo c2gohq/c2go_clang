@@ -340,6 +340,17 @@ llvm::c2go::analyzeC2GoLeafEligibility(
       continue;
     }
 
+    // (a.5) A c2go void** tagged-argument-pack variadic function must keep
+    // GoABI0 stack passing: its argsize reserves the trailing void** slot and
+    // va_arg walks the packed array as a stack object, so the private register
+    // ABI cannot apply. clang tags it with c2go-void-vararg (the #495 wrapper
+    // skips variadic functions likewise); never register-flip one.
+    if (F.hasFnAttribute("c2go-void-vararg")) {
+      E.IneligibleReason = "c2go void** variadic (keeps GoABI0 stack passing)";
+      Result[&F] = E;
+      continue;
+    }
+
     // (b) Internal linkage only (C `static`). A non-internal function may have
     // cross-TU callers that, lacking out-of-band ABI metadata, would marshal
     // via the default ABI0 -> mismatch. (Cross-TU near-leaf is deferred to the

@@ -701,21 +701,31 @@ CodeGenTypes::arrangeMSCtorClosure(const CXXConstructorDecl *CD,
 ///     Go ABI0 stack frame, mirroring the IR-level CC override at the call
 ///     site (CommonEmitCall) and definition (SetLLVMFunctionAttributes).
 ///
-/// Internal *variadic* functions are excluded: they go through the c2go
-/// `void**` tagged-argument-pack path (arrangeLLVMFunctionInfo), which
-/// rewrites them to a non-variadic IR signature and requires !isGoABI0 to
-/// fire. The CC override still tags the resulting (non-variadic) call/def
-/// with GoABI0 so the packed args land on the stack.
+/// *Variadic* functions are excluded (return false): they go through the c2go
+/// `void**` tagged-argument-pack path (arrangeLLVMFunctionInfo), which rewrites
+/// them to a non-variadic IR signature and requires !isGoABI0 to fire. This
+/// holds for internal AND c2go_extern / c2go_linkname variadic functions — the
+/// latter are our own implementations (open / printf / ...), not real external
+/// libc, so they take the void** path just like any internal variadic function.
+/// The CC override still tags the resulting (non-variadic) call/def with GoABI0
+/// so the packed args land on the stack. The ONLY variadic exception is a true
+/// unmanaged-extern *import* (real host libc), which keeps the platform va_list
+/// at the boundary (the cgocall bridge converts to the host ABI).
 static bool isC2GoABI0Function(CodeGenModule &CGM, const Decl *D,
                                const FunctionType *fnType) {
-  if (D && (D->hasAttr<C2GoExternAttr>() || D->hasAttr<C2GoLinknameAttr>() ||
-            clang::c2go::isC2GoUnmanagedExternImport(
-                dyn_cast_or_null<FunctionDecl>(D))))
+  const auto *FPT = dyn_cast_or_null<FunctionProtoType>(fnType);
+  const bool IsVariadic = FPT && FPT->isVariadic();
+  // A true external variadic import keeps the platform variadic ABI.
+  if (clang::c2go::isC2GoUnmanagedExternImport(dyn_cast_or_null<FunctionDecl>(D)))
     return true;
+  // GoABI0 boundary symbols (c2go_extern / c2go_linkname): non-variadic keep
+  // GoABI0; variadic take the void** path (return false).
+  if (D && (D->hasAttr<C2GoExternAttr>() || D->hasAttr<C2GoLinknameAttr>()))
+    return !IsVariadic;
   if (!CGM.useC2GoGoABI0CC(D))
     return false;
-  const auto *FPT = dyn_cast_or_null<FunctionProtoType>(fnType);
-  return !(FPT && FPT->isVariadic());
+  // Internal c2go function: non-variadic GoABI0; variadic void** path.
+  return !IsVariadic;
 }
 
 /// Arrange a call as unto a free function, except possibly with an

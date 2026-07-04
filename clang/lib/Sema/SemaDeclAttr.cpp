@@ -6355,6 +6355,27 @@ static void handleC2GoLinknameAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
     return;
   }
   D->addAttr(::new (S.Context) C2GoLinknameAttr(S.Context, AL, Name, (int)HasAbi0));
+
+  // c2go: c2go_linkname implicitly carries c2go_extern's GoABI0 boundary calling
+  // convention (design.md: "c2go_linkname 隐含 c2go_extern 的 ABI0"). Unlike
+  // c2go_extern, c2go_linkname is NOT itself a calling-convention *type* attribute
+  // — it is a decl attribute and cannot be spelled in a type position; it only
+  // *implies* the ABI0 CC. Adjust the declared function's type here so a header
+  // `c2go_linkname` declaration and its C `c2go_extern` definition agree on the
+  // CC; otherwise redeclaration merging reports "declared 'goabi0' ... previously
+  // declared without calling convention". This is a pure front-end type-system
+  // alignment: CodeGen already treats c2go_linkname functions as GoABI0 boundary
+  // symbols through the attribute-keyed useC2GoGoABI0CallingConv /
+  // shouldUseC2GoRegReturn predicates, so it does not change generated code.
+  if (auto *FD = dyn_cast<FunctionDecl>(D)) {
+    if (const FunctionType *FT = FD->getType()->getAs<FunctionType>())
+      if (FT->getCallConv() != CC_GoABI0) {
+        FT = S.Context.adjustFunctionType(
+            FT, FT->getExtInfo().withCallingConv(CC_GoABI0));
+        FD->setType(QualType(FT, 0));
+      }
+  }
+
   // RecordDecls use the attribute purely as a type-identity binding (no IR
   // symbol); only functions/variables get an asm label.
   if (!isa<ValueDecl>(D))
@@ -6376,7 +6397,15 @@ static void handleC2GoLinknameAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
     for (char &C : Label)
       if (!isPlan9Ident(C))
         C = '_';
-  D->addAttr(AsmLabelAttr::CreateImplicit(S.Context, Label, AL.getLoc()));
+  // c2go: when c2go_extern is ALSO present, the export attribute owns the
+  // emitted symbol (the header's c2go_linkname documents the Go target + the
+  // ABI0 CC applied above, but does not rename the symbol). Skip the asm-label
+  // override so the function keeps its natural c2go_extern symbol (·<name>).
+  // See the symmetric drop in handleC2GoExternAttr for the usual cross-decl
+  // order (c2go_linkname on a header declaration, c2go_extern on the C
+  // definition), where the inherited label is removed once c2go_extern is seen.
+  if (!D->hasAttr<C2GoExternAttr>())
+    D->addAttr(AsmLabelAttr::CreateImplicit(S.Context, Label, AL.getLoc()));
 }
 
 // handleC2GoExternAttr (#269): exports a c2go-managed function/var to
@@ -6427,6 +6456,19 @@ static void handleC2GoExternAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
         }
       }
   D->addAttr(::new (S.Context) C2GoExternAttr(S.Context, AL, (int)Export));
+
+  // c2go: a function carrying BOTH c2go_linkname (a header declaration naming
+  // the Go link target + implying the ABI0 CC) and c2go_extern (the C
+  // implementation) is exported under c2go_extern's own symbol. c2go_linkname
+  // installs an asm label that renames the symbol to the Go target's mangled
+  // form; on the definition it is inherited here via redeclaration merging.
+  // Drop it so the emitted TEXT symbol is the natural ·<name> that the manifest
+  // and the generated .go binding expect — otherwise the .s symbol and the
+  // //go:linkname target diverge and the program fails to link. Guarded on
+  // C2GoLinknameAttr so only the linkname-installed label is removed (a plain
+  // c2go_extern function without c2go_linkname has no asm label to drop).
+  if (isa<FunctionDecl>(D) && D->hasAttr<C2GoLinknameAttr>())
+    D->dropAttr<AsmLabelAttr>();
 }
 
 // handleC2GoReturnTypeAttr (v15 §P5): binds a C struct as the tuple of a

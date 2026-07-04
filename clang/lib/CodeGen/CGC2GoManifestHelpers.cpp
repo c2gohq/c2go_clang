@@ -161,6 +161,18 @@ std::string buildC2GoGoSig(const FunctionDecl *FD, const ASTContext &Ctx) {
     bool ParmUnmanaged = PVD->hasAttr<C2GoUnmanagedAttr>();
     Out += ArgName + " " + mapC2GoType(PVD->getType(), Ctx, ParmUnmanaged);
   }
+  // c2go §2.3: a void** tagged-argument-pack variadic function carries a
+  // synthetic trailing void** argptrs parameter in its lowered ABI. Expose it to
+  // Go as an unsafe.Pointer so the binding stays callable — a Go caller builds
+  // the void** array of pointers-to-varargs itself and passes &arr[0]. A true
+  // unmanaged-extern variadic import keeps the platform va_list (no such param).
+  if (Ctx.getLangOpts().C2GoMode && FD->isVariadic() &&
+      !isC2GoUnmanagedExternImport(FD)) {
+    if (!First)
+      Out += ", ";
+    First = false;
+    Out += "argptrs unsafe.Pointer";
+  }
   Out += ")";
   std::string Ret;
   // c2go_returntype(struct X): the boundary returns a Go multi-value tuple —
