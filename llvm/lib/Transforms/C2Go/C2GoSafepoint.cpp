@@ -167,6 +167,17 @@ static uint64_t readNextIdWatermark(Module &M) {
 
 // writeNextIdWatermark records the next-ID value so future runs on the
 // same module continue the sequence without collision.
+//
+// The flag uses Module::Max (not Override) so that per-TU bitcode can be
+// merged by c2go-lto (the unified/whole-library build path): each TU carries
+// its own watermark, and taking the max is exactly the right merged value —
+// a re-run of the safepoint pass on the combined module then starts above
+// every existing ID. (Override would demand identical watermarks across TUs,
+// which never holds for differently-sized translation units, so it aborted
+// the link.) The per-TU stackmap IDs themselves may repeat across TUs in the
+// merged module, but that is benign: the pass does not re-run inside c2go-lto,
+// and each ID lowers to that function's own per-frame FUNCDATA/PCDATA, never a
+// module-global key.
 static void writeNextIdWatermark(Module &M, uint64_t Next) {
   // Module flags are write-once; if it already exists we must rewrite the
   // metadata operand in place.
@@ -185,7 +196,7 @@ static void writeNextIdWatermark(Module &M, uint64_t Next) {
       return;
     }
   }
-  M.addModuleFlag(Module::Override, kNextIdFlag, Next);
+  M.addModuleFlag(Module::Max, kNextIdFlag, Next);
 }
 
 // collectManagedAllocas scans the entry block (where clang puts its
