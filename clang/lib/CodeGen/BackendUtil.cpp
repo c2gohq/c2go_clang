@@ -1167,7 +1167,7 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
   std::unique_ptr<TargetLibraryInfoImpl> TLII(
       llvm::driver::createTLII(TargetTriple, CodeGenOpts.getVecLib()));
   // #229 — bzero substitution is handled by C2GoMemcpyTyping pass
-  // which rewrites @llvm.memset → c2go_libc.Memset before SelectionDAG
+  // which rewrites @llvm.memset → c2go_libc.memset before SelectionDAG
   // (where the bzero subst happens) sees the intrinsic. TLI-level
   // setUnavailable doesn't help because the memset→bzero rewrite is
   // in SelectionDAG (codegen), not in optimisation transforms.

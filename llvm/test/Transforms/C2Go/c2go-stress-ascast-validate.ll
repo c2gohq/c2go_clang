@@ -91,7 +91,7 @@ declare void @llvm.memcpy.p1.p1.i64(ptr addrspace(1), ptr addrspace(1), i64, i1)
 ;
 ; RS4GC wraps libc.Memmove (non-leaf) in a statepoint - this is the
 ; call edge the carve-out exists for.
-; ON: gc.statepoint{{.*}}@"github.com/c2gohq/c2go_libc.Memmove"
+; ON: gc.statepoint{{.*}}@"github.com/c2gohq/c2go_libc.memmove"
 ;
 ; The AS1 base reachable through the cast chain is relocated as AS1,
 ; proving the carve-out's base-defining-value search walked across
@@ -112,7 +112,7 @@ declare void @llvm.memcpy.p1.p1.i64(ptr addrspace(1), ptr addrspace(1), i64, i1)
 ; equation; if c2go-memcpy-typing were allowed to fold it away, the linkage
 ; check would stay green but the runtime stress would crash.
 ; OFF: addrspacecast ptr addrspace(1) {{.*}} to ptr
-; OFF: call goabi0cc ptr @"github.com/c2gohq/c2go_libc.Memmove"
+; OFF: call goabi0cc ptr @"github.com/c2gohq/c2go_libc.memmove"
 
 define ptr addrspace(1) @stress_ascast_recurse_edge(ptr addrspace(1) %p, ptr addrspace(1) %dst) {
 entry:

@@ -72,13 +72,14 @@ using namespace llvm;
 
 namespace {
 
-// c2go-libc function names — matches c2go_linkname targets in
-// c2go-libc/include/string.h. Only Memcpy/Memmove are intercepted here;
-// memset/bzero/etc. are left to clang's TLI optimisations and the
-// c2go-libc raw-name ABI0 fallback entries.
-constexpr StringRef kMemcpyName  = "github.com/c2gohq/c2go_libc.Memcpy";
-constexpr StringRef kMemmoveName = "github.com/c2gohq/c2go_libc.Memmove";
-constexpr StringRef kMemsetName  = "github.com/c2gohq/c2go_libc.Memset";
+// c2go-libc byte-blob fallback symbols the pass routes @llvm.mem* to. These
+// are the c2go-libc mem* implementations' own (lowercase) ABI0 symbols — the
+// natural libc names, since the C2GoExportName casing only capitalises the
+// generated .go binding, never the .s/IR symbol. c2go-libc provides them
+// (mem_funcs.go today; a C source/mem.c is the intended replacement).
+constexpr StringRef kMemcpyName  = "github.com/c2gohq/c2go_libc.memcpy";
+constexpr StringRef kMemmoveName = "github.com/c2gohq/c2go_libc.memmove";
+constexpr StringRef kMemsetName  = "github.com/c2gohq/c2go_libc.memset";
 
 // Runtime typed-copy helpers — provided by c2gobind's runtimeHelpers.
 //   _c2go_typedmemmove(typ *_type, dst, src unsafe.Pointer)

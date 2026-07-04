@@ -38,7 +38,7 @@ declare void @llvm.memcpy.p1.p1.i64(ptr addrspace(1), ptr addrspace(1), i64, i1)
 ; CHECK: addrspacecast ptr addrspace(1) {{.*}} to ptr
 ;
 ; RS4GC must wrap libc.Memmove (it is NOT gc-leaf-function).
-; CHECK: gc.statepoint{{.*}}@"github.com/c2gohq/c2go_libc.Memmove"
+; CHECK: gc.statepoint{{.*}}@"github.com/c2gohq/c2go_libc.memmove"
 ;
 ; The AS1 base reachable through the load+cast chain is relocated as AS1.
 ; CHECK: relocated = call {{.*}}ptr addrspace(1) @llvm.experimental.gc.relocate.p1

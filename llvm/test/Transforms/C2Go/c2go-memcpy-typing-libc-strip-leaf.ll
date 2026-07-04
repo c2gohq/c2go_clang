@@ -11,7 +11,7 @@
 
 ; Pre-declare libc.Memmove WITH gc-leaf-function and default CC - the exact
 ; "pre-pollution" shape the strip path must scrub.
-declare ptr @"github.com/c2gohq/c2go_libc.Memmove"(ptr, ptr, i64) #0
+declare ptr @"github.com/c2gohq/c2go_libc.memmove"(ptr, ptr, i64) #0
 
 ; An intrinsic memcpy with no !c2go.elem.type and a non-inlinable size forces
 ; rewrite into the non-leaf libc.Memmove fallback path, which drives the
@@ -26,7 +26,7 @@ declare void @llvm.memcpy.p0.p0.i64(ptr nocapture writeonly, ptr nocapture reado
 ; Pre-existing gc-leaf-function must be STRIPPED on the declaration after the
 ; pass runs. CC must be GoABI0 (goabi0cc).
 ;
-; CHECK:      declare {{.*}}goabi0cc{{.*}}ptr @"github.com/c2gohq/c2go_libc.Memmove"
+; CHECK:      declare {{.*}}goabi0cc{{.*}}ptr @"github.com/c2gohq/c2go_libc.memmove"
 ; CHECK-NOT:    {{.*}}gc-leaf-function{{.*}}
 
 ; The original pre-pollution attribute group #0 may still appear in the

@@ -38,14 +38,35 @@
 #define c2go_extern     __attribute__((c2go_extern))
 
 /* Named selector values (use instead of bare 0 / 1). */
-/* c2go_extern Go-name casing (its optional int arg): the bare `c2go_extern`
- * macro is the default (C2GO_EXPORTED). Passing C2GO_KEEPCASE needs the raw
- * attribute (`__attribute__((c2go_extern(C2GO_KEEPCASE)))`) because the
- * object-like `c2go_extern` macro shadows the attribute spelling, so a
- * convenience wrapper macro can't carry the arg. Keep-case is currently
- * unused; these names document the values. */
-#define C2GO_EXPORTED   1   /* default: Go name upper-first (foo -> Foo) */
-#define C2GO_KEEPCASE   0   /* keep the C symbol's casing */
+/* c2go_extern's optional int arg = the generated .go export-name casing.
+ *
+ * C2GO_EXPORTED (1, default): the C symbol becomes an exported Go identifier in
+ *   *CamelCase* — snake_case is title-cased PER underscore-separated segment and
+ *   the underscores are dropped (NOT merely upper-casing the first letter):
+ *       strlen        -> Strlen
+ *       is_upper      -> IsUpper
+ *       sqlite3_open  -> Sqlite3Open
+ *   (the exact rule is c2goCapitalizeUnderscore in
+ *   llvm/Transforms/C2Go/C2GoExportName.h; c2gobind reproduces it byte-for-byte).
+ * C2GO_KEEPCASE (0): keep the C symbol's casing verbatim.
+ *
+ * The .s / IR TEXT symbol is ALWAYS the lowercase C name (`·strlen`). When the
+ * CamelCase Go name differs, c2gobind emits the export as a *bodyless* decl
+ *   //go:linkname Strlen  github.com/.../c2go_libc.strlen
+ *   func Strlen(...) ...
+ * i.e. the CamelCase name is a Go-SOURCE alias that resolves to the lowercase
+ * symbol; it is NOT itself a linker symbol. Consequence: a cross-TU
+ * `c2go_linkname("pkg.<name>")` *target* — which is a symbol reference emitted
+ * into the caller's .s — must name the *lowercase* C symbol (`pkg.strlen`), not
+ * the CamelCase form. Use the CamelCase name only from Go source (e.g. tests:
+ * `libc.Strlen(...)`).
+ *
+ * The bare `c2go_extern` macro is C2GO_EXPORTED. To pass 0 use the raw attribute
+ * `__attribute__((c2go_extern(C2GO_KEEPCASE)))` — the object-like `c2go_extern`
+ * macro shadows the attribute spelling, so a wrapper macro can't carry the arg.
+ * Keep-case is currently unused; these names document the values. */
+#define C2GO_EXPORTED   1   /* default: .go name = CamelCase(C symbol), e.g. sqlite3_open -> Sqlite3Open */
+#define C2GO_KEEPCASE   0   /* keep the C symbol's casing verbatim */
 
 /* c2go_linkname target-ABI selector (its optional 2nd arg): */
 #define C2GO_GOABI0     1   /* target provides an ABI0 entry -> direct reference */
@@ -183,10 +204,13 @@ static inline void *gc_malloc_array(const void *type_info,
 
 /*===-- errno accessor (per-goroutine via GLS) ----------------------------*/
 
-extern int *__c2go_errno_ptr(void)
+/* __errno_location is the glibc/musl-standard accessor name, so ported musl
+ * source that calls it directly resolves to the same per-goroutine errno
+ * that the `errno` macro reads — one accessor, no divergence. */
+extern int *__errno_location(void)
     c2go_linkname("github.com/c2gohq/c2go_libc.ErrnoPtr", C2GO_GOABI0);
 
-#define errno (*__c2go_errno_ptr())
+#define errno (*__errno_location())
 
 /*===-- Go built-in types (v15 §P5) ---------------------------------------
  * C representations of Go's built-in aggregate types, matching their exact
