@@ -13087,8 +13087,19 @@ SDValue AArch64TargetLowering::LowerVACOPY(SDValue Op,
   // pointer.
   SDLoc DL(Op);
   unsigned PtrSize = Subtarget->isTargetILP32() ? 4 : 8;
+  // c2go GoABI0 passes varargs on the stack (the void** argument pack), so its
+  // va_list is a single pointer (the Darwin char* layout), NOT the AAPCS
+  // 32-byte register-save-area struct. clang's front-end — a Darwin-triple cc1
+  // — lays it out as 8 bytes and inlines va_start/va_arg to match; only
+  // llvm.va_copy survives to the backend. c2go-lto then retargets the module to
+  // a neutral aarch64-unknown-ELF triple, so isTargetDarwin() is false here;
+  // without keying off the containing function's GoABI0 CC the default 32-byte
+  // copy would overrun the 8-byte va_list slot and clobber adjacent frame
+  // objects (#584).
+  bool IsGoABI0 = DAG.getMachineFunction().getFunction().getCallingConv() ==
+                  CallingConv::GoABI0;
   unsigned VaListSize =
-      (Subtarget->isTargetDarwin() || Subtarget->isTargetWindows())
+      (IsGoABI0 || Subtarget->isTargetDarwin() || Subtarget->isTargetWindows())
           ? PtrSize
           : Subtarget->isTargetILP32() ? 20 : 32;
   const Value *DestSV = cast<SrcValueSDNode>(Op.getOperand(3))->getValue();
