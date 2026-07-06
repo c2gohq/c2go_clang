@@ -1119,6 +1119,34 @@ void CodeGenModule::stampC2GoInternalFnAttrs(const FunctionDecl *FD,
   F->addFnAttr("c2go-argptrmask", ArgPtrMask);
 }
 
+void CodeGenModule::stampC2GoBoundaryFnAttrs(const FunctionDecl *FD,
+                                             llvm::Function *F) {
+  // The boundary (c2go_extern EXPORT) attrs. Mirrors the creation-time
+  // SetFunctionAttributes block: the args pointer mask (so copystack scans the
+  // export's incoming managed-pointer args — #332) plus the manifest-grade
+  // c2go-boundary / c2go-export-case / c2go-boundary-argsize markers. Extracted
+  // so EmitGlobalFunctionDefinition can re-run it with the DEFINITION decl:
+  // when a c2go_extern function is also declared c2go_linkname in a header (the
+  // whole stdio family), a call site can materialize the llvm::Function from the
+  // bodyless linkname decl first — which carries no C2GoExternAttr — so the
+  // creation-time stamping skips every boundary attr and the X86 frame stager
+  // falls back to `NOFRAME, $0` (the #599 crash shape, re-exposed for boundary
+  // symbols once #601 defers body emission). c2go-c-name / c2go-go-sig are
+  // stamped unconditionally at creation for every FunctionDecl, so they are
+  // already present and are not re-stamped here.
+  std::string ArgPtrMask =
+      computeC2GoArgPtrMask(FD, /*ResultInRegisters=*/false);
+  if (ArgPtrMask.empty())
+    ArgPtrMask = "00";
+  F->addFnAttr("c2go-argptrmask", ArgPtrMask);
+  if (const auto *EA = FD->getAttr<C2GoExternAttr>()) {
+    F->addFnAttr("c2go-boundary");
+    F->addFnAttr("c2go-export-case", llvm::utostr(EA->getExportCase()));
+    F->addFnAttr("c2go-boundary-argsize",
+                 llvm::utostr(clang::c2go::computeC2GoArgSize(FD, getContext())));
+  }
+}
+
 void CodeGenModule::attachC2GoAllocTargetMetadata(llvm::CallBase *CB,
                                                  QualType DestPointerType) {
   // Only meaningful in CGO mode.
@@ -6204,6 +6232,27 @@ void CodeGenModule::EmitGlobal(GlobalDecl GD) {
     }
   }
 
+  // c2go (#601): never emit a FUNCTION body eagerly (during parse). A call
+  // site's import-vs-internal classification (isC2GoUnmanagedExternImport)
+  // depends on isDefined(), which is only accurate once the whole TU is parsed.
+  // An eagerly-emitted body (e.g. a c2go_extern boundary function) that calls a
+  // forward-declared function whose definition appears LATER in the TU would
+  // arrange the call per the *import* ABI — platform varargs instead of the
+  // internal void** argument pack, or an sret return instead of the -O2
+  // register return — while the callee body, emitted later, uses the internal
+  // form. Both are silent (same GoABI0 CC, so the c2go-lto call-site-CC sweep
+  // does not catch them). Deferring the body to end-of-TU (HandleTranslationUnit
+  // drains DeferredDeclsToEmit after all parsing) makes isDefined() accurate for
+  // every call site. #599 healed the DEFINITION side of this window; this heals
+  // the CALL side. Cache-locality (the only reason eager emission exists here)
+  // is not a correctness property. Gated to functions so variable init ordering
+  // is untouched.
+  if (getLangOpts().C2GoMode && isa<FunctionDecl>(Global) &&
+      MustBeEmitted(Global) && MayBeEmittedEagerly(Global)) {
+    addDeferredDeclToEmit(GD);
+    return;
+  }
+
   // Defer code generation to first use when possible, e.g. if this is an inline
   // function. If the global must always be emitted, do it eagerly if possible
   // to benefit from cache locality.
@@ -8497,6 +8546,17 @@ void CodeGenModule::EmitGlobalFunctionDefinition(GlobalDecl GD,
   // are excluded by useC2GoGoABI0CC — they must NOT carry c2go-argsize.
   if (useC2GoGoABI0CC(D) && !Fn->hasFnAttribute("c2go-argsize"))
     stampC2GoInternalFnAttrs(D, Fn);
+
+  // c2go (#601 co-fix): the boundary dual of the re-stamp above. A c2go_extern
+  // definition that is also declared c2go_linkname in a header can have its
+  // llvm::Function materialized from the bodyless linkname decl (no
+  // C2GoExternAttr) by an earlier call site, so the creation-time path skips the
+  // boundary attrs. Re-stamp them from the DEFINITION decl (which carries
+  // C2GoExternAttr) when the marker is absent. Excludes useC2GoGoABI0CC (handled
+  // above) so a plain internal function never lands here.
+  if (!useC2GoGoABI0CC(D) && D->hasAttr<C2GoExternAttr>() &&
+      D->doesThisDeclarationHaveABody() && !Fn->hasFnAttribute("c2go-boundary"))
+    stampC2GoBoundaryFnAttrs(D, Fn);
 
   CodeGenFunction(*this).GenerateCode(GD, Fn, FI);
 

@@ -1785,6 +1785,13 @@ public:
   /// unmanaged-extern import at creation time, skipping these attrs.
   void stampC2GoInternalFnAttrs(const FunctionDecl *FD, llvm::Function *F);
 
+  /// c2go (#601 co-fix): stamp the boundary (c2go_extern EXPORT) attrs
+  /// (c2go-argptrmask / c2go-boundary / c2go-export-case /
+  /// c2go-boundary-argsize). Re-run at EmitGlobalFunctionDefinition so a
+  /// c2go_extern+c2go_linkname export materialized from its bodyless linkname
+  /// decl still gets the boundary markers the creation-time path skipped.
+  void stampC2GoBoundaryFnAttrs(const FunctionDecl *FD, llvm::Function *F);
+
   /// c2go #541: true when generating windows extern glue (target triple OS is
   /// windows). A windows c2go_callback target resolves to a syscall.NewCallback
   /// var (load), not a .s cdecl trampoline (function address).
