@@ -178,11 +178,28 @@ computeX86LocalsMasks(const llvm::MachineFunction &MF, uint64_t FrameSize) {
       continue;
     llvm::Register FrameReg;
     llvm::StackOffset Off = TFL->getFrameIndexReference(MF, FI, FrameReg);
-    // X86 delta from AArch64: SP → RSP.
-    if (FrameReg != llvm::X86::RSP)
+    // #602: resolve to an SP-relative offset (the bitmap's coordinate
+    // system). AArch64 resolves locals against SP directly, but X86's
+    // getFrameIndexReference prefers RBP once the function has a frame
+    // pointer — which every non-leaf c2go function does (`push rbp; mov
+    // rbp, rsp; sub rsp, FrameSize`, so RBP == SP + FrameSize) — and
+    // returns a negative RBP-relative offset. The original RSP-only filter
+    // silently dropped every such aggregate: the X86 locals aggregate mask
+    // AND the #312 union-ambig scrub were empty since Wave AC.1, so
+    // copystack never adjusted pointer fields inside stack aggregates
+    // (vsnprintf's stack FILE sink was the visible casualty: the first
+    // snprintf whose stack growth fired mid-chain kept writing through the
+    // stale pre-move f->buf/f->cookie). The scalar/per-PC stackmap path
+    // handles RBP separately (Wave Z LowerSTACKMAP) — only this static
+    // aggregate walk missed the conversion.
+    int64_t SPoff;
+    if (FrameReg == llvm::X86::RSP)
+      SPoff = Off.getFixed();
+    else if (FrameReg == llvm::X86::RBP)
+      SPoff = (int64_t)FrameSize + Off.getFixed();
+    else
       continue;
-    int64_t SPoff = Off.getFixed();
-    if (SPoff < 0)
+    if (SPoff < 0 || (uint64_t)SPoff >= FrameSize)
       continue;
 
     // Union-ambig scrub (#312): read alloca-attached MD and translate
@@ -738,6 +755,26 @@ bool X86C2GoFrameMetaStager::runOnMachineFunction(MachineFunction &MF) {
     // case so we don't add it here either.
     Meta.FrameSize = static_cast<int>(MF.getFrameInfo().getStackSize());
     Meta.NoSplit = false;
+
+    // c2go #602: locals aggregate-field mask + #312 union-ambig scrub for
+    // the SysV-fallback (CC-not-flipped) population — i.e. every ordinary
+    // c2go function. This was the "Wave AB will extend this" TODO above:
+    // the masks were only ever computed on the emitX86C2GoPrologue path,
+    // which serves CC-flipped strict leaves (FrameSize==0 ⇒ empty masks),
+    // so the X86 locals aggregate mask was EMPTY for every function that
+    // mattered and copystack never adjusted pointer fields inside stack
+    // aggregates (vsnprintf's stack FILE sink was the visible casualty —
+    // the first snprintf whose stack growth fired mid-chain kept writing
+    // through the stale pre-move f->buf/f->cookie; AArch64 has emitted
+    // this mask since #287/#312). This stager runs in addPreEmitPass2,
+    // AFTER PEI folded and aligned the final autosize, so
+    // getFrameIndexReference resolves against the same frame the
+    // suppressed SysV prologue (re-injected by obj6.go) establishes:
+    // RBP == SP + FrameSize, matching computeX86LocalsMasks' conversion.
+    auto LocalsMasks =
+        llvm::c2go::computeX86LocalsMasks(MF, (uint64_t)Meta.FrameSize);
+    Meta.LocalsAggMaskBytes = std::move(LocalsMasks.first);
+    Meta.LocalsAmbigMaskBytes = std::move(LocalsMasks.second);
   }
   // Wave AJ.2 — silence the unused-variable warning when IsBoundary is
   // only consulted in the argsize forward block below.

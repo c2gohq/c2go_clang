@@ -867,6 +867,34 @@ int main(int argc, char **argv) {
     }
   }
 
+  // c2go #600: amd64 stack-alignment ship-gate. Go's amd64 stack is only
+  // 8-byte aligned, but IR-level known-bits folds trust an alloca's align
+  // attribute: a claimed 16 licenses rewrites like `buf+9` -> `buf|9` that
+  // are silently wrong when the frame lands at 8 mod 16 (fmt_fp's printf %e
+  // dropped its exponent exactly this way). clang -fc2go no longer emits
+  // >8-aligned allocas on x86-64 (the large-array raise is clamped to 8 and
+  // long double == double), so a survivor here — an explicit alignas / __int128 /
+  // vector local, or a pass raising an alloca's alignment
+  // (tryEnforceAlignment does not consult the stack's natural alignment) —
+  // cannot be lowered soundly on the Go stack: refuse to emit.
+  if (Triple(Composite->getTargetTriple()).getArch() == Triple::x86_64) {
+    bool OverAlignedAlloca = false;
+    for (Function &F : *Composite)
+      for (BasicBlock &BB : F)
+        for (Instruction &I : BB)
+          if (auto *AI = dyn_cast<AllocaInst>(&I))
+            if (AI->getAlign() > Align(8)) {
+              errs() << argv[0] << ": error: function '" << F.getName()
+                     << "' has an alloca '" << AI->getName() << "' requiring "
+                     << AI->getAlign().value()
+                     << "-byte stack alignment, but the Go amd64 stack "
+                        "guarantees only 8 — refusing to emit (#600)\n";
+              OverAlignedAlloca = true;
+            }
+    if (OverAlignedAlloca)
+      return ExitToolError;
+  }
+
   // c2go WF2 (#319, M4 minimal): optional manifest rebuild from combined
   // bitcode. Implementation lives in C2GoManifestRebuilder.cpp (#465 split);
   // the helper renders the JSON into `ManifestText` so the EmitArchive path

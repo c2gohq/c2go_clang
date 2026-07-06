@@ -539,6 +539,28 @@ void TargetInfo::adjust(DiagnosticsEngine &Diags, LangOptions &Opts,
     }
   }
 
+  if (Opts.C2GoMode) {
+    // c2go: `long double` is IEEE double on every target. Go has no long
+    // double, the GoABI0 backends support neither x87 fp80 nor fp128, and
+    // c2go-libc is ported against the LDBL==DBL model (musl's aarch64
+    // configuration). This also removes fp80/fp128's 16-byte-aligned stack
+    // slots, which the Go amd64 stack cannot provide (see below).
+    LongDoubleWidth = DoubleWidth;
+    LongDoubleAlign = DoubleAlign;
+    LongDoubleFormat = DoubleFormat;
+    if (getTriple().getArch() == llvm::Triple::x86_64) {
+      // #600: Go's amd64 stack is only 8-byte aligned (arm64 keeps 16 by
+      // hardware rule), so claiming 16-byte alignment for a local is a lie
+      // the optimizer exploits: known-bits folds turn pointer arithmetic on
+      // such allocas into bit tricks (fmt_fp's `buf+9` became `buf|9`) that
+      // are silently wrong when the frame lands at 8 mod 16. Clamp the
+      // large-array raise to the real guarantee (8 bytes, not off — the
+      // raise itself is still useful); c2go-lto fail-closes on any alloca
+      // align > 8 that still reaches it.
+      LargeArrayAlign = 64;
+    }
+  }
+
   if (Opts.NewAlignOverride)
     NewAlign = Opts.NewAlignOverride * getCharWidth();
 

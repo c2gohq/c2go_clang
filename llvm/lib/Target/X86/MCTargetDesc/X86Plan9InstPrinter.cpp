@@ -1372,9 +1372,17 @@ static bool tryPrintSetccMemSymbolic(const MCInst *MI, raw_ostream &O,
 static bool tryPrintSSEX87MemSymbolic(const MCInst *MI, raw_ostream &O,
                                       const MCRegisterInfo &MRI,
                                       const MCInstrInfo &MII) {
-  enum Form { Load6, RMW7, Store6, X87M5 };
+  enum Form { Load6, RMW7, Store6, X87M5, BlendRMW7 };
   struct Ent { const char *Op; const char *P9; Form F; };
   static const Ent kTable[] = {
+      // (0) SSE4.1 implicit-XMM0 blends (#600: sqlite3AtoF selects
+      // `blendvpd LCPI, xmm` once c2go long double == double routes its
+      // rounding through SSE instead of x87). Same RMW7 operand layout;
+      // Go asm spells the implicit mask register explicitly
+      // (`BLENDVPD X0, m/x, x` — cmd/asm testdata amd64enc.s).
+      {"BLENDVPDrm0", "BLENDVPD",  BlendRMW7},
+      {"BLENDVPSrm0", "BLENDVPS",  BlendRMW7},
+      {"PBLENDVBrm0", "PBLENDVB",  BlendRMW7},
       // (1) SSE packed / integer SIMD
       {"MOVDQArm",    "MOVO",      Load6},
       {"MOVDQUrm",    "MOVOU",     Load6},
@@ -1455,6 +1463,17 @@ static bool tryPrintSSEX87MemSymbolic(const MCInst *MI, raw_ostream &O,
     O << "\t" << E->P9 << " ";
     printPlan9MemRef(O, MI, /*OpStart=*/0, MRI);
     O << ", F0\n";
+    return true;
+  case BlendRMW7:
+    // dst @0 (tied to src1 @1), mem tuple @2-6; XMM0 mask is an implicit
+    // use in the MCInst but an explicit first operand in Go asm.
+    if (MI->getNumOperands() < 7 || !MI->getOperand(0).isReg()) return false;
+    if (!isPlan9SymbolicMemTuple(MI, /*OpStart=*/2)) return false;
+    O << "\t" << E->P9 << " X0, ";
+    printPlan9MemRef(O, MI, /*OpStart=*/2, MRI);
+    O << ", ";
+    printPlan9Reg(O, MI->getOperand(0).getReg(), MRI);
+    O << "\n";
     return true;
   }
   return false;
