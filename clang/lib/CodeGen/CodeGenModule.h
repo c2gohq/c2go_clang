@@ -1775,6 +1775,16 @@ public:
   /// lands on the stack). \p D may be null (an indirect call).
   bool useC2GoGoABI0CallingConv(const Decl *D) const;
 
+  /// c2go: stamp the internal-GoABI0 metadata attrs (c2go-void-vararg /
+  /// c2go-reg-return / c2go-argsize / c2go-argptrmask) for \p FD onto \p F and
+  /// enroll leaf-wrapper candidacy. Called from SetLLVMFunctionAttributes at
+  /// llvm::Function creation, and again from EmitGlobalFunctionDefinition
+  /// (guarded on the c2go-argsize attr) to heal the incremental-codegen
+  /// import-misclassification window (#599): a forward-declared function
+  /// referenced before its definition is parsed classifies as an
+  /// unmanaged-extern import at creation time, skipping these attrs.
+  void stampC2GoInternalFnAttrs(const FunctionDecl *FD, llvm::Function *F);
+
   /// c2go #541: true when generating windows extern glue (target triple OS is
   /// windows). A windows c2go_callback target resolves to a syscall.NewCallback
   /// var (load), not a .s cdecl trampoline (function address).

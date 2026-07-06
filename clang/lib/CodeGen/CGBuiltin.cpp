@@ -3213,8 +3213,22 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
     return RValue::get(nullptr);
   }
   case Builtin::BI__builtin_va_copy: {
-    Value *DstPtr = EmitVAListRef(E->getArg(0)).emitRawPointer(*this);
-    Value *SrcPtr = EmitVAListRef(E->getArg(1)).emitRawPointer(*this);
+    Address DstAddr = EmitVAListRef(E->getArg(0));
+    Address SrcAddr = EmitVAListRef(E->getArg(1));
+    if (getLangOpts().C2GoMode) {
+      // c2go §2.3: va_list is a plain void** cursor, so va_copy is a single
+      // pointer copy. Emitting llvm.va_copy instead is unsafe — the c2go-lto
+      // backend sizes that intrinsic by its neutral-ELF platform va_list (SysV
+      // 24B / AAPCS 32B), overrunning c2go's 8-byte cursor slot and smashing the
+      // stack. This is the x86-64 analogue of the #584 AArch64 va_copy fix, but
+      // surfaced on Windows (Win64's scalar va_list leaves the mismatch unmasked).
+      Address Src = SrcAddr.withElementType(Int8PtrTy);
+      Address Dst = DstAddr.withElementType(Int8PtrTy);
+      Builder.CreateStore(Builder.CreateLoad(Src, "c2go.va.copy"), Dst);
+      return RValue::get(nullptr);
+    }
+    Value *DstPtr = DstAddr.emitRawPointer(*this);
+    Value *SrcPtr = SrcAddr.emitRawPointer(*this);
     Builder.CreateCall(CGM.getIntrinsic(Intrinsic::vacopy, {DstPtr->getType()}),
                        {DstPtr, SrcPtr});
     return RValue::get(nullptr);

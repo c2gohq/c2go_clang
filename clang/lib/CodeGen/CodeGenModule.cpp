@@ -1060,6 +1060,65 @@ std::string CodeGenModule::computeC2GoArgPtrMask(const FunctionDecl *FD,
   return Hex;
 }
 
+void CodeGenModule::stampC2GoInternalFnAttrs(const FunctionDecl *FD,
+                                             llvm::Function *F) {
+  // c2go §2.3: a void** tagged-argument-pack variadic function must stay
+  // on the GoABI0 stack — its argsize reserves the trailing void** slot,
+  // and va_arg walks the packed array as a stack object — so it is NOT a
+  // leaf register-ABI candidate. Tag it so the leaf CC-flip pass excludes
+  // it (C2GoLeafEligibility), mirroring the #495 wrapper's variadic skip:
+  // no variadic function ever gets register argument passing.
+  if (usesC2GoVoidPtrVararg(FD->getType()->getAs<FunctionType>(), FD))
+    F->addFnAttr("c2go-void-vararg");
+  // c2go §2.0.2 (#281): internal functions return results in registers
+  // (ABIInternal) ONLY at -O2+; at -O0/-O1 they keep ABI0 stack returns
+  // for debuggability (argsize includes the result slot). The decision
+  // is centralized in shouldUseC2GoRegReturn so callee body and call
+  // site (CGCall.cpp) cannot disagree — a mismatch would have the
+  // caller read X0 while the callee wrote the result slot on the stack
+  // (or vice versa). Boundary symbols (c2go_extern / c2go_linkname) are
+  // already excluded by the caller's useC2GoGoABI0CC gate.
+  const bool RegRet = shouldUseC2GoRegReturn(FD);
+  if (RegRet)
+    F->addFnAttr("c2go-reg-return");
+  // c2go (#495): a static register-return function is a leaf-flip
+  // candidate. If its address escapes (any non-direct-call use), the
+  // backend disqualifies it today (isC2GoAddressTaken). Record it now —
+  // while we still hold the FunctionDecl — and decide in
+  // EmitC2GoLeafWrappers() (after EmitDeferred, when the whole-TU use
+  // set is final) whether to synthesize an ABI0 wrapper for the escaped
+  // pointer so the body can keep the register ABI.
+  //
+  // NOTE: at the creation-time call site F's linkage is NOT set yet —
+  // SetFunctionAttributes calls SetLLVMFunctionAttributes BEFORE
+  // setLinkageForGV. So we must NOT gate on hasLocalLinkage() now (it
+  // would always be false); the static-only check is enforced in
+  // EmitC2GoLeafWrappers(), which runs at Release after linkage is final.
+  if (RegRet)
+    C2GoLeafWrapperCandidates.emplace_back(FD, F);
+  F->addFnAttr("c2go-argsize",
+               llvm::utostr(computeC2GoArgSize(FD,
+                                               /*ResultInRegisters=*/RegRet)));
+  // c2go #287 (Option 3): publish the pointer-word mask of the incoming
+  // argument area. The AArch64 backend forwards it to MCPlan9AsmStreamer,
+  // which sets the matching bits in FUNCDATA $0 (args pointer map) so
+  // Go's copystack RELOCATES pointer args that point into the moving
+  // goroutine stack — the cross-Exec dangling-`&local` fix (#282). Empty
+  // => no pointer args => backend keeps the all-zeros args map.
+  std::string ArgPtrMask =
+      computeC2GoArgPtrMask(FD, /*ResultInRegisters=*/RegRet);
+  // c2go #330: always publish the mask (even when all-zero / non-pointer
+  // args) so the AArch64 backend forwards the function's argsize to the
+  // Plan 9 streamer and FUNCDATA $0 is emitted. Without this, an
+  // internal function with non-pointer args (e.g. `int + char`) gets
+  // c2go-argsize=8 but no c2go-argptrmask → the streamer skips the args
+  // funcdata → Go's `getStackMap` aborts with "missing stackmap /
+  // untyped args" when copystack walks the frame.
+  if (ArgPtrMask.empty())
+    ArgPtrMask = "00";
+  F->addFnAttr("c2go-argptrmask", ArgPtrMask);
+}
+
 void CodeGenModule::attachC2GoAllocTargetMetadata(llvm::CallBase *CB,
                                                  QualType DestPointerType) {
   // Only meaningful in CGO mode.
@@ -2906,61 +2965,13 @@ void CodeGenModule::SetLLVMFunctionAttributes(GlobalDecl GD,
     // CC predicate above.
     if (useC2GoGoABI0CC(GD.getDecl())) {
       if (const auto *FD = dyn_cast_or_null<FunctionDecl>(GD.getDecl())) {
-        // c2go §2.3: a void** tagged-argument-pack variadic function must stay
-        // on the GoABI0 stack — its argsize reserves the trailing void** slot,
-        // and va_arg walks the packed array as a stack object — so it is NOT a
-        // leaf register-ABI candidate. Tag it so the leaf CC-flip pass excludes
-        // it (C2GoLeafEligibility), mirroring the #495 wrapper's variadic skip:
-        // no variadic function ever gets register argument passing.
-        if (usesC2GoVoidPtrVararg(FD->getType()->getAs<FunctionType>(), FD))
-          F->addFnAttr("c2go-void-vararg");
-        // c2go §2.0.2 (#281): internal functions return results in registers
-        // (ABIInternal) ONLY at -O2+; at -O0/-O1 they keep ABI0 stack returns
-        // for debuggability (argsize includes the result slot). The decision
-        // is centralized in shouldUseC2GoRegReturn so callee body and call
-        // site (CGCall.cpp) cannot disagree — a mismatch would have the
-        // caller read X0 while the callee wrote the result slot on the stack
-        // (or vice versa). Boundary symbols (c2go_extern / c2go_linkname) are
-        // already excluded by the outer useC2GoGoABI0CC.
-        const bool RegRet = shouldUseC2GoRegReturn(FD);
-        if (RegRet)
-          F->addFnAttr("c2go-reg-return");
-        // c2go (#495): a static register-return function is a leaf-flip
-        // candidate. If its address escapes (any non-direct-call use), the
-        // backend disqualifies it today (isC2GoAddressTaken). Record it now —
-        // while we still hold the FunctionDecl — and decide in
-        // EmitC2GoLeafWrappers() (after EmitDeferred, when the whole-TU use
-        // set is final) whether to synthesize an ABI0 wrapper for the escaped
-        // pointer so the body can keep the register ABI.
-        //
-        // NOTE: F's linkage is NOT set yet here — SetFunctionAttributes calls
-        // SetLLVMFunctionAttributes (this code) BEFORE setLinkageForGV. So we
-        // must NOT gate on hasLocalLinkage() now (it would always be false);
-        // the static-only check is enforced in EmitC2GoLeafWrappers(), which
-        // runs at Release after linkage is final.
-        if (RegRet)
-          C2GoLeafWrapperCandidates.emplace_back(FD, F);
-        F->addFnAttr("c2go-argsize",
-                     llvm::utostr(computeC2GoArgSize(FD,
-                                                     /*ResultInRegisters=*/RegRet)));
-        // c2go #287 (Option 3): publish the pointer-word mask of the incoming
-        // argument area. The AArch64 backend forwards it to MCPlan9AsmStreamer,
-        // which sets the matching bits in FUNCDATA $0 (args pointer map) so
-        // Go's copystack RELOCATES pointer args that point into the moving
-        // goroutine stack — the cross-Exec dangling-`&local` fix (#282). Empty
-        // => no pointer args => backend keeps the all-zeros args map.
-        std::string ArgPtrMask =
-            computeC2GoArgPtrMask(FD, /*ResultInRegisters=*/RegRet);
-        // c2go #330: always publish the mask (even when all-zero / non-pointer
-        // args) so the AArch64 backend forwards the function's argsize to the
-        // Plan 9 streamer and FUNCDATA $0 is emitted. Without this, an
-        // internal function with non-pointer args (e.g. `int + char`) gets
-        // c2go-argsize=8 but no c2go-argptrmask → the streamer skips the args
-        // funcdata → Go's `getStackMap` aborts with "missing stackmap /
-        // untyped args" when copystack walks the frame.
-        if (ArgPtrMask.empty())
-          ArgPtrMask = "00";
-        F->addFnAttr("c2go-argptrmask", ArgPtrMask);
+        // The stamping body lives in stampC2GoInternalFnAttrs so
+        // EmitGlobalFunctionDefinition can re-run it with the DEFINITION decl:
+        // when a forward-declared function is referenced before its definition
+        // is parsed (incremental codegen), this creation-time path classifies
+        // it an unmanaged-extern import (isDefined() is still false) and skips
+        // the attrs entirely — the #599 __ofl_lock `NOFRAME, $0` fopen crash.
+        stampC2GoInternalFnAttrs(FD, F);
       }
     } else if (const auto *FD =
                    dyn_cast_or_null<FunctionDecl>(GD.getDecl())) {
@@ -8469,6 +8480,23 @@ void CodeGenModule::EmitGlobalFunctionDefinition(GlobalDecl GD,
   MaybeHandleStaticInExternC(D, Fn);
 
   maybeSetTrivialComdat(*D, *Fn);
+
+  // c2go (#599): heal the incremental-codegen import-misclassification window.
+  // Model B stamps an implicit C2GoUnmanagedAttr on every plain declaration and
+  // isC2GoUnmanagedExternImport() relies on isDefined() to keep later-defined
+  // functions internal — but when an eagerly-emitted body (e.g. c2go_extern
+  // fflush) references a forward-declared function whose definition appears
+  // LATER in the TU, the llvm::Function is created while isDefined() is still
+  // false, the decl classifies as an import, and SetLLVMFunctionAttributes
+  // skips the internal attrs. The X86 frame stager then finds no c2go-argsize
+  // and falls back to the Stage-4 `NOFRAME, $0` TEXT shape while the body
+  // still addresses args/locals via BP (the __ofl_lock fopen crash); AArch64
+  // publishes argsize 0 (a GC args-map hole). A function being DEFINED is
+  // definitively internal (Sema rejects defining a real import), so re-stamp
+  // with the definition decl. Boundary symbols (c2go_extern / c2go_linkname)
+  // are excluded by useC2GoGoABI0CC — they must NOT carry c2go-argsize.
+  if (useC2GoGoABI0CC(D) && !Fn->hasFnAttribute("c2go-argsize"))
+    stampC2GoInternalFnAttrs(D, Fn);
 
   CodeGenFunction(*this).GenerateCode(GD, Fn, FI);
 

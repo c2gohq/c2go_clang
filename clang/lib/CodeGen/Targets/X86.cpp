@@ -3538,6 +3538,15 @@ void WinX86_64ABIInfo::computeInfo(CGFunctionInfo &FI) const {
 
 RValue WinX86_64ABIInfo::EmitVAArg(CodeGenFunction &CGF, Address VAListAddr,
                                    QualType Ty, AggValueSlot Slot) const {
+  // c2go §2.3: the va_list is a void** cursor over the caller-packed argptrs
+  // array (va_arg(ap,T) == *(T*)(*ap++)), NOT a native Win64 va_list. Bypass the
+  // MS walk below — it reads the cursor one indirection too shallow, taking the
+  // arg-slot POINTER as the scalar value. Mirrors X86_64ABIInfo::EmitVAArg; the
+  // caller side is EmitC2GoVarArgPack (target-neutral), so this is the only
+  // Windows-specific gap.
+  if (getContext().getLangOpts().C2GoMode)
+    return emitC2GoVAArg(CGF, VAListAddr, Ty, Slot);
+
   // MS x64 ABI requirement: "Any argument that doesn't fit in 8 bytes, or is
   // not 1, 2, 4, or 8 bytes, must be passed by reference."
   uint64_t Width = getContext().getTypeSize(Ty);
