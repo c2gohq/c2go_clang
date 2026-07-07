@@ -4585,8 +4585,8 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
     // symbol @<name> itself is otherwise unused: emitting the wrapper sets
     // WrapperInAsm, so c2go-bind emits the stub + //go:cgo_import_dynamic glue
     // that the &import value resolves to.
-    llvm::Function *ExistingStub =
-        getModule().getFunction(("c2go_stub_" + FD->getName()).str());
+    llvm::Function *ExistingStub = getModule().getFunction(
+        ("c2go_stub_" + c2goHostImportName(FD->getName())).str());
     const bool StubUsed = ExistingStub && !ExistingStub->use_empty();
     if (!F || !F->isDeclaration() || (F->use_empty() && !StubUsed))
       continue; // unreferenced: no wrapper needed (no .s dead weight)
@@ -4715,7 +4715,8 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
     // c2go_SyscallN is the package-local forwarder to syscall.SyscallN. ----
     if (IsWindows) {
       llvm::GlobalVariable *FnAddrW =
-          getExternI64Global(("c2go_dyn_" + FD->getName()).str());
+          getExternI64Global(
+              ("c2go_dyn_" + c2goHostImportName(FD->getName())).str());
 
       // A size 1/2/4/8 is a Win64 single-register class (struct-as-integer).
       auto IsRegSize = [](uint64_t Sz) {
@@ -4857,7 +4858,7 @@ void CodeGenModule::EmitC2GoUnmanagedExternWrappers() {
     llvm::Function *Stub = cast<llvm::Function>(
         getModule()
             .getOrInsertFunction(
-                ("c2go_stub_" + FD->getName()).str(),
+                ("c2go_stub_" + c2goHostImportName(FD->getName())).str(),
                 llvm::FunctionType::get(llvm::Type::getVoidTy(getLLVMContext()),
                                         {}, /*isVarArg=*/false))
             .getCallee());

@@ -1775,6 +1775,21 @@ public:
   /// lands on the stack). \p D may be null (an indirect call).
   bool useC2GoGoABI0CallingConv(const Decl *D) const;
 
+  /// c2go: the host symbol an `unmanaged extern` binds to, for naming the
+  /// internal dispatch symbols (`c2go_dyn_<host>` address var, `c2go_stub_<host>`
+  /// trampoline). It is \p Name with the `__c2go_dynimp_` prefix stripped — that
+  /// prefix lets a wrapper import a host symbol whose plain name it also PROVIDES
+  /// (e.g. an errno-mapping rename over msvcrt's own rename) without a C-level
+  /// clash; the internal symbols name the *host* target, not the prefixed C
+  /// identifier, so the generated `c2go_dyn_rename` stays readable. No-op when the
+  /// prefix is absent, so every ordinary import is unaffected. c2go-bind applies
+  /// the identical strip (hostImportName) so both sides agree. Must be kept in
+  /// sync with c2go-bind's dynImportPrefix.
+  static llvm::StringRef c2goHostImportName(llvm::StringRef Name) {
+    Name.consume_front("__c2go_dynimp_"); // strips in place iff the prefix is present
+    return Name;
+  }
+
   /// c2go: stamp the internal-GoABI0 metadata attrs (c2go-void-vararg /
   /// c2go-reg-return / c2go-argsize / c2go-argptrmask) for \p FD onto \p F and
   /// enroll leaf-wrapper candidacy. Called from SetLLVMFunctionAttributes at

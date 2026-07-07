@@ -538,8 +538,10 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
           // address) instead of the wrapper @<name>, so the import is referenced
           // even when @<name> itself is unused — count the stub's uses too.
           if (!Referenced)
-            if (llvm::Function *SF =
-                    Mod->getFunction("c2go_stub_" + FD->getNameAsString()))
+            if (llvm::Function *SF = Mod->getFunction(
+                    ("c2go_stub_" +
+                     CodeGen::CodeGenModule::c2goHostImportName(FD->getName()))
+                        .str()))
               Referenced = !SF->use_empty();
         }
         if (!Explicit && !Referenced)

@@ -283,7 +283,8 @@ static llvm::Value *tryEmitC2GoExternImportStubAddr(CodeGenFunction &CGF,
   llvm::Function *Stub = cast<llvm::Function>(
       CGF.CGM.getModule()
           .getOrInsertFunction(
-              ("c2go_stub_" + FD->getName()).str(),
+              ("c2go_stub_" + CodeGenModule::c2goHostImportName(FD->getName()))
+                  .str(),
               llvm::FunctionType::get(CGF.VoidTy, {}, /*isVarArg=*/false))
           .getCallee());
   return CGF.Builder.CreateBitCast(Stub, CGF.ConvertType(PtrTy));
