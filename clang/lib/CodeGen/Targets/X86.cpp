@@ -3077,9 +3077,23 @@ static RValue emitC2GoVAArg(CodeGenFunction &CGF, Address VAListAddr,
       Builder.CreateConstInBoundsGEP1_64(PtrTy, Cursor, 1, "c2go.va.next");
   Builder.CreateStore(NextCursor, CursorSlot);
 
+  // Null-tolerant read: a va_arg past the last real vararg lands on the pack's
+  // trailing NIL sentinel slot (#588). Rather than dereferencing null, substitute
+  // a zero-initialized T-slot so the value read is 0. This makes musl's variadic
+  // idiom safe — read an optional trailing arg and ignore it when a runtime flag
+  // says it is absent (fcntl's F_GETFD/F_GETFL, ioctl's no-arg requests). A
+  // well-formed read (storage pointer non-null) loads the real value unchanged;
+  // only the sentinel case — previously a fault — becomes a defined zero. The
+  // sentinel stays nil, so the #588 GC contract (EmitC2GoVarArgPack) is untouched.
+  llvm::Value *IsSentinel = Builder.CreateIsNull(ArgStorage, "c2go.va.atend");
+  RawAddress ZeroSlot = CGF.CreateMemTemp(Ty, "c2go.va.zero");
+  CGF.EmitNullInitialization(ZeroSlot, Ty);
+  llvm::Value *SafeStorage = Builder.CreateSelect(
+      IsSentinel, ZeroSlot.getPointer(), ArgStorage, "c2go.va.safep");
+
   // The storage holds the vararg value; load it as T.
   CharUnits TyAlign = CGF.getContext().getTypeUnadjustedAlignInChars(Ty);
-  Address ResAddr(ArgStorage, CGF.ConvertTypeForMem(Ty), TyAlign);
+  Address ResAddr(SafeStorage, CGF.ConvertTypeForMem(Ty), TyAlign);
   return CGF.EmitLoadOfAnyValue(CGF.MakeAddrLValue(ResAddr, Ty), Slot);
 }
 

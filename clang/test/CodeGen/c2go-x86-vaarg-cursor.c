@@ -46,8 +46,13 @@ static long g;
 // CHECK: call goabi0cc void @my_config(i32 noundef 4, ptr noundef %c2go.va.argptrs)
 
 // Callee side: va_start binds the synthetic `void** __c2go_va` cursor
-// parameter; each va_arg loads the cursor, loads the argptr, advances
-// the cursor, then loads the value.
+// parameter; each va_arg loads the cursor, loads the argptr, advances the
+// cursor, then — #613, null-tolerant — compares the argptr to null and selects a
+// zero-initialized slot when it IS null (a va_arg past the last real vararg lands
+// on the pack's nil sentinel), so the value read is 0 instead of a null deref;
+// finally loads through the selected pointer. This makes musl's variadic idiom
+// (read an optional trailing arg, ignore it when a runtime flag says it's absent)
+// safe. The sentinel stays nil, so the caller-side #588 GC contract is unchanged.
 // CHECK-LABEL: define{{.*}} goabi0cc void @my_config(i32 noundef %op, ptr noundef %__c2go_va)
 // CHECK: %c2go.va.base = load ptr, ptr %__c2go_va.addr
 // CHECK: store ptr %c2go.va.base,
@@ -56,12 +61,16 @@ static long g;
 // CHECK: %c2go.va.cur = load ptr,
 // CHECK: %c2go.va.argp = load ptr, ptr %c2go.va.cur
 // CHECK: %c2go.va.next = getelementptr inbounds ptr, ptr %c2go.va.cur, i64 1
-// CHECK: load ptr, ptr %c2go.va.argp
+// CHECK: %c2go.va.atend = icmp eq ptr %c2go.va.argp, null
+// CHECK: %c2go.va.safep = select i1 %c2go.va.atend, ptr %c2go.va.zero, ptr %c2go.va.argp
+// CHECK: load ptr, ptr %c2go.va.safep
 //
 // va_arg(ap, long):
 // CHECK: %c2go.va.cur{{[0-9]+}} = load ptr,
-// CHECK: %c2go.va.argp{{[0-9]+}} = load ptr, ptr %c2go.va.cur
-// CHECK: load i64, ptr %c2go.va.argp
+// CHECK: %c2go.va.argp{{[0-9]+}} = load ptr, ptr %c2go.va.cur{{[0-9]+}}
+// CHECK: %c2go.va.atend{{[0-9]+}} = icmp eq ptr %c2go.va.argp{{[0-9]+}}, null
+// CHECK: %c2go.va.safep{{[0-9]+}} = select i1 %c2go.va.atend{{[0-9]+}}, ptr %c2go.va.zero{{[0-9]+}}, ptr %c2go.va.argp{{[0-9]+}}
+// CHECK: load i64, ptr %c2go.va.safep{{[0-9]+}}
 
 static void my_config(int op, ...) {
   va_list ap;
