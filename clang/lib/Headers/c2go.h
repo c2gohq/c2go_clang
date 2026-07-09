@@ -185,6 +185,30 @@ void *gc_malloc(const void *type_info, __SIZE_TYPE__ n)
 
 #define c2go_callout(fn) (__c2go_callout(fn))
 
+/*===-- Host-import name: import a host symbol you ALSO provide ------------
+ * C2GO_DYN(name) expands to the reserved `__c2go_dynimp_<name>` identifier for
+ * DECLARING a host import that must not claim the bare name — so the package can
+ * import host symbol `<name>` (from a DLL/so) while ALSO providing its own
+ * `<name>` via c2go_extern. clang strips the `__c2go_dynimp_` prefix to recover
+ * the real host symbol (the //go:cgo_import_dynamic remote + the c2go_dyn_<name>
+ * address var); the wrapper the C source calls keeps the prefixed identifier, so
+ * it never collides with the package's own `<name>`.
+ *
+ * A bare `extern int <name>(...)` import instead keeps the bare wrapper `<name>`,
+ * which by design collides at link with an accidental same-named internal
+ * definition — the guard that catches "meant this to be internal, forgot to say
+ * so". Reach for C2GO_DYN only when that collision is intentional (you provide
+ * your own <name>).
+ *
+ * Usage:
+ *   extern int C2GO_DYN(rename)(const char *, const char *);  // import host rename
+ *   c2go_extern int rename(const char *a, const char *b) {    // our own rename
+ *       int r = C2GO_DYN(rename)(a, b); ...                    // call the host
+ *   }
+ *===-----------------------------------------------------------------------*/
+
+#define C2GO_DYN(name) __c2go_dynimp_##name
+
 /*===-- GC array allocation (v15 §P4) -------------------------------------
  * gc_malloc_array(type_info, elem_size, count) allocates a contiguous,
  * GC-tracked array of `count` elements, each `elem_size` bytes, scanned per
