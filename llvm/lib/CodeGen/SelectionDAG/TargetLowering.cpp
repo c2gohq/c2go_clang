@@ -35,6 +35,7 @@
 #include "llvm/Support/KnownBits.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include <cctype>
 #include <deque>
 using namespace llvm;
@@ -202,10 +203,34 @@ TargetLowering::makeLibCall(SelectionDAG &DAG, RTLIB::LibcallImpl LibcallImpl,
       signExtend = zeroExtend = false;
   }
 
+  CallingConv::ID LibCC = getLibcallImplCallingConv(LibcallImpl);
+
+  // c2go: this libcall was synthesized here at ISel — either from an
+  // `@llvm.<fn>` FP intrinsic that the middle-end folded a libm call into, or
+  // from an ISel-recognized libm call (SelectionDAGBuilder::visitCall) — and it
+  // targets a c2go-provided Go-side symbol (`·sin`, `·atan2`, `·rint`, ...) that
+  // uses the Plan 9 GoABI0 convention, NOT the default C CC. Both folding paths
+  // converge on makeLibCall, so overriding the CC once here fixes every libm
+  // libcall on every target. Without this the callee reads its args off the
+  // stack while the default-C-CC call passes them in registers — a silent ABI
+  // break (observed as garbage atan2/nearbyint/exp results on baseline x86_64
+  // and via the arm64 intrinsic-fold path). Gate on the c2go module flag and an
+  // FP-typed result or argument (the shape of every libm transcendental /
+  // rounding libcall on c2go's hardware-float targets, where no soft-float or
+  // fp-conversion libcalls arise); non-c2go modules are untouched. This is what
+  // makes the per-libm-body no_builtin attributes unnecessary.
+  if (DAG.getMachineFunction().getFunction().getParent()->getModuleFlag(
+          llvm::c2go::kGoabiModuleFlag)) {
+    bool AnyFP = RetVT.isFloatingPoint();
+    for (const SDValue &Op : Ops)
+      AnyFP |= Op.getValueType().isFloatingPoint();
+    if (AnyFP)
+      LibCC = CallingConv::GoABI0;
+  }
+
   CLI.setDebugLoc(dl)
       .setChain(InChain)
-      .setLibCallee(getLibcallImplCallingConv(LibcallImpl), RetTy, OrigRetTy,
-                    Callee, std::move(Args))
+      .setLibCallee(LibCC, RetTy, OrigRetTy, Callee, std::move(Args))
       .setNoReturn(CallOptions.DoesNotReturn)
       .setDiscardResult(!CallOptions.IsReturnValueUsed)
       .setIsPostTypeLegalization(CallOptions.IsPostTypeLegalization)
@@ -12394,9 +12419,24 @@ bool TargetLowering::expandMultipleResultFPLibCall(
   SDValue InChain = StoresInChain ? StoresInChain : DAG.getEntryNode();
   SDValue Callee =
       DAG.getExternalSymbol(LibcallImpl, getPointerTy(DAG.getDataLayout()));
+
+  // c2go: the multiple-result FP libm libcalls (frexp/modf/sincos) synthesized
+  // here target c2go-provided GoABI0 Go-side symbols, not the default C CC —
+  // the third and last scalar-FP libcall emitter alongside makeLibCall and
+  // SelectionDAGLegalize::ExpandLibCall. Same gate/rationale as those two.
+  CallingConv::ID LibCC = getLibcallImplCallingConv(LibcallImpl);
+  if (DAG.getMachineFunction().getFunction().getParent()->getModuleFlag(
+          llvm::c2go::kGoabiModuleFlag)) {
+    bool AnyFP = RetType->isFloatingPointTy();
+    for (const SDValue &Op : Node->op_values())
+      AnyFP |= Op.getValueType().isFloatingPoint();
+    if (AnyFP)
+      LibCC = CallingConv::GoABI0;
+  }
+
   TargetLowering::CallLoweringInfo CLI(DAG);
-  CLI.setDebugLoc(DL).setChain(InChain).setLibCallee(
-      getLibcallImplCallingConv(LibcallImpl), RetType, Callee, std::move(Args));
+  CLI.setDebugLoc(DL).setChain(InChain).setLibCallee(LibCC, RetType, Callee,
+                                                     std::move(Args));
 
   auto [Call, CallChain] = LowerCallTo(CLI);
 
