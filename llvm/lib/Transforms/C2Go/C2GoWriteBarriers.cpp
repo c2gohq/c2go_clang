@@ -78,10 +78,20 @@ static bool storeNeedsBarrier(const StoreInst *SI) {
   if (!Val->getType()->isPointerTy() ||
       Val->getType()->getPointerAddressSpace() != kManagedAS)
     return false;
-  // The destination must also be a managed pointer: the shim takes AS1 operands
-  // and a managed store deposits into AS1 memory. A boundary cast that left the
-  // slot in AS0 is not a managed-heap write (and would mistype the shim call).
-  if (SI->getPointerOperand()->getType()->getPointerAddressSpace() != kManagedAS)
+  // The destination: managed (AS1) memory, or — #646 hole-2 fix — an AS0 slot
+  // that is not a current-frame alloca. C GLOBALS (data/bss pointer slots,
+  // including the Go-owned ceded ones) are AS0 addresses: they are GC roots
+  // re-scanned only at mark start, so a store during concurrent mark must
+  // shade the value exactly like a heap write (the Go compiler barriers ITS
+  // global pointer stores; C must too). Other AS0 slots reached through
+  // opaque/boundary-cast pointers are barriered conservatively — the same
+  // "prove safe or barrier" philosophy as the alloca rule below: an extra
+  // barrier only over-marks, never under-marks. (The former AS1-only slot
+  // filter existed to avoid mistyping the AS1 shim call; insertBarrier now
+  // addrspacecasts an AS0 slot for the call instead.)
+  unsigned SlotAS =
+      SI->getPointerOperand()->getType()->getPointerAddressSpace();
+  if (SlotAS != kManagedAS && SlotAS != 0)
     return false;
   const Value *Obj = getUnderlyingObject(SI->getPointerOperand());
   // A store straight into a current-frame alloca slot is a root-slot write; the
@@ -138,7 +148,15 @@ static void insertBarrier(StoreInst *SI, Constant *WBFlag,
   SplitBlockAndInsertIfThenElse(Cond, SI->getIterator(), &ThenTerm, &ElseTerm);
 
   IRBuilder<> SlowB(ThenTerm);
-  CallInst *Call = SlowB.CreateCall(Shim, {Slot, Val});
+  // #646: an AS0 slot (a C/global address) is addrspacecast for the AS1-typed
+  // shim call — same pointer word, and it never crosses a statepoint (the shim
+  // is gc-leaf and the cast's only use is this call), so RS4GC never needs a
+  // base for it.
+  Value *SlotArg = Slot;
+  if (Slot->getType()->getPointerAddressSpace() != kManagedAS)
+    SlotArg = SlowB.CreateAddrSpaceCast(
+        Slot, PointerType::get(SI->getContext(), kManagedAS), "wb.slot.as1");
+  CallInst *Call = SlowB.CreateCall(Shim, {SlotArg, Val});
   Call->setCallingConv(CallingConv::GoABI0);
 
   IRBuilder<> FastB(ElseTerm);

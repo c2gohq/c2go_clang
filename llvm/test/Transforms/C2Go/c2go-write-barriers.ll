@@ -33,6 +33,22 @@ entry:
   ret void
 }
 
+; #646 hole-2: a store of a managed pointer into a GLOBAL slot (an AS0 address
+; in the data segment — including the Go-owned ceded globals) IS barriered:
+; globals are GC roots re-scanned only at mark start, so a store during
+; concurrent mark must shade the value exactly like a heap write. The AS0 slot
+; is addrspacecast for the AS1-typed shim call; the fast-path store stays AS0.
+; CHECK-LABEL: define void @store_to_global(ptr addrspace(1) %q)
+; CHECK: load i32, ptr @runtime.writeBarrier
+; CHECK: call {{.*}}void @_c2go_writePtr(ptr addrspace(1) addrspacecast (ptr @g_single to ptr addrspace(1)), ptr addrspace(1) %q)
+; CHECK: store ptr addrspace(1) %q, ptr @g_single
+@g_single = internal global ptr addrspace(1) null, align 8
+define void @store_to_global(ptr addrspace(1) %q) gc "c2go-gc" {
+entry:
+  store ptr addrspace(1) %q, ptr @g_single, align 8
+  ret void
+}
+
 ; The c2go-libc barrier shim, declared with GoABI0 + addrspace(1) params so
 ; RewriteStatepointsForGC keeps the managed operands live across the call.
 ; CHECK: declare {{.*}}void @_c2go_writePtr(ptr addrspace(1), ptr addrspace(1)) [[WP_ATTRS:#[0-9]+]]
