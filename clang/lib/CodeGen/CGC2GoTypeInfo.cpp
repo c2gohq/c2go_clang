@@ -836,31 +836,77 @@ void CodeGenModule::emitC2GoGlobalGCMask(const VarDecl *D,
           if (CI->isZero())
             return true;
     }
-    // #423(b): one-pointer-word ConstantStruct/ConstantArray whose sole
-    // operand is a null pointer (or recurses into the same shape).
+    // #423(b), generalized by #646 P2: a ConstantStruct/ConstantArray ALL of
+    // whose operands are null (or the folded inttoptr-0 spelling of null) —
+    // `{ NULL, NULL }` / `{ .p = (T *)0 }` aggregates the FE did not collapse
+    // to zeroinitializer. (Constant::isNullValue does not recurse into
+    // ConstantAggregate.)
     if (auto *CA = llvm::dyn_cast<llvm::ConstantAggregate>(Init)) {
-      if (CA->getNumOperands() == 1) {
-        llvm::Constant *Op0 = CA->getOperand(0);
-        if (Op0->isNullValue())
+      auto opIsNull = [](llvm::Constant *Op) {
+        if (Op->isNullValue())
           return true;
-        if (auto *CE = llvm::dyn_cast<llvm::ConstantExpr>(Op0))
+        if (auto *CE = llvm::dyn_cast<llvm::ConstantExpr>(Op))
           if (CE->getOpcode() == llvm::Instruction::IntToPtr)
             if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(CE->getOperand(0)))
               if (CI->isZero())
                 return true;
-      }
+        return false;
+      };
+      bool AllNull = CA->getNumOperands() > 0;
+      for (unsigned I = 0, E = CA->getNumOperands(); I < E; ++I)
+        if (!opIsNull(CA->getOperand(I))) {
+          AllNull = false;
+          break;
+        }
+      if (AllNull)
+        return true;
     }
     return false;
   };
 
-  uint64_t VarSizeBytes =
-      ASTCtx.getTypeSizeInChars(QT).getQuantity();
-  unsigned PtrSize = M.getDataLayout().getPointerSize();
-  if (VarSizeBytes == PtrSize && Bitmap.Bytes.size() == 1 &&
-      Bitmap.Bytes[0] == 0x01 && isC2GoNullInit(GV)) {
+  // #646 P2 (== the #388 follow-up): EVERY pointer-carrying file-scope global
+  // cedes storage to the Go side — aggregates and multi-pointer layouts
+  // included, not just the single-pointer-word case. c2gobind synthesizes a
+  // Go var whose layout matches the mask ([N]unsafe.Pointer, or a mixed
+  // unsafe.Pointer/uintptr struct), so moduledata.gcdata covers every pointer
+  // slot and runtime.markroot scans them natively — a managed pointer parked
+  // in such a global is a REAL root (previously the aggregate path had a
+  // gcmask bitmap but no consumer: the object was collected out from under
+  // the C global; proven by the #646 repro).
+  //
+  // Eligibility stays zero-init (#394's reasoning, aggregate-wide): the Go
+  // var provides zero-value storage, so a DATA initializer cannot be
+  // preserved. Managed pointer slots can only ever be statically null, so
+  // real code is zero-init by construction; a global that mixes a managed
+  // pointer with a NON-zero scalar initializer is a hard error — silently
+  // keeping it C-owned would leave exactly the unrooted hole this closes.
+  if (isC2GoNullInit(GV)) {
     llvm::NamedMDNode *NMD =
         M.getOrInsertNamedMetadata(llvm::c2go::kGoOwnedGlobalsMDName);
     NMD->addOperand(
         llvm::MDNode::get(Ctx, {llvm::MDString::get(Ctx, VarName)}));
+    // Pin the DATA global itself (the mask GV is pinned above): mid-end
+    // SROA/GlobalOpt would otherwise split or internalize the aggregate
+    // (observed at -O2: `@g_slots` scalar-replaced into `@g_slots.0`),
+    // detaching the ceded Go storage from the C reference sites and
+    // invalidating the mask correspondence.
+    addCompilerUsedGlobal(GV);
+  } else {
+    // Non-zero initializer: NOT ceded — the C side keeps storage and emits
+    // the DATA initializer (#394 direction A; a static initializer can only
+    // point at other C globals, which need no GC root). Residual hazard,
+    // warned rather than rejected: if RUNTIME code later parks a gc_malloc'd
+    // object in this global, that pointer has no root (the write barrier
+    // covers the mark window, not persistence). Zero-initialize + assign at
+    // startup to get Go-owned rooted storage.
+    DiagnosticsEngine &DE = getDiags();
+    unsigned ID = DE.getCustomDiagID(
+        DiagnosticsEngine::Warning,
+        "c2go: global %0 contains managed pointers but has a non-zero "
+        "initializer, so its storage stays C-owned and is NOT scanned as a "
+        "GC root; a heap object stored into it at runtime can be collected "
+        "while still referenced. Zero-initialize it (assign at startup) to "
+        "get Go-owned rooted storage");
+    DE.Report(D->getLocation(), ID) << D->getName();
   }
 }

@@ -32,6 +32,10 @@
 // in this UTF-8 source). The trailing `[(+]` class disambiguates from any
 // strict-prefix name (none exist today, but pinned defensively).
 // RUN: grep -E "^(DATA|GLOBL) ·gPtrNull[(+]" %t.s | count 0
+//
+// #646 P2: the zero-init AGGREGATE gTarget is ceded too — no DATA/GLOBL for
+// its storage either (the Go-owned var provides it).
+// RUN: grep -E "^(DATA|GLOBL) ·gTarget[(+]" %t.s | count 0
 
 #if !defined(__C2GO__)
 #  error "needs -fc2go"
@@ -46,10 +50,10 @@ struct Node {
 };
 #pragma c2go pop
 
-// Storage target for the non-zero-init pointer. The emitter includes gTarget
-// in module_gcmask (aggregate, mask "03") but it is not single-ptr-word, so
-// it never enters the Go-owned set and its GLOBL trailer is expected to
-// remain.
+// Storage target for the non-zero-init pointer. #646 P2: gTarget is a
+// zero-init pointer-carrying aggregate, so it is now ALSO ceded to Go-owned
+// storage — its GLOBL trailer is suppressed like gPtrNull's, while the DATA
+// initializer of gPtr still references the (Go-provided) symbol.
 static struct Node gTarget;
 
 // C-owned path: non-zero pointer init. The IR initializer is `ptr @gTarget`

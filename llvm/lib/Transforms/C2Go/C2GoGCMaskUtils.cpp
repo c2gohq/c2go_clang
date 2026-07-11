@@ -120,6 +120,15 @@ json::Array collectGCMaskVarsFromModule(const Module &M) {
     V["name"] = VarName.str();
     V["mask_hex"] = HexBytes.str().str();
     V["ptr_bits"] = (int64_t)BitCount;
+    // #646 P2: the DATA global's allocation size. c2gobind needs it to
+    // synthesize a Go-owned var whose storage covers the WHOLE C layout
+    // (mask bytes only reach the last pointer word — trailing scalar fields
+    // would otherwise fall off the ceded storage). The data GV is pinned via
+    // llvm.compiler.used at emission, so it is still present here.
+    if (const GlobalVariable *DataGV =
+            M.getGlobalVariable(VarName, /*AllowInternal=*/true))
+      V["size_bytes"] = (int64_t)M.getDataLayout().getTypeAllocSize(
+          DataGV->getValueType());
     // c2go #387 §B4 phase 6 sub-step 1 (#389 WF2 mirror): surface the
     // Go-owned bit so c2gobind can emit a bodyless `var <name>
     // unsafe.Pointer` declaration in the generated Go package (Go
