@@ -2653,6 +2653,32 @@ bool AArch64TargetLowering::targetShrinkDemandedConstant(
   return optimizeLogicalImm(Op, Size, Imm, DemandedBits, TLO, NewOpc);
 }
 
+// c2go #654c: cap the known low-zero bits of a goabi frame index at 8-byte
+// alignment. The c2go frame places SP-based locals 8 bytes below their
+// layout-assigned offsets (resolveFrameOffsetReference's -8 shift keeps them
+// out of the reserved frame-top word the runtime's varp computation backs
+// over), so an object whose MachineFrameInfo alignment says 16+ (e.g. after
+// InstCombine's preferred-alignment bump in the c2go-lto inline pipeline) is
+// physically only guaranteed 8-aligned. Reporting the MFI alignment lets
+// DAGCombine fold `add (FrameIndex), 8` into a disjoint ORR whose bit 3 is
+// ALREADY SET at run time — the +8 silently vanishes and every derived field
+// address collapses onto the object base (Lua probe5: `&p.dyd` computed as
+// `&p`, so growvar wrote actvar.n into actvar.arr and the SP-relative reader
+// saw 0). An 8-byte claim survives the shift (both layout >= 8 and the shift
+// amount are multiples of 8), so cap — don't zero — the report. Shared by
+// SelectionDAG and GISelValueTracking, which both funnel frame-index known
+// bits through this hook.
+void AArch64TargetLowering::computeKnownBitsForFrameIndex(
+    int FIOp, KnownBits &Known, const MachineFunction &MF) const {
+  if (MF.getFunction().getParent()->getModuleFlag(
+          llvm::c2go::kGoabiModuleFlag) != nullptr) {
+    Known.Zero.setLowBits(std::min(
+        Log2(MF.getFrameInfo().getObjectAlign(FIOp)), 3u));
+    return;
+  }
+  TargetLowering::computeKnownBitsForFrameIndex(FIOp, Known, MF);
+}
+
 /// computeKnownBitsForTargetNode - Determine which of the bits specified in
 /// Mask are known to be either zero or one and return them Known.
 void AArch64TargetLowering::computeKnownBitsForTargetNode(

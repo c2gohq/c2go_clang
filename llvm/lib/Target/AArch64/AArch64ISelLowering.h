@@ -95,6 +95,12 @@ public:
                                      const SelectionDAG &DAG,
                                      unsigned Depth = 0) const override;
 
+  /// c2go #654c: in goabi mode a stack object's ADVERTISED alignment can
+  /// exceed its physical alignment, so the frame-index known bits must be
+  /// capped at 8-byte alignment (see the implementation comment).
+  void computeKnownBitsForFrameIndex(int FIOp, KnownBits &Known,
+                                     const MachineFunction &MF) const override;
+
   unsigned ComputeNumSignBitsForTargetNode(SDValue Op,
                                            const APInt &DemandedElts,
                                            const SelectionDAG &DAG,
