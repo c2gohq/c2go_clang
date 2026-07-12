@@ -147,13 +147,21 @@ computeX86LocalsMasks(const llvm::MachineFunction &MF, uint64_t FrameSize) {
   // When the function uses the "c2go-gc" strategy (set by C2GoGCSetupPass
   // when -c2go-statepoint-gc is on), RewriteStatepointsForGC already tracks
   // every live pointer per-PC and LowerSTATEPOINT records them, which is the
-  // SOUND source of truth. Suppress this static OR entirely in statepoint
-  // mode — let per-PC liveness take over and avoid the silent over-mark vs
-  // stack-slot coloring conflict (Wave Z F1-same-shape silent corruption).
+  // SOUND source of truth. Suppress this static OR in statepoint mode — let
+  // per-PC liveness take over and avoid the silent over-mark vs stack-slot
+  // coloring conflict (Wave Z F1-same-shape silent corruption).
+  //
+  // #654c EXCEPTION (AArch64 mirror): an aggregate whose ADDRESS is captured
+  // must keep the static mask even under statepoints — the per-PC expansion
+  // stops once the base SSA value dies, while the escaped address keeps the
+  // object reachable through pointer chains SSA liveness cannot see
+  // (`funcstate.ls = &lexstate`; copystack then strands lexstate.dyd on the
+  // dead pre-copy segment). Sound because C2GoFoldAllocaRelocates null-inits
+  // captured aggregates' pointer fields at entry and the lifetime strip pins
+  // their slots. Va-pack allocas stay excluded (contents valid only at their
+  // own call PC; no entry null-init — #588).
   const llvm::Function &F = MF.getFunction();
   const bool C2GoStatepointGC = F.hasGC() && F.getGC() == "c2go-gc";
-  if (C2GoStatepointGC)
-    return {AggBits, AmbigBits}; // both empty — per-PC liveness owns it
 
   const llvm::MachineFrameInfo &MFI = MF.getFrameInfo();
   const llvm::DataLayout &DL = MF.getDataLayout();
@@ -176,6 +184,10 @@ computeX86LocalsMasks(const llvm::MachineFunction &MF, uint64_t FrameSize) {
     llvm::Type *ATy = AI->getAllocatedType();
     if (!ATy->isAggregateType()) // scalars handled by the stackmap path
       continue;
+    if (C2GoStatepointGC &&
+        (AI->getMetadata(llvm::c2go::kVaPackMD) ||
+         !llvm::c2go::isAllocaAddressCaptured(AI)))
+      continue; // per-PC statepoint coverage suffices for non-escaped aggs
     llvm::Register FrameReg;
     llvm::StackOffset Off = TFL->getFrameIndexReference(MF, FI, FrameReg);
     // #602: resolve to an SP-relative offset (the bitmap's coordinate

@@ -31,6 +31,7 @@
 #include <cstdint>
 
 namespace llvm {
+class AllocaInst;
 class Module;
 class Type;
 
@@ -41,6 +42,25 @@ namespace c2go {
 /// any var named in the `!c2go.go_owned_globals` named-metadata. The result is
 /// sorted by var name for deterministic manifest output.
 json::Array collectGCMaskVarsFromModule(const Module &M);
+
+/// c2go #654c — does this stack object's ADDRESS escape the def-use chain?
+///
+/// True when the alloca's address may be CAPTURED (stored out as a value,
+/// laundered through ptrtoint, passed to a callee that may stash it, ...).
+/// From that instant the object can be reached through pointer chains that no
+/// SSA walk sees, so every SSA-liveness-based GC covering — RS4GC's gc-live
+/// sets (whose per-PC aggregate-field expansion in LowerSTATEPOINT stops when
+/// the base SSA value dies) and C2GoSafepoint's backward AllocaLiveness (whose
+/// escape handling is a one-off gen) — under-approximates "may still be
+/// observed". Consumers must fall back to static all-PCs coverage for captured
+/// allocas: probe5/#654c's `funcstate.ls = &lexstate` dropped lexstate out of
+/// every map after setup, so copystack left lexstate.dyd pointing into the
+/// dead pre-copy stack segment. nocapture-annotated callees (memset/printf at
+/// -O2) do NOT capture, preserving precise per-PC treatment for purely-local
+/// aggregates. One definition shared by the AArch64/X86 frame emitters and
+/// C2GoSafepoint so the three sites cannot drift (same rationale as
+/// walkPointerFields below).
+bool isAllocaAddressCaptured(const AllocaInst *AI);
 
 /// c2go #432 — single shared aggregate pointer-field walker.
 ///

@@ -417,8 +417,8 @@ static void markZeroInit(Instruction *I) {
                  MDNode::get(I->getContext(), {}));
 }
 
-// #311 — strip `llvm.lifetime.start/end` markers off a tracked aggregate
-// alloca, returning true if any were removed.
+// #311 — strip `llvm.lifetime.start/end` markers off a tracked alloca,
+// returning true if any were removed.
 //
 // Why: the entry zero-init we emit for a pointer-bearing aggregate (above) is
 // placed at function ENTRY, but after inlining the inlined aggregate carries
@@ -435,10 +435,12 @@ static void markZeroInit(Instruction *I) {
 // markers makes the slot whole-function-live, which (a) keeps the entry
 // zero-init valid so it survives to the prologue, and (b) stops StackColoring
 // from reusing the slot for an unrelated non-pointer local (consistent with the
-// #305 pointer/non-pointer no-merge rule). Scoped to c2go-tracked aggregates;
-// scalar pointer slots are unaffected (they already survive). #312 tracks the
-// per-PC-field-liveness root fix that would restore slot reuse.
-static bool stripAggregateLifetimes(AllocaInst *AI) {
+// #305 pointer/non-pointer no-merge rule). Applied to c2go-tracked aggregates
+// and (#654c) to address-captured SCALAR pointer slots — those are forced
+// whole-function live in the per-PC stackmaps, so their slot must likewise
+// never be recycled for a non-pointer. #312 tracks the per-PC-field-liveness
+// root fix that would restore slot reuse.
+static bool stripAllocaLifetimes(AllocaInst *AI) {
   SmallVector<IntrinsicInst *, 4> ToErase;
   for (User *U : AI->users()) {
     if (auto *II = dyn_cast<IntrinsicInst>(U)) {
@@ -550,6 +552,11 @@ static void classifyAllocaEffects(AllocaInst *A, unsigned BitIdx, unsigned NBits
         if (SI->getValueOperand() == V) {
           // The alloca-derived POINTER is being stashed elsewhere (escape):
           // a future load through that other location can observe it → USE.
+          // NOTE (#654c): this gen only extends liveness BACKWARD (toward
+          // entry); the "future load" needs coverage at every PC AFTER the
+          // escape too, which backward dataflow cannot express. That forward
+          // half is handled in run(): captured slots (this store makes the
+          // slot captured) are forced live at every site via CapturedSlots.
           setBit(L.Gen, I);
         } else if (IsBase && SI->getValueOperand()->getType()->isPointerTy()) {
           // store <ptr>, %alloca — direct, full pointer-width overwrite of the
@@ -821,7 +828,7 @@ PreservedAnalyses C2GoSafepointPass::run(Module &M, ModuleAnalysisManager &MAM) 
       // #311: drop each tracked aggregate's lifetime markers FIRST — before
       // computing the zero-init insertion point — so the entry zero-init is not
       // treated as a write to dead memory (which DSE/StackColoring would delete;
-      // see stripAggregateLifetimes). Done every run (the inliner re-introduces
+      // see stripAllocaLifetimes). Done every run (the inliner re-introduces
       // markers on the second run's freshly-inlined copies).
       //   #314: this strip MUST precede the IP computation below. A
       // `llvm.lifetime.start/end` intrinsic can be the first non-alloca entry
@@ -833,8 +840,25 @@ PreservedAnalyses C2GoSafepointPass::run(Module &M, ModuleAnalysisManager &MAM) 
       // masked because the removed #314 aggregate stackmap operands kept the
       // markers from being hoisted to the entry head.)
       for (AllocaInst *AI : AggAllocas)
-        if (stripAggregateLifetimes(AI))
+        if (stripAllocaLifetimes(AI))
           Changed = true;
+      // #654c: a pointer slot whose ADDRESS is captured (stored out as a
+      // value / handed to a callee that may stash it) can be read later
+      // through pointer chains the backward AllocaLiveness below cannot see —
+      // its escape handling is a one-off `gen`, which only protects PCs
+      // BEFORE the escape, while the promised "future load through that other
+      // location" needs every PC AFTER it. Force captured slots live at every
+      // site (their entry null-init makes the pre-store window read NULL,
+      // which copystack skips) and strip their lifetime markers — same
+      // #305/#311 no-recycle rationale as aggregates, and same #314 ordering
+      // constraint: strip BEFORE the zero-init IP is computed below.
+      BitVector CapturedSlots(SlotAllocas.size());
+      for (unsigned I = 0, N = SlotAllocas.size(); I < N; ++I)
+        if (c2go::isAllocaAddressCaptured(SlotAllocas[I])) {
+          CapturedSlots.set(I);
+          if (stripAllocaLifetimes(SlotAllocas[I]))
+            Changed = true;
+        }
       Instruction *IP = &*F.getEntryBlock().getFirstInsertionPt();
       while (IP && isa<AllocaInst>(IP))
         IP = IP->getNextNode();
@@ -872,7 +896,7 @@ PreservedAnalyses C2GoSafepointPass::run(Module &M, ModuleAnalysisManager &MAM) 
         // their call sites too.
         //
         // #311 keeps an aggregate's entry zero-init alive via
-        // stripAggregateLifetimes (above): with no lifetime markers the slot is
+        // stripAllocaLifetimes (above): with no lifetime markers the slot is
         // whole-function-live, so DSE/StackColoring can no longer prove the
         // zero-init dead. The backend OR's the aggregate's pointer-field bits
         // into every body bitmap (FUNCDATA $1) using the REAL field offsets, so
@@ -889,7 +913,7 @@ PreservedAnalyses C2GoSafepointPass::run(Module &M, ModuleAnalysisManager &MAM) 
         // only the real pointer-field words; anchoring spuriously marked the
         // non-pointer base word, so copystack read eDest=SRT_Output=9 as a
         // pointer → "bad pointer in frame ... yy_reduce ... 0x9". The
-        // zero-init anchoring is unnecessary (stripAggregateLifetimes already
+        // zero-init anchoring is unnecessary (stripAllocaLifetimes already
         // keeps it live) and unsound (pollutes the base word), so aggregates are
         // NO LONGER per-PC stackmap operands. Empty-operand stackmaps are still
         // emitted at every aggregate-bearing site (see below) so the backend has
@@ -916,8 +940,10 @@ PreservedAnalyses C2GoSafepointPass::run(Module &M, ModuleAnalysisManager &MAM) 
               SmallVector<AllocaInst *, 8> LiveSlots;
               if (!SlotAllocas.empty()) {
                 const BitVector &Live = L.LiveBefore[CB];
+                // #654c: captured slots bypass the backward liveness — see
+                // the CapturedSlots comment above.
                 for (unsigned I = 0, N = SlotAllocas.size(); I < N; ++I)
-                  if (Live.test(I))
+                  if (Live.test(I) || CapturedSlots.test(I))
                     LiveSlots.push_back(SlotAllocas[I]);
               }
               // #314: aggregates are NO LONGER appended as stackmap operands

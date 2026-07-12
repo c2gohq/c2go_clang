@@ -343,8 +343,23 @@ bool emitC2GoPrologue(MachineFunction &MF, MachineBasicBlock &MBB) {
   // C2GoGCSetupPass when -c2go-statepoint-gc is on), RewriteStatepointsForGC
   // already tracks every live pointer — including aggregate-field pointers it
   // loads/derives — and LowerSTATEPOINT records them per-PC, which is the SOUND
-  // source of truth. So suppress this static OR entirely in statepoint mode;
+  // source of truth. So suppress this static OR in statepoint mode;
   // the union-ambig scrub (its companion #312 hack) is likewise unneeded.
+  //
+  // #654c: ...EXCEPT for aggregates whose ADDRESS is captured. The per-PC
+  // expansion covers an aggregate only while its base SSA value sits in a
+  // gc-live set; once the address escapes into memory (Lua probe5:
+  // `funcstate.ls = &lexstate`), later reads arrive through pointer chains SSA
+  // liveness cannot see, the base drops out of every gc-live set after setup,
+  // and the aggregate's pointer fields vanish from the maps — the first
+  // copystack then leaves an escaped interior pointer (lexstate.dyd) aimed at
+  // the dead pre-copy segment. For captured aggregates the static mask IS
+  // sound today: C2GoFoldAllocaRelocates null-inits every pointer field at
+  // entry (#327) so a not-yet-written field reads NULL (skipped), the
+  // lifetime strip (#311/#326) pins the slot against stack-slot reuse, and
+  // union-ambiguous words keep the #312 scrub. Va-pack allocas stay excluded:
+  // their contents are valid only at their own call PC and they carry no
+  // entry null-init (#588).
   bool C2GoStatepointGC = MF.getFunction().hasGC() &&
                           MF.getFunction().getGC() == "c2go-gc";
   // c2go #238 Phase 3: locals masks (`Bits` / `AmbigBits`) and the storage
@@ -375,11 +390,12 @@ bool emitC2GoPrologue(MachineFunction &MF, MachineBasicBlock &MBB) {
     // them apart, so at a PC where the slot holds the union's integer member
     // copystack would misread it as a pointer (#312: yy_reduce ... 0x9).
     AmbigBits.assign((Nbit + 7) / 8, 0);
-    // Aggregate pointer-FIELD mask + union-ambig scrub: lightweight path only
-    // (#327: unsound/unneeded under the statepoint path, which marks aggregate
-    // fields per-PC via LowerSTATEPOINT).
+    // Aggregate pointer-FIELD mask + union-ambig scrub: lightweight path, plus
+    // — under the statepoint path — address-captured aggregates only (#654c:
+    // per-PC LowerSTATEPOINT expansion loses an aggregate once its base SSA
+    // value dies, even though the escaped address keeps the object reachable).
     for (int FI = MFI.getObjectIndexBegin(), E = MFI.getObjectIndexEnd();
-         !C2GoStatepointGC && FI < E; ++FI) {
+         FI < E; ++FI) {
       if (MFI.isDeadObjectIndex(FI))
         continue;
       const AllocaInst *AI = MFI.getObjectAllocation(FI);
@@ -388,6 +404,10 @@ bool emitC2GoPrologue(MachineFunction &MF, MachineBasicBlock &MBB) {
       Type *ATy = AI->getAllocatedType();
       if (!ATy->isAggregateType()) // scalars handled by the stackmap path
         continue;
+      if (C2GoStatepointGC &&
+          (AI->getMetadata(llvm::c2go::kVaPackMD) ||
+           !c2go::isAllocaAddressCaptured(AI)))
+        continue; // per-PC statepoint coverage suffices for non-escaped aggs
       Register FrameReg;
       StackOffset Off = TFL->getFrameIndexReference(MF, FI, FrameReg);
       if (FrameReg != AArch64::SP)

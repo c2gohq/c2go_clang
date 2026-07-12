@@ -21,8 +21,11 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Analysis/CaptureTracking.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Casting.h"
@@ -149,6 +152,49 @@ json::Array collectGCMaskVarsFromModule(const Module &M) {
     return AN < BN;
   });
   return Vars;
+}
+
+namespace {
+// c2go #654c: capture tracker that ignores c2go's OWN GC bookkeeping uses.
+// C2GoSafepoint lists every tracked alloca as an operand of the
+// `llvm.experimental.stackmap` it anchors before each call, and RS4GC threads
+// alloca bases through `gc.statepoint` gc-live bundles. Those operands merely
+// RECORD the slot for the runtime — they cannot stash the address anywhere —
+// but they carry no `captures(none)` attribute, so the stock analysis counts
+// them as captures. Left unfiltered, the pass's second run (OptimizerLast,
+// after run 1 instrumented every site) would classify EVERY tracked slot as
+// escaped, destroying the per-PC precision the whole scheme exists for.
+struct C2GoEscapeTracker : public CaptureTracker {
+  bool Captured = false;
+  void tooManyUses() override { Captured = true; } // conservative direction
+  Action captured(const Use *U, UseCaptureInfo CI) override {
+    if (const auto *II = dyn_cast<IntrinsicInst>(U->getUser())) {
+      switch (II->getIntrinsicID()) {
+      case Intrinsic::experimental_stackmap:
+      case Intrinsic::experimental_gc_statepoint:
+        return ContinueIgnoringReturn;
+      default:
+        break;
+      }
+    }
+    Captured = true;
+    return Stop;
+  }
+};
+} // end anonymous namespace
+
+// c2go #654c — see the header doc-comment. One shared wrapper over LLVM's
+// capture analysis so all three consumers share ONE escape definition.
+//
+// A `ret` of the address counts as a capture (returning a stack address out
+// of the frame is UB in C, but if code does it anyway we prefer a redundant
+// static mark over a silent stale pointer). MaxUsesToExplore stays at the
+// analysis default — on "too many uses" the tracker reports captured, which
+// is the conservative (over-mark) direction.
+bool isAllocaAddressCaptured(const AllocaInst *AI) {
+  C2GoEscapeTracker Tracker;
+  PointerMayBeCaptured(AI, &Tracker);
+  return Tracker.Captured;
 }
 
 } // namespace c2go
