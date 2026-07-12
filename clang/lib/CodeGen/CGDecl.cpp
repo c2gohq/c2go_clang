@@ -185,8 +185,22 @@ c2goCollectAmbiguousUnionWords(const clang::ASTContext &Ctx, clang::QualType QT,
                                uint64_t Base, uint64_t PtrSize,
                                llvm::SmallVectorImpl<uint64_t> &Out) {
   QT = QT.getCanonicalType();
-  if (QT.isNull() || QT->isPointerType())
-    return; // pointer leaves are unambiguous; scalars carry no pointer
+  if (QT.isNull())
+    return;
+  if (QT->isPointerType()) {
+    // #654c-b: a FUNCTION-pointer field must never be marked as a relocatable
+    // stack pointer. Its run-time values are code addresses or POSIX sentinel
+    // integers (struct sigaction's sa_handler holding SIG_IGN == 1); neither
+    // points into the goroutine stack, and copystack throws "invalid pointer
+    // found on stack" on any marked word holding a small non-zero integer.
+    // Emit its offset through this same skip/scrub channel: the streamer
+    // clears the bit in EVERY locals bitmap (static agg mask AND per-PC
+    // stackmap entries), and the emitters' SkipBytes drop it from the
+    // aggregate-field walk.
+    if (QT->getPointeeType()->isFunctionType())
+      Out.push_back(Base);
+    return; // data-pointer leaves are unambiguous; scalars carry no pointer
+  }
 
   if (const auto *AT = Ctx.getAsConstantArrayType(QT)) {
     uint64_t ESz = Ctx.getTypeSizeInChars(AT->getElementType()).getQuantity();
@@ -1826,7 +1840,11 @@ CodeGenFunction::EmitAutoVarAlloca(const VarDecl &D) {
           attachC2GoManagedPtrMetadata(AllocaAddr.getPointer(), RD);
         // #282/#287: also tag every pointer-typed local so copystack
         // relocates it (a `T* p = &stackLocal` must survive a stack move).
-        if (Ty->isPointerType())
+        // #654c-b: EXCEPT function pointers — they hold code addresses or
+        // POSIX sentinel integers (SIG_IGN == 1), never stack addresses, and
+        // a marked slot holding a small integer makes copystack throw
+        // "invalid pointer found on stack".
+        if (Ty->isPointerType() && !Ty->getPointeeType()->isFunctionType())
           attachC2GoPtrSlotMetadata(AllocaAddr.getPointer());
         // #312: tag aggregate locals that contain a union with the set of
         // union-ambiguous pointer-word offsets so the backend's static

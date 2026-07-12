@@ -1022,7 +1022,14 @@ std::string CodeGenModule::computeC2GoArgPtrMask(const FunctionDecl *FD,
     uint64_t Sz = Ctx.getTypeSizeInChars(QT).getQuantity();
     uint64_t Al = Ctx.getTypeAlignInChars(QT).getQuantity();
     Total = alignUp(Total, Al);
-    if (MarkIfPointer && QT->isPointerType())
+    // #654c-b: FUNCTION-pointer args are never marked. Their run-time values
+    // are code addresses or POSIX sentinel integers (SIG_IGN == 1, SIG_ERR ==
+    // -1) — neither points into the goroutine stack, so copystack has nothing
+    // to relocate, and a marked word holding a small non-zero integer makes
+    // adjustpointers throw "invalid pointer found on stack" (signal(sig,
+    // SIG_IGN) with a stack move while the arg word is in a walked frame).
+    if (MarkIfPointer && QT->isPointerType() &&
+        !QT->getPointeeType()->isFunctionType())
       PtrWords.push_back(Total / RegSize);
     Total += Sz;
   };
