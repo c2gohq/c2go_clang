@@ -17,7 +17,6 @@
 #include "clang/AST/ASTDiagnostic.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/AttrIterator.h"
-#include "clang/AST/C2GoUtil.h"
 #include "clang/AST/CharUnits.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclBase.h"
@@ -4171,51 +4170,6 @@ void Sema::CheckConstructorCall(FunctionDecl *FDecl, QualType ThisType,
             Loc, SourceRange(), CallType);
 }
 
-// c2go #650: qsort cannot sort elements that carry MANAGED pointers — a MODEL
-// CONSTRAINT (the union-punning precedent), not a missing feature. qsort's
-// void* interface erases the element type, so its moves are untyped byte
-// copies through a NOSCAN char temp, violating the concurrent-GC invariants
-// three ways: a pointer's only copy can sit invisible in the temp while the
-// array object is scanned (lost object), a scanner can read a torn pointer
-// mid-move (badPointer throw), and the moves skip the hybrid write barrier
-// (lost marking). Diagnose the VISIBLE spelling at the call site — the base
-// argument's pre-decay element type transitively containing a managed
-// pointer; a base laundered through an explicit void* cast escapes the check
-// and is undefined behavior (documented in c2go-libc source/qsort.c), exactly
-// as memcpy escapes the union-punning error. bsearch only READS elements, so
-// it is exempt.
-static void checkC2GoQsortManagedElements(Sema &S, CallExpr *TheCall,
-                                          const IdentifierInfo *FnInfo) {
-  if (!FnInfo->isStr("qsort") || TheCall->getNumArgs() < 1)
-    return;
-  const Expr *Base = TheCall->getArg(0)->IgnoreParenImpCasts();
-  QualType T = Base->getType();
-  if (const ArrayType *AT = S.Context.getAsArrayType(T))
-    T = AT->getElementType();
-  else if (T->isPointerType())
-    T = T->getPointeeType();
-  else
-    return;
-  while (const ArrayType *AT = S.Context.getAsArrayType(T))
-    T = AT->getElementType();
-  bool Managed = c2go::isManagedPointerType(T);
-  if (!Managed) {
-    QualType Canon = T.getCanonicalType();
-    if (const auto *RT = Canon->getAs<RecordType>())
-      if (const RecordDecl *RD = RT->getDecl()->getDefinition())
-        Managed = c2go::recordContainsManagedPointer(RD);
-  }
-  if (!Managed)
-    return;
-  unsigned ID = S.Diags.getCustomDiagID(
-      DiagnosticsEngine::Error,
-      "c2go: qsort cannot sort elements of type %0, which contain managed "
-      "pointers — its untyped byte moves are not GC-safe under concurrent "
-      "marking (invisible/torn pointers, no write barriers); sort indices or "
-      "unmanaged data instead");
-  S.Diag(Base->getBeginLoc(), ID) << T;
-}
-
 bool Sema::CheckFunctionCall(FunctionDecl *FDecl, CallExpr *TheCall,
                              const FunctionProtoType *Proto) {
   bool IsMemberOperatorCall = isa<CXXOperatorCallExpr>(TheCall) &&
@@ -4273,9 +4227,6 @@ bool Sema::CheckFunctionCall(FunctionDecl *FDecl, CallExpr *TheCall,
   CheckAbsoluteValueFunction(TheCall, FDecl);
   CheckMaxUnsignedZero(TheCall, FDecl);
   CheckInfNaNFunction(TheCall, FDecl);
-
-  if (getLangOpts().C2GoMode)
-    checkC2GoQsortManagedElements(*this, TheCall, FnInfo);
 
   if (getLangOpts().ObjC)
     ObjC().DiagnoseCStringFormatDirectiveInCFAPI(FDecl, Args, NumArgs);
