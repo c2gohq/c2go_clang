@@ -50,6 +50,37 @@ class MCInstPrinter;
 class MCCodeEmitter;
 class formatted_raw_ostream;
 
+/// #654b: single source of truth for "is this a COMPILER-GENERATED private /
+/// local symbol" in the Plan 9 pipeline. Locals render file-scoped
+/// (`name<>(SB)`, sanitised, no middle-dot); everything else is an ordinary
+/// package symbol (`·name`). This predicate used to be duplicated (with
+/// "keep in lockstep" comments) across MCPlan9AsmStreamer
+/// {isPlan9LocalDataSym, emitLabel stage-3, symbolToPlan9} and the
+/// {AArch64,X86} InstPrinters {goSymToPlan9, isLocalLabelName}; the copies
+/// drifted twice (#276 `likeInfoNorm`, #654b Lua's `l_alloc`/`LTnum`), each
+/// time splitting a static C function's TEXT definition (`·name`) from its
+/// references (`name<>`). Key invariant: a C identifier can never contain a
+/// `.`, so a dot marks a generated name; the only dot-free generated shapes
+/// are the well-known label/constant-pool prefixes below.
+/// (AArch64Plan9InstPrinter::isLocalLabelName stays broader by design — it
+/// classifies BRANCH TARGETS only, which are never C function symbols.)
+inline bool isPlan9CompilerLocalSym(StringRef Name) {
+  if (Name.starts_with(".L"))
+    return true; // ELF locals: .LBB / .Ltmp / .L.str / .LCPI / .LJTI ...
+  if (Name.empty())
+    return false;
+  if (Name[0] == 'L')
+    return Name.contains('.') || Name.starts_with("LBB") ||
+           Name.starts_with("Ltmp") || Name.starts_with("LCPI") ||
+           Name.starts_with("LJTI") || Name.starts_with("Lloh") ||
+           Name.starts_with("Lfunc_"); // Mach-O-style, e.g. NOT Lua's LTnum
+  if (Name.size() >= 2 && Name[0] == 'l' &&
+      (Name[1] == '_' || (Name[1] >= 'A' && Name[1] <= 'Z')))
+    return Name.contains('.') || Name.starts_with("lCPI") ||
+           Name.starts_with("lJTI"); // l_.str.N / l_c2go.*, NOT Lua's l_alloc
+  return false;
+}
+
 /// Per-target Plan 9 symbolic printing interface. AArch64Plan9InstPrinter
 /// implements this (multiple inheritance alongside AArch64InstPrinter).
 /// MCPlan9AsmStreamer holds a non-owning pointer to this interface so

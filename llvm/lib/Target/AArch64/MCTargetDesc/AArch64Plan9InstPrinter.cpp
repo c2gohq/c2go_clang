@@ -174,10 +174,11 @@ static std::string goSymToPlan9(StringRef Name) {
     }
   };
 
-  // Mach-O / ELF local labels: sanitise, no middle-dot.
-  if ((Name.size() >= 2 && Name[0] == 'l' &&
-       (Name[1] == '_' || (Name[1] >= 'A' && Name[1] <= 'Z'))) ||
-      Name.starts_with("L") || Name.starts_with(".L")) {
+  // Mach-O / ELF local labels: sanitise, no middle-dot. #654b: shared
+  // predicate (MCPlan9AsmStreamer.h) — a static C function named `l_alloc`
+  // or `LTnum` (Lua) stays an ordinary `·` symbol matching its TEXT
+  // definition; only compiler-generated privates render file-local.
+  if (isPlan9CompilerLocalSym(Name)) {
     std::string Out = Name.str();
     sanitiseToIdent(Out);
     // #586: goSymToPlan9 only ever renders (SB) operands (data / functions);

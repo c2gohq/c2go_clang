@@ -95,10 +95,11 @@ static bool isC2GoGoOwnedGlobal(const StringSet<> &Set, StringRef Plan9);
 // formatBranchTarget / text-label emission), so only real private data symbols
 // are scoped. Keep this predicate in lockstep with the local-label detection in
 // symbolToPlan9 / goSymToPlan9.
+// #654b: delegates to the single shared predicate (MCPlan9AsmStreamer.h) —
+// the per-site copies drifted twice (#276 `likeInfoNorm`, #654b `l_alloc` /
+// `LTnum`), splitting a static C function's TEXT definition from its refs.
 static bool isPlan9LocalDataSym(StringRef Name) {
-  return Name.starts_with("L") || Name.starts_with(".L") ||
-         (Name.size() >= 2 && Name[0] == 'l' &&
-          (Name[1] == '_' || (Name[1] >= 'A' && Name[1] <= 'Z')));
+  return isPlan9CompilerLocalSym(Name);
 }
 
 namespace {
@@ -410,10 +411,7 @@ void MCPlan9AsmStreamer::emitLabel(MCSymbol *Symbol, SMLoc /*Loc*/) {
   // this test as narrow as symbolToPlan9's so an ordinary static C
   // function whose name starts with a lowercase `l` (e.g. `lengthFunc`)
   // is NOT mistaken for a private label here.
-  if (!Name.empty() &&
-      (Name[0] == 'L' || Name.starts_with(".L") ||
-       (Name.size() >= 2 && Name[0] == 'l' &&
-        (Name[1] == '_' || (Name[1] >= 'A' && Name[1] <= 'Z'))))) {
+  if (isPlan9CompilerLocalSym(Name)) {
     emitC2GoLocalLabel(Name);
     return;
   }
@@ -696,9 +694,7 @@ std::string MCPlan9AsmStreamer::symbolToPlan9(StringRef Name) {
   // dropped its `·` prefix, so its DATA/GLOBL definition and the
   // InstPrinter-emitted code reference disagreed (goSymToPlan9 uses the
   // narrower test below). Keep both in sync.
-  if (Name[0] == 'L' || Name.starts_with(".L") ||
-      (Name.size() >= 2 && Name[0] == 'l' &&
-       (Name[1] == '_' || (Name[1] >= 'A' && Name[1] <= 'Z')))) {
+  if (isPlan9CompilerLocalSym(Name)) {
     std::string Out = Name.str();
     sanitiseToIdent(Out);
     return Out;

@@ -192,10 +192,11 @@ static std::string goSymToPlan9(StringRef Name) {
     }
   };
 
-  // Mach-O / ELF local labels: sanitise, no middle-dot.
-  if ((Name.size() >= 2 && Name[0] == 'l' &&
-       (Name[1] == '_' || (Name[1] >= 'A' && Name[1] <= 'Z'))) ||
-      Name.starts_with("L") || Name.starts_with(".L")) {
+  // Mach-O / ELF local labels: sanitise, no middle-dot. #654b: shared
+  // predicate (MCPlan9AsmStreamer.h) — a static C function named `l_alloc`
+  // or `LTnum` (Lua) stays an ordinary `·` symbol matching its TEXT
+  // definition; only compiler-generated privates render file-local.
+  if (isPlan9CompilerLocalSym(Name)) {
     std::string Out = Name.str();
     sanitiseToIdent(Out);
     // #586: a local symbol reaching goSymToPlan9 is a private DATA symbol
@@ -266,12 +267,9 @@ static std::string goSymToPlan9(StringRef Name) {
 // (AArch64's broad `isLocalLabelName` is branch-target-only — its data
 // refs always route through `goSymToPlan9` — so it is unaffected.)
 static bool isLocalLabelName(StringRef Name) {
-  if (Name.empty()) return false;
-  if (Name[0] == 'L' || Name.starts_with(".L")) return true;
-  if (Name.size() >= 2 && Name[0] == 'l' &&
-      (Name[1] == '_' || (Name[1] >= 'A' && Name[1] <= 'Z')))
-    return true;
-  return false;
+  // #654b: shared predicate (MCPlan9AsmStreamer.h) — keeps static C symbols
+  // like `l_alloc` / `LTnum` (Lua) out of the local class on data refs too.
+  return isPlan9CompilerLocalSym(Name);
 }
 
 static std::string sanitizeLocalLabel(StringRef Name) {

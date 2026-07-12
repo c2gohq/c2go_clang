@@ -280,6 +280,14 @@ static llvm::Value *tryEmitC2GoExternImportStubAddr(CodeGenFunction &CGF,
   const auto *FD = DRE ? dyn_cast<FunctionDecl>(DRE->getDecl()) : nullptr;
   if (!FD)
     return nullptr;
+  // #654b: Sema retypes `&f` to CC_C2GoExternImport at PARSE time, when a
+  // definition later in the TU is not yet visible (Lua's makeseed takes
+  // &lua_newstate 300 lines before lstate.c defines it). Body emission is
+  // deferred to end-of-TU (#601), so isDefined() is accurate HERE: a function
+  // defined in this TU can never be an import — emit its real address, not a
+  // c2go_stub_* trampoline that nothing will ever define.
+  if (FD->isDefined())
+    return nullptr;
   llvm::Function *Stub = cast<llvm::Function>(
       CGF.CGM.getModule()
           .getOrInsertFunction(
