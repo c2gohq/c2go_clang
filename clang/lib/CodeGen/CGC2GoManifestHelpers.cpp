@@ -30,6 +30,11 @@ bool isC2GoUnmanagedExternImport(const FunctionDecl *FD) {
   // c2go_extern is export-only; c2go_linkname owns its own bridge path.
   if (FD->hasAttr<C2GoExternAttr>() || FD->hasAttr<C2GoLinknameAttr>())
     return false;
+  // An internal-linkage (static) function can never be an external import:
+  // its definition lives in this TU by construction (#654; keep in sync with
+  // SemaExpr's c2goAdjustImportFnPointee).
+  if (!FD->isExternallyVisible())
+    return false;
   // Declared-only: no body in this declaration and no definition anywhere in
   // the redecl chain. A c2go_unmanaged function names an external import, so it
   // must never be defined in c2go (Sema rejects a definition); this test keeps

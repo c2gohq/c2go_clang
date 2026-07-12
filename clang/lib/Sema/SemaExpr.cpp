@@ -528,9 +528,16 @@ static QualType c2goAdjustImportFnPointee(Sema &S, const Expr *FnRef,
     return FnTy;
   const auto *DRE = dyn_cast<DeclRefExpr>(FnRef->IgnoreParenImpCasts());
   const auto *FD = DRE ? dyn_cast<FunctionDecl>(DRE->getDecl()) : nullptr;
+  // An internal-linkage (static) function can NEVER be an external import —
+  // its definition lives in this TU by construction. Without this exclusion a
+  // FORWARD-DECLARED static decayed before its definition (mutually recursive
+  // helpers, Lua's warnfoff/warnfon and io_readline) is mid-parse
+  // "not-yet-defined" and got mistyped into the import world (#654 — the
+  // parse-point-isDefined twin of #601).
   if (!FD || !FD->hasAttr<C2GoUnmanagedAttr>() ||
       FD->hasAttr<C2GoExternAttr>() || FD->hasAttr<C2GoLinknameAttr>() ||
-      FD->doesThisDeclarationHaveABody() || FD->isDefined())
+      FD->doesThisDeclarationHaveABody() || FD->isDefined() ||
+      !FD->isExternallyVisible())
     return FnTy;
   ASTContext &Ctx = S.Context;
   if (const auto *FPT = FnTy->getAs<FunctionProtoType>()) {
