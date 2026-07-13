@@ -2535,14 +2535,28 @@ static void AppendCPUSpecificCPUDispatchMangling(const CodeGenModule &CGM,
 // (llvm/Transforms/C2Go/C2GoExportName.h), so the WF1 manifest writer
 // and the WF2 fallback path stay in lock-step with this rename emitter
 // by construction (#444).
+//
+// c2go (#676): file-scope DATA named `init`/`main` collides identically —
+// `DATA ·init` shares the symbol slot with the package's init TEXT, the
+// relocations against it resolve into the code segment, and the first
+// store SIGBUSes (musl random.c's `static uint32_t init[]` was the live
+// case). Same unconditional rename, DISTINCT spelling
+// (c2go_dinit/c2go_dmain, shared helper c2goInitMainRenamedDataSymbol) so
+// a function `init` and a data `init` from different TUs of one package
+// cannot merge into a single renamed symbol. The manifest is untouched:
+// statics never enter it, and Sema rejects c2go_extern on a variable
+// named init/main outright — the exported Go side would need a
+// package-level `var init`, which Go reserves
+// (err_c2go_extern_var_init_main).
 static StringRef c2goInitMainRename(const CodeGenModule &CGM,
                                     const NamedDecl *ND) {
   if (!CGM.getLangOpts().C2GoMode)
     return {};
-  const auto *FD = dyn_cast<FunctionDecl>(ND);
-  if (!FD)
-    return {};
-  return llvm::c2go::c2goInitMainRenamedSymbol(FD->getName());
+  if (const auto *FD = dyn_cast<FunctionDecl>(ND))
+    return llvm::c2go::c2goInitMainRenamedSymbol(FD->getName());
+  if (const auto *VD = dyn_cast<VarDecl>(ND))
+    return llvm::c2go::c2goInitMainRenamedDataSymbol(VD->getName());
+  return {};
 }
 
 // Returns true if GD is a function decl with internal linkage and

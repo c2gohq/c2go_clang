@@ -6455,6 +6455,22 @@ static void handleC2GoExternAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
           return;
         }
       }
+  // c2go (#676): a c2go_extern VARIABLE named `init`/`main` is not
+  // representable at all (any export case): exported c2go data is Go-owned
+  // storage — c2gobind declares a package-level Go `var <cname>` — and Go
+  // reserves `init` (and `main` in package main) there. The emitted DATA
+  // symbol itself is renamed (CodeGenModule::c2goInitMainRename, the #317
+  // data extension), but the Go-side var cannot follow; reject instead of
+  // exporting a binding that cannot compile.
+  if (const auto *VD = dyn_cast<VarDecl>(D))
+    if (const IdentifierInfo *II = VD->getIdentifier()) {
+      StringRef N = II->getName();
+      if (N == "init" || N == "main") {
+        S.Diag(AL.getLoc(), diag::err_c2go_extern_var_init_main) << N;
+        AL.setInvalid();
+        return;
+      }
+    }
   D->addAttr(::new (S.Context) C2GoExternAttr(S.Context, AL, (int)Export));
 
   // c2go: a function carrying BOTH c2go_linkname (a header declaration naming

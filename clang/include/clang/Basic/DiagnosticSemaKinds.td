@@ -2466,6 +2466,10 @@ def err_c2go_extern_init_main_lowercase : Error<
   "'c2go_extern(0)' cannot export a C function named %0: a lowercase Go "
   "binding would collide with Go's language-level %0; use 'c2go_extern' or "
   "'c2go_extern(1)' to export it as the exported wrapper '%1' instead">;
+def err_c2go_extern_var_init_main : Error<
+  "'c2go_extern' cannot export a C variable named %0: exported c2go data "
+  "is Go-owned storage declared as a package-level Go 'var %0', and Go "
+  "reserves that identifier at package scope; rename the C variable">;
 def note_implicit_param_decl : Note<"%0 is an implicit parameter">;
 def note_member_synthesized_at : Note<
   "in %select{implicit|defaulted}0 %sub{select_special_member_kind}1 for %2 "

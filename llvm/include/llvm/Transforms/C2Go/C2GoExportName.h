@@ -74,6 +74,25 @@ inline StringRef c2goInitMainRenamedSymbol(StringRef CName) {
   return {};
 }
 
+/// c2go (#676): the DATA-symbol counterpart of the #317 function rename.
+/// A C file-scope VARIABLE named `init`/`main` collides the same way once
+/// the Plan 9 emitter prepends `·`: `DATA ·init` shares the symbol slot
+/// with the package's language-level init TEXT, relocations against it
+/// resolve into the code segment, and the first store through them faults
+/// (SIGBUS with a text-segment fault address — the #675/prng fingerprint,
+/// musl random.c's `static uint32_t init[]`). The spelling is DISTINCT
+/// from the function rename (c2go_cinit/c2go_cmain): one package may hold
+/// a C function `init` in one TU and a C data `init` in another, and the
+/// two renames must not merge into a single symbol. Returns the renamed
+/// bare symbol or an empty StringRef when \p CName is neither.
+inline StringRef c2goInitMainRenamedDataSymbol(StringRef CName) {
+  if (CName == "init")
+    return "c2go_dinit";
+  if (CName == "main")
+    return "c2go_dmain";
+  return {};
+}
+
 } // namespace c2go
 } // namespace llvm
 
