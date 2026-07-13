@@ -247,8 +247,8 @@ void emitC2GoStructMeta(llvm::Module &M, const RecordDecl *RD,
       SchemeStr = "scheme1";
       PtrOff = (int64_t)Class.PointerOffsetBytes;
       break;
-    case C2GoUnionScheme::Scheme2:
-      SchemeStr = "scheme2";
+    case C2GoUnionScheme::PunHardError:
+      SchemeStr = "pun_hard_error";
       break;
     case C2GoUnionScheme::NotApplicable:
       SchemeStr = "not_applicable";
@@ -267,8 +267,10 @@ void emitC2GoStructMeta(llvm::Module &M, const RecordDecl *RD,
       llvm::MDString::get(LCtx, Linkname),
   };
   NMD->addOperand(llvm::MDNode::get(LCtx, Ops));
-  // 2026-06-16: scheme2 unions are now a hard error (§3.9) — no
-  // per-alternative `union_alts` / `union_alts_go_type` MD to emit.
+  // 2026-06-16: type-punned unions (PunHardError, historically "scheme2")
+  // hard-error in CodeGenAction (§3.9); the abandoned union→Go-`any` boxing
+  // emitted per-alternative `union_alts` / `union_alts_go_type` MD here —
+  // deleted, nothing to emit.
 }
 
 void emitC2GoFuncManifest(llvm::Module &M, llvm::StringRef CName,

@@ -228,8 +228,9 @@ static void collectAlternatives(const RecordDecl *RD, uint64_t BaseOff,
     // that as "scalar with size" for scheme1 purposes (a single-bit
     // bitmap can't cover an array of pointers). Concretely: an array of
     // managed pointers in a union alternative falls through to Scalar
-    // (blocks scheme1) which is the correct conservative answer — Scheme2
-    // is needed to express that case.
+    // (blocks scheme1) which is the correct conservative answer — the
+    // PunHardError classification covers that case (hard error; use
+    // c2go_variant).
     QualType Peeled = FT;
     bool IsArray = false;
     while (const ArrayType *AT = Peeled->getAsArrayTypeUnsafe()) {
@@ -266,7 +267,7 @@ static void collectAlternatives(const RecordDecl *RD, uint64_t BaseOff,
       // its whole footprint. A nested union with managed pointers is a
       // legitimate case that scheme1 cannot encode (would need a second
       // bit position), so falling through to Scalar correctly forces
-      // scheme2.
+      // PunHardError (hard error; use c2go_variant).
     }
 
     uint64_t Sz = Ctx.getTypeSizeInChars(FT).getQuantity();
@@ -313,9 +314,10 @@ C2GoUnionClassification classifyC2GoUnion(const RecordDecl *UnionRD,
   // Precise single-slot (Scheme1) requires (a) all scan-pointer
   // alternatives at the same offset and (b) no scalar alternative overlaps
   // that offset. Otherwise the union type-puns a pointer slot → hard error
-  // (Scheme2 classification; the any-subtype box scaffolding is deleted).
+  // (PunHardError; the historical "scheme2" any-boxing scaffolding was
+  // deleted 2026-06-16).
   if (ScanPtrOffsets.size() != 1) {
-    Result.Scheme = C2GoUnionScheme::Scheme2;
+    Result.Scheme = C2GoUnionScheme::PunHardError;
     // Pick any second offset as the "blocker" hint.
     uint64_t First = *ScanPtrOffsets.begin();
     for (const UnionAlt &A : Alts) {
@@ -338,7 +340,7 @@ C2GoUnionClassification classifyC2GoUnion(const RecordDecl *UnionRD,
     uint64_t SEnd = SBeg + (S->SizeBytes ? S->SizeBytes : 1);
     // Overlap test: [SBeg, SEnd) intersects [PtrOff, PtrEnd).
     if (SBeg < PtrEnd && PtrOff < SEnd) {
-      Result.Scheme = C2GoUnionScheme::Scheme2;
+      Result.Scheme = C2GoUnionScheme::PunHardError;
       Result.BlockerFieldName = S->FieldName;
       Result.BlockerReason =
           "scalar alternative overlaps the managed pointer slot";

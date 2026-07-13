@@ -799,8 +799,8 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
       // §3.9 / T3 — a `c2go_variant` union is converted to a struct whose
       // slots are partitioned by GC class (pointer slots first as
       // `unsafe.Pointer`, then one trailing no-scan `[N]uint8` blob). This
-      // makes the pointer slots precisely scannable and bypasses the Scheme2
-      // hard error below (which the un-opted-in punning union still gets).
+      // makes the pointer slots precisely scannable and bypasses the
+      // PunHardError below (which the un-opted-in punning union still gets).
       bool IsVariant = IsUnion && c2go::isC2GoVariantUnion(RD);
       if (IsVariant) {
         auto VL = c2go::computeC2GoVariantLayout(RD, Ctx);
@@ -831,17 +831,17 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
         //     pointer slot precisely. No diagnostic — the union is
         //     exactly representable.
         //
-        //   * Scheme2 — a scanned pointer type-puns a scalar, or scan
+        //   * PunHardError — a scanned pointer type-puns a scalar, or scan
         //     pointers live at multiple offsets. A single static bitmap
-        //     cannot encode this → HARD ERROR (see below). The old
-        //     "any-subtype box" fallback is deleted.
+        //     cannot encode this → HARD ERROR (see below). The abandoned
+        //     "scheme2 → any-subtype box" fallback is deleted (2026-06-16).
         //
         //   * NotApplicable — no scanned-pointer alternative at all.
         //     The union is a plain opaque slab from the GC's point of
         //     view; nothing to encode.
         UnionClass = c2go::classifyC2GoUnion(RD, Ctx);
         auto &Class = UnionClass;
-        if (Class.Scheme == c2go::C2GoUnionScheme::Scheme2) {
+        if (Class.Scheme == c2go::C2GoUnionScheme::PunHardError) {
           // 2026-06-16 (§3.9): a union that type-puns a SCANNED pointer
           // slot with a scalar (or places scan pointers at >1 offset)
           // cannot be represented as a static GC bitmap. Under the new
@@ -866,7 +866,7 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
         }
         // Scheme1 / NotApplicable: the union's typeinfo bitmap will
         // encode the precise pointer slot (Scheme1) or be empty
-        // (NotApplicable). Scheme2 already errored out above.
+        // (NotApplicable). PunHardError already errored out above.
         const ASTRecordLayout &Layout = Ctx.getASTRecordLayout(RD);
         uint64_t SizeBytes = Layout.getSize().getQuantity();
         uint64_t AlignBytes = Layout.getAlignment().getQuantity();
@@ -994,7 +994,8 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
       //     emission style that doesn't collide with user-typed names.
       //   * The union representation scheme picked by §A4 so the
       //     binding can emit a precise GC bitmap hint (scheme1) or
-      //     defer to opaque storage (not_applicable / scheme2).
+      //     defer to opaque storage (not_applicable; pun_hard_error
+      //     never reaches the manifest — it errored out above).
 
       // (1) linkage owner: defaults to C-owner. A c2go_linkname on the
       // record means the canonical Go-side declaration lives in
@@ -1030,8 +1031,8 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
         case c2go::C2GoUnionScheme::Scheme1:
           SchemeStr = "scheme1";
           break;
-        case c2go::C2GoUnionScheme::Scheme2:
-          SchemeStr = "scheme2";
+        case c2go::C2GoUnionScheme::PunHardError:
+          SchemeStr = "pun_hard_error";
           break;
         case c2go::C2GoUnionScheme::NotApplicable:
           SchemeStr = "not_applicable";
@@ -1040,7 +1041,7 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
         Ty["union_scheme"] = SchemeStr;
         if (UnionClass.Scheme == c2go::C2GoUnionScheme::Scheme1)
           Ty["union_ptr_offset"] = (int64_t)UnionClass.PointerOffsetBytes;
-        // Scheme2 errored out earlier; only Scheme1 / NotApplicable
+        // PunHardError errored out earlier; only Scheme1 / NotApplicable
         // reach here, so there are no per-alternative subtypes to emit.
       }
 

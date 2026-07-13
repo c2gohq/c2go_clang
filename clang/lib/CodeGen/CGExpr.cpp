@@ -6549,10 +6549,12 @@ CGCallee CodeGenFunction::EmitCallee(const Expr *E) {
 }
 
 // #214 — removed `_c2go_union_write_barrier` emit (was Round 1 P0 #1+#3,
-// scheme2 union + non-union p->m=v cases). Wrong direction: scheme2 union
-// should go through §A4 step 2 any-subtype IR rewrite (task #215); non-
-// union c2go_struct managed-ptr stores are already covered by the
-// precise GC bitmap (alloca has !c2go.ptr.managed metadata + stackmap).
+// punned-union + non-union p->m=v cases). Wrong direction; the whole
+// "scheme2 → any-subtype rewrite" plan it deferred to (#215) was itself
+// abandoned on 2026-06-16 (§3.9: type-punned unions are a hard error,
+// opt-in via c2go_variant). Non-union c2go_struct managed-ptr stores are
+// covered by the precise GC bitmap (alloca has !c2go.ptr.managed metadata
+// + stackmap).
 // At SQLite scale, 1233 of these CALLs were unresolved cross-pkg refs
 // that ballooned the Go linker symbol table to 16 GB.
 //

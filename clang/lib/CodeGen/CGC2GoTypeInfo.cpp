@@ -155,9 +155,10 @@ public:
       emitCOwner(RecName, TypeinfoName);
     }
 
-    // 2026-06-16: scheme2 unions are now a hard error (§3.9); the
-    // any-subtype box scaffolding (union_alts MD + _c2go_union_box) is
-    // deleted, so there is nothing extra to emit for unions here.
+    // 2026-06-16: type-punned unions (PunHardError, historically "scheme2")
+    // hard-error in CodeGenAction (§3.9); the abandoned union→Go-`any` box
+    // scaffolding (union_alts MD + _c2go_union_box) is deleted, so there is
+    // nothing extra to emit for unions here.
   }
 
 private:
@@ -341,15 +342,15 @@ private:
 
     const ASTRecordLayout &RL = ASTCtx.getASTRecordLayout(R);
 
-    // Unions: §A4 / §3.9 — pick scheme1 or scheme2 from the
-    // per-alternative layout. Scheme1 yields one bitmap bit at the unique
-    // scanned-pointer offset inside the union. Scheme2 type-puns a scanned
-    // pointer slot → a static bitmap cannot encode it; since this struct
-    // gets a real typeinfo (it is GC-tracked), force-scanning the punned
-    // slot would feed Go's GC a non-pointer and trip `invalidptr`. That is
-    // a HARD ERROR here too (the CodeGenAction worklist path catches
-    // unions that reach the manifest; this catches those reached only via
-    // a parent struct's typeinfo walk). NotApplicable: no scanned-pointer
+    // Unions: §A4 / §3.9 — classify from the per-alternative layout.
+    // Scheme1 yields one bitmap bit at the unique scanned-pointer offset
+    // inside the union. PunHardError type-puns a scanned pointer slot → a
+    // static bitmap cannot encode it; since this struct gets a real
+    // typeinfo (it is GC-tracked), force-scanning the punned slot would
+    // feed Go's GC a non-pointer and trip `invalidptr`. That is a HARD
+    // ERROR here too (the CodeGenAction worklist path catches unions that
+    // reach the manifest; this catches those reached only via a parent
+    // struct's typeinfo walk). NotApplicable: no scanned-pointer
     // alternative → nothing to add.
     if (R->isUnion()) {
       if (RecWorld == FieldWorld::Unmanaged)
@@ -357,7 +358,7 @@ private:
       // §3.9 / T3 — a `c2go_variant` union is converted to a struct whose
       // pointer slots are GC-class-partitioned (no punned bytes). Set a scan
       // bit at each pointer slot's offset within the converted struct; the
-      // scalar blob is no-scan. This bypasses the Scheme2 hard error below.
+      // scalar blob is no-scan. This bypasses the PunHardError below.
       if (c2go::isC2GoVariantUnion(R)) {
         auto VL = c2go::computeC2GoVariantLayout(R, ASTCtx);
         if (VL.Valid)
@@ -371,7 +372,7 @@ private:
       if (Class.Scheme == c2go::C2GoUnionScheme::Scheme1) {
         uint64_t BitOff = Offset + Class.PointerOffsetBytes;
         Bitmap.setWord(BitOff / PtrSize, PtrSize);
-      } else if (Class.Scheme == c2go::C2GoUnionScheme::Scheme2) {
+      } else if (Class.Scheme == c2go::C2GoUnionScheme::PunHardError) {
         DiagnosticsEngine &Diags = CGM.getDiags();
         Diags.Report(R->getLocation(),
                      Diags.getCustomDiagID(

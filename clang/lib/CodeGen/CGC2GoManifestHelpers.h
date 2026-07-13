@@ -98,7 +98,7 @@ bool isC2GoScalarRegReturnImport(const FunctionDecl *FD);
 ///
 /// Operand layout (one MDNode, 4 operands):
 ///   0: !"managed" | !"unmanaged"
-///   1: !"not_applicable" | !"scheme1" | !"scheme2"  (union scheme)
+///   1: !"not_applicable" | !"scheme1" | !"pun_hard_error"  (union scheme)
 ///   2: i64 union_ptr_offset (scheme1 only; -1 otherwise)
 ///   3: !"<linkname>" if c2go_linkname is set; empty MDString otherwise.
 void emitC2GoStructMeta(llvm::Module &M, const RecordDecl *RD,

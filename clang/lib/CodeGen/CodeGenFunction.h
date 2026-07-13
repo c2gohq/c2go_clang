@@ -4410,11 +4410,13 @@ public:
   void EmitStoreThroughExtVectorComponentLValue(RValue Src, LValue Dst);
   void EmitStoreThroughGlobalRegLValue(RValue Src, LValue Dst);
 
-  // #214 — removed EmitC2GoScheme2UnionBarrierIfNeeded. The
-  // `_c2go_union_write_barrier` emit path was the wrong substitute for
-  // §A4 step 2 any-subtype IR rewrite (task #215) and for non-union
-  // structs needed no barrier at all (managed alloca has precise GC
-  // bitmap). See CGExpr.cpp's pre-EmitBinaryOperatorLValue comment.
+  // #214 — removed EmitC2GoScheme2UnionBarrierIfNeeded (the
+  // `_c2go_union_write_barrier` emit path). The any-subtype rewrite it
+  // deferred to (#215) was itself abandoned on 2026-06-16 — type-punned
+  // unions are now a hard error (§3.9, C2GoUnionScheme::PunHardError;
+  // opt-in via c2go_variant). Non-union structs needed no barrier at all
+  // (managed alloca has precise GC bitmap). See CGExpr.cpp's
+  // pre-EmitBinaryOperatorLValue comment.
 
   /// EmitStoreThroughBitfieldLValue - Store Src into Dst with same constraints
   /// as EmitStoreThroughLValue.

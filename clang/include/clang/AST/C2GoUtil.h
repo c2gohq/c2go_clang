@@ -73,23 +73,26 @@ bool recordContainsManagedPointer(const RecordDecl *RD);
 ///     storage with a one-word GC bitmap bit set at offset N. The Go side
 ///     sees a typed pointer slot the GC can scan without ambiguity.
 ///
-///   * Scheme2 ("type-punned pointer slot"): a scanned pointer coexists with
-///     scalars at the same offset, or scanned pointers live at multiple
-///     distinct offsets. The static-bitmap encoding cannot represent this.
-///     There is no boxing / zero-bit fallback — the boxing scaffolding was
-///     deleted. We report Scheme2 and the caller hard-errors (instructing
-///     the user to give the pointer its own pure slot, change the punned
-///     member to uintptr_t, or mark the union `__attribute__((c2go_variant))`).
+///   * PunHardError ("type-punned pointer slot"): a scanned pointer coexists
+///     with scalars at the same offset, or scanned pointers live at multiple
+///     distinct offsets. The static-bitmap encoding cannot represent this and
+///     the caller hard-errors (instructing the user to give the pointer its
+///     own pure slot, change the punned member to uintptr_t, or mark the
+///     union `__attribute__((c2go_variant))`). Historical note: this
+///     classification was named "scheme2" while a union→Go-`any` boxing
+///     lowering existed for it; that approach was abandoned and its
+///     scaffolding deleted on 2026-06-16 (§3.9) — the classification now
+///     exists ONLY to drive the hard error.
 ///
 ///   * NotApplicable: \p UnionRD is not a union, or it contains no managed
 ///     pointer alternative (a pure-scalar union needs no special treatment;
 ///     the surrounding struct's bitmap simply has no bits in that span).
-enum class C2GoUnionScheme { Scheme1, Scheme2, NotApplicable };
+enum class C2GoUnionScheme { Scheme1, PunHardError, NotApplicable };
 
 /// Result of classifyC2GoUnion. When \c Scheme is Scheme1 the
 /// \c PointerOffsetBytes field reports the single byte offset at which all
 /// managed pointer alternatives sit; the typeinfo emitter uses it to mark
-/// one bit in the GC bitmap. For Scheme2 the \c BlockerFieldName /
+/// one bit in the GC bitmap. For PunHardError the \c BlockerFieldName /
 /// \c BlockerReason describe one of the alternatives that prevented Scheme1
 /// — surfaced in the diagnostic so users can refactor the offending field.
 struct C2GoUnionClassification {
@@ -100,8 +103,8 @@ struct C2GoUnionClassification {
 };
 
 /// Walk \p UnionRD's alternatives (recursing into anonymous structs that
-/// appear as direct alternatives) and decide between Scheme1, Scheme2, or
-/// NotApplicable. The classification mirrors the rules in the doc-comment
+/// appear as direct alternatives) and decide between Scheme1, PunHardError,
+/// or NotApplicable. The classification mirrors the rules in the doc-comment
 /// on \c C2GoUnionScheme.
 C2GoUnionClassification classifyC2GoUnion(const RecordDecl *UnionRD,
                                           const ASTContext &Ctx);
