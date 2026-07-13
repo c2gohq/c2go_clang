@@ -233,6 +233,15 @@ static void collectPtrSlotAllocas(Function &F,
     auto *AI = dyn_cast<AllocaInst>(&I);
     if (!AI)
       continue;
+    // #665: FUNCTION-pointer slots (kFnPtrAddrSpace) never enter the tracked
+    // set — their values are code addresses or POSIX sentinel integers, and a
+    // marked slot holding SIG_IGN==1 makes copystack throw. (clang already
+    // stopped tagging them with kPtrSlotMD in #654c-b; this covers the bare
+    // isPointerTy() arm for the new address space.)
+    if (AI->getAllocatedType()->isPointerTy() &&
+        AI->getAllocatedType()->getPointerAddressSpace() ==
+            c2go::kFnPtrAddrSpace)
+      continue;
     if (AI->getAllocatedType()->isPointerTy() ||
         AI->getMetadata(c2go::kPtrSlotMD))
       Out.push_back(AI);

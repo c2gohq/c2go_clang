@@ -27,6 +27,7 @@
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 
 #include <cstdint>
 
@@ -85,6 +86,13 @@ bool isAllocaAddressCaptured(const AllocaInst *AI);
 inline void walkPointerFields(Type *Ty, uint64_t Base, const DataLayout &DL,
                               function_ref<void(uint64_t Off)> Cb) {
   if (Ty->isPointerTy()) {
+    // #665: FUNCTION-pointer fields live in kFnPtrAddrSpace and are never GC
+    // pointers (code addresses or POSIX sentinel integers) — they contribute
+    // no pointer word to any mask / null-init / per-PC expansion. The clang
+    // union-ambig channel (#654c-b) remains as a redundant scrub for the
+    // same words.
+    if (Ty->getPointerAddressSpace() == kFnPtrAddrSpace)
+      return;
     Cb(Base);
     return;
   }

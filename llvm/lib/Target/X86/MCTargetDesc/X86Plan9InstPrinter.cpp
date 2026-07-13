@@ -1370,7 +1370,7 @@ static bool tryPrintSetccMemSymbolic(const MCInst *MI, raw_ostream &O,
 static bool tryPrintSSEX87MemSymbolic(const MCInst *MI, raw_ostream &O,
                                       const MCRegisterInfo &MRI,
                                       const MCInstrInfo &MII) {
-  enum Form { Load6, RMW7, Store6, X87M5, BlendRMW7 };
+  enum Form { Load6, RMW7, Store6, X87M5, BlendRMW7, CmpRMW8 };
   struct Ent { const char *Op; const char *P9; Form F; };
   static const Ent kTable[] = {
       // (0) SSE4.1 implicit-XMM0 blends (#600: sqlite3AtoF selects
@@ -1403,6 +1403,11 @@ static bool tryPrintSSEX87MemSymbolic(const MCInst *MI, raw_ostream &O,
       {"MOVSSrm_alt", "MOVSS",     Load6},
       {"UCOMISDrm",   "UCOMISD",   Load6},   // compare: shares Load6 print
       {"UCOMISSrm",   "UCOMISS",   Load6},
+      // predicate compares producing an all-ones/zero mask (#665: the fp
+      // addrspace lowering let -O2 fold `fcmp oeq; zext` through the SSE
+      // mask form against a pool constant — {Rd, Rd(tied), mem5, pred-imm})
+      {"CMPSDrmi",    "CMPSD",     CmpRMW8},
+      {"CMPSSrmi",    "CMPSS",     CmpRMW8},
       {"ADDSDrm",     "ADDSD",     RMW7},
       {"SUBSDrm",     "SUBSD",     RMW7},
       {"MULSDrm",     "MULSD",     RMW7},
@@ -1472,6 +1477,20 @@ static bool tryPrintSSEX87MemSymbolic(const MCInst *MI, raw_ostream &O,
     O << ", ";
     printPlan9Reg(O, MI->getOperand(0).getReg(), MRI);
     O << "\n";
+    return true;
+  case CmpRMW8:
+    // dst @0 (tied to src1 @1), mem tuple @2-6, predicate imm @7. Go asm
+    // wants the predicate LAST: `CMPSD mem, xmm, $pred`
+    // (cmd/asm testdata amd64enc.s: `CMPSD (BX), X2, $7`).
+    if (MI->getNumOperands() < 8 || !MI->getOperand(0).isReg() ||
+        !MI->getOperand(7).isImm())
+      return false;
+    if (!isPlan9SymbolicMemTuple(MI, /*OpStart=*/2)) return false;
+    O << "\t" << E->P9 << " ";
+    printPlan9MemRef(O, MI, /*OpStart=*/2, MRI);
+    O << ", ";
+    printPlan9Reg(O, MI->getOperand(0).getReg(), MRI);
+    O << ", $" << MI->getOperand(7).getImm() << "\n";
     return true;
   }
   return false;

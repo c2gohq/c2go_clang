@@ -49,6 +49,7 @@
 #include "llvm/IR/MatrixBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/TypeSize.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include <cstdarg>
 #include <optional>
 
@@ -295,7 +296,11 @@ static llvm::Value *tryEmitC2GoExternImportStubAddr(CodeGenFunction &CGF,
                   .str(),
               llvm::FunctionType::get(CGF.VoidTy, {}, /*isVarArg=*/false))
           .getCallee());
-  return CGF.Builder.CreateBitCast(Stub, CGF.ConvertType(PtrTy));
+  // #665: the stub is an AS0 llvm::Function while function-POINTER types live
+  // in kFnPtrAddrSpace — bridge with an addrspacecast (a plain BitCast across
+  // address spaces fails castIsValid).
+  return CGF.Builder.CreatePointerBitCastOrAddrSpaceCast(
+      Stub, CGF.ConvertType(PtrTy));
 }
 
 class ScalarExprEmitter
@@ -5316,18 +5321,25 @@ Value *ScalarExprEmitter::EmitCompare(const BinaryOperator *E,
               RHS->getType()->getPointerAddressSpace()) {
         unsigned LHSAS = LHS->getType()->getPointerAddressSpace();
         unsigned RHSAS = RHS->getType()->getPointerAddressSpace();
-        // c2go #441: only the {AS0, AS1} mismatch is a legitimate c2go-managed
-        // shape (one side is `ptr addrspace(1)` from a managed pointer, the
-        // other side is `ptr` from a managed-record GV address or a
-        // non-managed pointer). Any other AS combination has no documented
-        // semantic — silently bridging it would either lose managed-ness or
-        // forge it. Trap so we surface the gap instead of miscompiling.
-        assert(((LHSAS == 0 && RHSAS == 1) || (LHSAS == 1 && RHSAS == 0)) &&
+        // c2go #441: only the {AS0, AS1} managed mismatch and (#665) the
+        // {AS0, kFnPtrAddrSpace} function-pointer mismatch are legitimate
+        // c2go shapes. AS1: one side is `ptr addrspace(1)` from a managed
+        // pointer, the other `ptr` from a managed-record GV address or a
+        // non-managed pointer. kFnPtrAddrSpace: function-POINTER values live
+        // in the dedicated non-GC AS while a decayed function DESIGNATOR
+        // (`fp == somefunc`) is the AS0 llvm::Function address. Any other AS
+        // combination has no documented semantic — silently bridging it
+        // would either lose managed-ness or forge it. Trap so we surface the
+        // gap instead of miscompiling.
+        auto IsBridgeable = [](unsigned A, unsigned B) {
+          return A == 0 && (B == 1 || B == llvm::c2go::kFnPtrAddrSpace);
+        };
+        assert((IsBridgeable(LHSAS, RHSAS) || IsBridgeable(RHSAS, LHSAS)) &&
                "c2go #441: unexpected non-default address space in pointer "
-               "compare; only AS0<->AS1 mismatch is supported");
-        if (LHSAS == 0 && RHSAS == 1)
+               "compare; only AS0<->{AS1, fnptr-AS} mismatches are supported");
+        if (IsBridgeable(LHSAS, RHSAS))
           LHS = Builder.CreateAddrSpaceCast(LHS, RHS->getType(), "cmp.ascast");
-        else if (LHSAS == 1 && RHSAS == 0)
+        else if (IsBridgeable(RHSAS, LHSAS))
           RHS = Builder.CreateAddrSpaceCast(RHS, LHS->getType(), "cmp.ascast");
         else
           llvm_unreachable("c2go #441: unsupported address-space pair in "
@@ -5951,12 +5963,19 @@ VisitAbstractConditionalOperator(const AbstractConditionalOperator *E) {
             RHS->getType()->getPointerAddressSpace()) {
       unsigned LHSAS = LHS->getType()->getPointerAddressSpace();
       unsigned RHSAS = RHS->getType()->getPointerAddressSpace();
-      assert(((LHSAS == 0 && RHSAS == 1) || (LHSAS == 1 && RHSAS == 0)) &&
+      // #665: also bridge {AS0, kFnPtrAddrSpace} — a `?:` between a decayed
+      // function DESIGNATOR (AS0 llvm::Function address) and a function-
+      // pointer VALUE (fnptr AS), e.g. sqlite3PagerOpen's
+      // `memDb ? pageReinit : 0` shapes. Same rationale as the compare path.
+      auto IsBridgeable = [](unsigned A, unsigned B) {
+        return A == 0 && (B == 1 || B == llvm::c2go::kFnPtrAddrSpace);
+      };
+      assert((IsBridgeable(LHSAS, RHSAS) || IsBridgeable(RHSAS, LHSAS)) &&
              "c2go #442: unexpected non-default address space in `?:` arm; "
-             "only AS0<->AS1 mismatch is supported");
-      if (LHSAS == 0 && RHSAS == 1)
+             "only AS0<->{AS1, fnptr-AS} mismatches are supported");
+      if (IsBridgeable(LHSAS, RHSAS))
         LHS = Builder.CreateAddrSpaceCast(LHS, RHS->getType(), "cond.ascast");
-      else if (LHSAS == 1 && RHSAS == 0)
+      else if (IsBridgeable(RHSAS, LHSAS))
         RHS = Builder.CreateAddrSpaceCast(RHS, LHS->getType(), "cond.ascast");
       else
         llvm_unreachable("c2go #442: unsupported address-space pair in `?:`");
@@ -6031,9 +6050,14 @@ VisitAbstractConditionalOperator(const AbstractConditionalOperator *E) {
           RHS->getType()->getPointerAddressSpace()) {
     unsigned LHSAS = LHS->getType()->getPointerAddressSpace();
     unsigned RHSAS = RHS->getType()->getPointerAddressSpace();
-    assert(((LHSAS == 0 && RHSAS == 1) || (LHSAS == 1 && RHSAS == 0)) &&
+    // #665: also bridge {AS0, kFnPtrAddrSpace} — decayed function designator
+    // vs function-pointer value arms; same rationale as the select shape.
+    auto IsBridgeable = [](unsigned A, unsigned B) {
+      return A == 0 && (B == 1 || B == llvm::c2go::kFnPtrAddrSpace);
+    };
+    assert((IsBridgeable(LHSAS, RHSAS) || IsBridgeable(RHSAS, LHSAS)) &&
            "c2go #442: unexpected non-default address space in PHI `?:` arm; "
-           "only AS0<->AS1 mismatch is supported");
+           "only AS0<->{AS1, fnptr-AS} mismatches are supported");
     auto InsertAscastBeforeTerm = [&](llvm::Value *&V, llvm::BasicBlock *BB,
                                      llvm::Type *DstTy) {
       llvm::Instruction *Term = BB->getTerminator();
@@ -6042,9 +6066,9 @@ VisitAbstractConditionalOperator(const AbstractConditionalOperator *E) {
       Builder.SetInsertPoint(Term);
       V = Builder.CreateAddrSpaceCast(V, DstTy, "cond.ascast");
     };
-    if (LHSAS == 0 && RHSAS == 1)
+    if (IsBridgeable(LHSAS, RHSAS))
       InsertAscastBeforeTerm(LHS, LHSBlock, RHS->getType());
-    else if (LHSAS == 1 && RHSAS == 0)
+    else if (IsBridgeable(RHSAS, LHSAS))
       InsertAscastBeforeTerm(RHS, RHSBlock, LHS->getType());
     else
       llvm_unreachable("c2go #442: unsupported address-space pair in PHI `?:`");

@@ -46,6 +46,21 @@ static llvm::cl::opt<bool> C2GoManagedAddrSpace(
     llvm::cl::desc("c2go: lower pointers to c2go_struct-managed records to "
                    "addrspace(1) (GC discriminator)"));
 
+// c2go #665 (#654c-b root fix): FUNCTION-pointer types are lowered to the
+// dedicated kFnPtrAddrSpace(200) so the type itself carries "never a GC
+// pointer" through every optimization: the "c2go-gc" strategy answers
+// isGCManagedPointer==false for it, keeping RS4GC from threading fp SSA
+// values into gc-live sets (fp values are code addresses or POSIX sentinel
+// integers like SIG_IGN==1; a marked slot holding a small integer makes
+// copystack throw "invalid pointer found on stack"). Function DEFINITIONS
+// stay in AS0; decay and indirect-call sites bridge with addrspacecast,
+// which both targets lower as a no-op. Default ON; disable with
+// -mllvm -c2go-fnptr-addrspace=0 for diagnostic regression only.
+static llvm::cl::opt<bool> C2GoFnPtrAddrSpace(
+    "c2go-fnptr-addrspace", llvm::cl::Hidden, llvm::cl::init(true),
+    llvm::cl::desc("c2go: lower function-pointer types to the dedicated "
+                   "non-GC address space (kFnPtrAddrSpace)"));
+
 // True when PointeeTy's canonical type is a c2go_struct-managed record. Mirrors
 // getC2GoManagedPointee in CGDecl.cpp (the GC-root-tracking criterion).
 static bool isC2GoManagedRecordPointee(QualType PointeeTy) {
@@ -660,6 +675,10 @@ llvm::Type *CodeGenTypes::ConvertType(QualType T) {
     if (C2GoManagedAddrSpace && Context.getLangOpts().C2GoMode &&
         isC2GoManagedRecordPointee(ETy))
       AS = 1;
+    // #665: function pointers get the dedicated non-GC address space.
+    if (C2GoFnPtrAddrSpace && Context.getLangOpts().C2GoMode &&
+        ETy->isFunctionType())
+      AS = llvm::c2go::kFnPtrAddrSpace;
     ResultType = llvm::PointerType::get(getLLVMContext(), AS);
     break;
   }

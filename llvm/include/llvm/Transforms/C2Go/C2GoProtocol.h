@@ -230,6 +230,25 @@ inline constexpr StringLiteral kVaPackMD = "c2go.va.pack";
 /// (Plan9 .s gclocals emission).
 inline constexpr StringLiteral kUnionAmbigWordsMD = "c2go.union.ambig.words";
 
+/// c2go #665 (#654c-b root fix): the address space FUNCTION-POINTER types are
+/// lowered to. Model rule: a function pointer's run-time value is a code
+/// address or a POSIX sentinel integer (SIG_IGN == 1) — never a stack or
+/// GC-heap address — so it must never enter ANY GC map. Lowering the TYPE to
+/// a dedicated address space makes the exclusion survive every optimization:
+/// the "c2go-gc" GCStrategy answers isGCManagedPointer==false for it, so
+/// RewriteStatepointsForGC never threads a function-pointer SSA value into a
+/// gc-live set (the last marking surface — the type-level argptrmask /
+/// kPtrSlotMD / union-ambig exclusions and the MIR spill-root filter cover
+/// the rest). Function DEFINITIONS stay in AS0 (the program address space);
+/// decay/indirect-call sites bridge with addrspacecast, which both targets
+/// lower as a no-op (same 64-bit width; note X86's isNoopAddrSpaceCast
+/// requires AS < 256, and AArch64 reserves 270-272 for __ptr32/__ptr64 —
+/// hence 200).
+/// Producer: clang CodeGenTypes (pointer-to-function lowering).
+/// Consumer: BuiltinGCs C2GoGC strategy, C2GoGCMaskUtils::walkPointerFields,
+/// C2GoSafepoint::collectPtrSlotAllocas.
+inline constexpr unsigned kFnPtrAddrSpace = 200;
+
 /// GlobalVariable MD attached to a c2go-managed (or unmanaged) module-level
 /// VarDecl. Encodes the c2go view of the global: (name MDString,
 /// go_type MDString, managed-bit i1). Used by c2go-lto WF2 to rebuild

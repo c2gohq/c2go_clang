@@ -133,6 +133,18 @@ public:
   }
 
   std::optional<bool> isGCManagedPointer(const Type *Ty) const override {
+    // c2go #665 (#654c-b root fix): FUNCTION pointers are lowered to a
+    // dedicated address space (llvm::c2go::kFnPtrAddrSpace == 200, clang
+    // CodeGenTypes; literal here — lib/IR must not include Transforms
+    // headers) precisely so they can be excluded HERE. Their run-time values
+    // are code addresses or POSIX sentinel integers (SIG_IGN == 1) — never
+    // stack or GC-heap addresses — and a gc-live spill slot marked "pointer"
+    // holding a small non-zero integer makes copystack throw "invalid
+    // pointer found on stack". Answering false keeps RS4GC from threading
+    // them into gc-live sets at all.
+    if (const auto *PT = dyn_cast<PointerType>(Ty))
+      if (PT->getAddressSpace() == 200)
+        return false;
     // c2go (STAGE I, #326): track BOTH AS0 (plain C pointers) and AS1 (managed
     // Go-heap pointers). In the Go model EVERY pointer-typed value is a
     // potential stack root: the goroutine stack is MOVABLE, so copystack must
