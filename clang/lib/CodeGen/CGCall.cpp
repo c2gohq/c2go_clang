@@ -6255,13 +6255,14 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
     // pick the result RetCC. Note: useC2GoGoABI0CallingConv is true for
     // boundary too (CC match), so the register decision must explicitly
     // exclude boundary here.
-    // c2go §2.0.2 (#281): both the IsBoundary check and the opt-level gate
-    // are folded into CGM.shouldUseC2GoRegReturn — this is the single source
-    // of truth shared with the callee body in CodeGenModule.cpp. For indirect
-    // calls (TargetDecl == null), shouldUseC2GoRegReturn treats the target as
-    // internal (no boundary attrs) and just consults the opt-level. Without
-    // this, a caller at -O2 would read X0 while a -O0 callee wrote the result
-    // slot on the stack.
+    // c2go §2.0.2 (#669, was #281): the IsBoundary check is folded into
+    // CGM.shouldUseC2GoRegReturn — the single source of truth shared with the
+    // callee body in CodeGenModule.cpp. For indirect calls (TargetDecl ==
+    // null), shouldUseC2GoRegReturn treats the target as internal (no
+    // boundary attrs) → reg-return. #281's additional opt-level gate is GONE:
+    // it made the convention follow the TU's -O level, so an fp minted by a
+    // -O2 TU (reg-return c2gowrap) indirect-called from a -O0 TU had the
+    // caller read the never-written stack slot (#668).
     bool RegRet = CGM.shouldUseC2GoRegReturn(TargetDecl);
     // c2go: shouldUseC2GoRegReturn defaults an INDIRECT call (TargetDecl is not
     // a named FunctionDecl — a variable / struct-member / expression callee) to

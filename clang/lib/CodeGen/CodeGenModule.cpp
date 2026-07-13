@@ -935,10 +935,17 @@ bool CodeGenModule::useC2GoGoABI0CallingConv(const Decl *D) const {
 }
 
 bool CodeGenModule::shouldUseC2GoRegReturn(const Decl *D) const {
-  // c2go §2.0.2 (#281): the register-return convention is used at -O2+ only (the
-  // -O0/-O1 path keeps ABI0 stack returns for debuggability).
-  if (CodeGenOpts.OptimizationLevel < 2)
-    return false;
+  // c2go §2.0.2 (#669, replacing #281's -O2-only gate): the internal
+  // register-return convention is OPT-LEVEL-INDEPENDENT. The full ABI0 stack
+  // return exists only at the Go interop boundary (c2go_extern / c2go_linkname
+  // / non-scalar imports — excluded via useC2GoGoABI0CC below). #281 keyed
+  // this on OptimizationLevel >= 2, which split the ABI across compilation
+  // units built at different -O levels: a function POINTER produced by a -O2
+  // TU (its c2gowrap returns in a register) could be indirect-called from a
+  // -O0 TU (which then read the never-written stack result slot — #668's
+  // tsearch cmp read garbage 24(RSP) and silently returned 0 forever). An fp
+  // value must carry ONE convention wherever it travels, so the convention
+  // cannot depend on the caller's or producer's opt level.
   // A scalar-signature unmanaged-extern import is reg-return: its synthesized .s
   // dispatch wrapper is c2go-internal (only c2go calls it; the host boundary is
   // the runtime.cgocall inside the wrapper), and a single scalar/pointer/float
@@ -1077,14 +1084,16 @@ void CodeGenModule::stampC2GoInternalFnAttrs(const FunctionDecl *FD,
   // no variadic function ever gets register argument passing.
   if (usesC2GoVoidPtrVararg(FD->getType()->getAs<FunctionType>(), FD))
     F->addFnAttr("c2go-void-vararg");
-  // c2go §2.0.2 (#281): internal functions return results in registers
-  // (ABIInternal) ONLY at -O2+; at -O0/-O1 they keep ABI0 stack returns
-  // for debuggability (argsize includes the result slot). The decision
+  // c2go §2.0.2 (#669): internal functions return results in registers
+  // (ABIInternal) at EVERY opt level; only Go-boundary symbols keep the
+  // ABI0 stack return (argsize includes the result slot). The decision
   // is centralized in shouldUseC2GoRegReturn so callee body and call
   // site (CGCall.cpp) cannot disagree — a mismatch would have the
   // caller read X0 while the callee wrote the result slot on the stack
-  // (or vice versa). Boundary symbols (c2go_extern / c2go_linkname) are
-  // already excluded by the caller's useC2GoGoABI0CC gate.
+  // (or vice versa; #668 hit exactly that across -O0/-O2 TUs under the
+  // old #281 opt-level gate). Boundary symbols (c2go_extern /
+  // c2go_linkname) are already excluded by the caller's useC2GoGoABI0CC
+  // gate.
   const bool RegRet = shouldUseC2GoRegReturn(FD);
   if (RegRet)
     F->addFnAttr("c2go-reg-return");
@@ -5435,6 +5444,15 @@ void CodeGenModule::EmitC2GoCallbackConverters() {
 
     llvm::CallInst *Ret = B.CreateCall(DestTy, DestFn, CallArgs);
     Ret->setCallingConv(llvm::CallingConv::GoABI0);
+    // #669: the internal reg-return convention is opt-level-independent, so
+    // this hand-built call must carry the same call-site attr CGCall would
+    // emit for a direct call to Target — without it the backend lowers a
+    // stack-slot result read against a register-writing callee (the #669
+    // callback-gate regression: `add = <garbage>, want 5`). A boundary
+    // target keeps the stack return via the same predicate.
+    if (shouldUseC2GoRegReturn(Target))
+      Ret->addFnAttr(
+          llvm::Attribute::get(getLLVMContext(), "c2go-reg-return"));
 
     if (!RI.isIgnore()) {
       llvm::SmallVector<AbiWord, 4> RW;
@@ -7209,6 +7227,23 @@ CodeGenModule::GetAddrOfFunction(GlobalDecl GD, llvm::Type *Ty, bool ForVTable,
     Ty = getTypes().ConvertType(FD->getType());
     if (DeviceKernelAttr::isOpenCLSpelling(FD->getAttr<DeviceKernelAttr>()) &&
         GD.getKernelReferenceKind() == KernelReferenceKind::Stub) {
+      const CGFunctionInfo &FI = getTypes().arrangeGlobalDeclaration(GD);
+      Ty = getTypes().GetFunctionType(FI);
+    }
+    // c2go (#670): a boundary symbol's IR type must come from the DECL-aware
+    // arrangement (FnInfoOpts::IsGoABI0 — #273 flattens record params to
+    // per-field ABI0 slots). The bare ConvertType(FD->getType()) above has no
+    // decl, so it classifies records per the NATIVE ABI (AArch64: an
+    // [2 x i64] aggregate coerce, ONE IR param), while every call site
+    // arranges the GoABI0 field split (TWO IR params) — the call-site-shaped
+    // attribute list then overflows the declaration (Verifier: "Attribute
+    // after last parameter"). x86-64's eightbyte split happens to coincide
+    // with the field split, which hid this until the first record-by-value
+    // boundary function (#668's hsearch). Variadic boundary decls fall back
+    // inside the arrangement (isC2GoABI0Function returns false) to the same
+    // shape as ConvertType, so re-deriving is harmless for them.
+    if (LangOpts.C2GoMode &&
+        (FD->hasAttr<C2GoExternAttr>() || FD->hasAttr<C2GoLinknameAttr>())) {
       const CGFunctionInfo &FI = getTypes().arrangeGlobalDeclaration(GD);
       Ty = getTypes().GetFunctionType(FI);
     }

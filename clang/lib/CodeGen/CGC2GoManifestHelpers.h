@@ -83,8 +83,9 @@ bool isC2GoUnmanagedExternImport(const FunctionDecl *FD);
 /// whose signature is entirely scalar (every parameter and the result is
 /// void/integer/enum/pointer/real-float; non-variadic). Such an import's
 /// synthesized .s dispatch wrapper returns a single register-class word, so it
-/// uses the internal register-return convention (c2go-reg-return) at -O2 like
-/// any internal function — its result fp is then a plain CC_C2GoInternal
+/// uses the internal register-return convention (c2go-reg-return, opt-level-
+/// independent per #669) like any internal function — its result fp is then a
+/// plain CC_C2GoInternal
 /// pointer, assignable without a calling-convention cast. Record/variadic
 /// imports keep the ABI0 stack return. Purely AST-based so Sema and CodeGen
 /// compute the same answer (no CGFunctionInfo arrangement).
