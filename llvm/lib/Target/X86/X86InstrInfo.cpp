@@ -4842,9 +4842,19 @@ static bool x86C2GoIsPtrDerived(Register Reg, const MachineRegisterInfo &MRI,
     return false;
   };
   auto hasGlobalAddr = [](const MachineInstr &MI) {
-    for (const MachineOperand &MO : MI.operands())
-      if (MO.isGlobal() || MO.isBlockAddress() || MO.isJTI() || MO.isCPI())
+    for (const MachineOperand &MO : MI.operands()) {
+      // #654c-b: a FUNCTION address is a code pointer. The c2go model rule is
+      // that function pointers never enter GC maps — their run-time values
+      // are code addresses or POSIX sentinel integers (SIG_IGN == 1), never
+      // stack or GC-heap addresses, so a vreg rooted at one must not tag its
+      // spill slot "ptr". Data globals (&g_var / &g_struct.field) stay roots
+      // — unchanged historical behavior for non-function globals. Mirror of
+      // AArch64InstrInfo.cpp.
+      if (MO.isGlobal() && !isa<Function>(MO.getGlobal()))
         return true;
+      if (MO.isBlockAddress() || MO.isJTI() || MO.isCPI())
+        return true;
+    }
     return false;
   };
 
