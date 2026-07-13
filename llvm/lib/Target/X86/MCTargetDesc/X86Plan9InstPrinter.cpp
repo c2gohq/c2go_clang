@@ -1393,6 +1393,12 @@ static bool tryPrintSSEX87MemSymbolic(const MCInst *MI, raw_ostream &O,
       {"PADDWrm",     "PADDW",     RMW7},
       {"PADDDrm",     "PADDL",     RMW7},
       {"PADDQrm",     "PADDQ",     RMW7},
+      // packed integer equality vs a pool constant (#654 Lua amd64 first
+      // run: byte-compare loops vectorize into `pcmpeqb LCPI, xmm`); W/L
+      // duals per the family convention — Go spells the dword form PCMPEQL.
+      {"PCMPEQBrm",   "PCMPEQB",   RMW7},
+      {"PCMPEQWrm",   "PCMPEQW",   RMW7},
+      {"PCMPEQDrm",   "PCMPEQL",   RMW7},
       {"PMULLDrm",    "PMULLD",    RMW7},
       {"PUNPCKLDQrm", "PUNPCKLLQ", RMW7},
       {"XORPSrm",     "XORPS",     RMW7},
