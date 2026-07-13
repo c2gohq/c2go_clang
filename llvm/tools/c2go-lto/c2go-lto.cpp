@@ -275,6 +275,20 @@ bool RunPlan9Codegen(Module &M, raw_pwrite_stream &Out) {
 
   TargetOptions Options;
   Options.MCOptions.OutputAsmVariant = 2; // drive MCPlan9AsmStreamer
+  // c2go #666: mirror the Go compiler's "an UNDEF follows every no-return
+  // call" invariant. A c2go function that ENDS in a genuine call (exit /
+  // abort / longjmp — clang drops the unreachable RET) leaves its return
+  // address pointing at the go-asm morestack tail appended right after the
+  // body, whose pcsp value is 0 (pre-prologue state). Go's unwinder looks up
+  // spdelta with the RAW return address (traceback.go next(): findfunc /
+  // funcspdelta on frame.lr, no -1), reads a zero frame, and copystack
+  // throws "traceback did not unwind completely" (linux+darwin amd64
+  // TestAtexitLIFO; arm64 escapes by pcsp-layout luck, but gets the same
+  // guard). TrapUnreachable materializes `unreachable` as ud2/brk, pinning
+  // the return address inside the body's pcsp range. NoTrapAfterNoreturn
+  // must stay FALSE — the trap after a no-return call is exactly the point.
+  Options.TrapUnreachable = true;
+  Options.NoTrapAfterNoreturn = false;
 
   // c2go #433: read CPU + features + optlevel from the bc's c2go.* module
   // flags (clang/CodeGenModule.cpp stamps them at `-fc2go -emit-llvm` time)

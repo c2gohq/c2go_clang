@@ -1601,6 +1601,14 @@ void EmitAssemblyHelper::RunC2GoPlan9Pipeline() {
   if (!initTargetOptions(CI, Diags, NeutralOptions))
     return;
   NeutralOptions.MCOptions.OutputAsmVariant = 2; // drive MCPlan9AsmStreamer
+  // c2go #666: mirror the Go compiler's "an UNDEF follows every no-return
+  // call" invariant so a body ending in a genuine call (exit/abort) does not
+  // leave its return address inside the go-asm morestack tail, whose pcsp is
+  // 0 — Go's unwinder reads spdelta at the RAW return address and copystack
+  // throws "traceback did not unwind completely". Twin of the c2go-lto (WF2)
+  // setting; NoTrapAfterNoreturn stays false on purpose.
+  NeutralOptions.TrapUnreachable = true;
+  NeutralOptions.NoTrapAfterNoreturn = false;
 
   std::optional<CodeGenOptLevel> OptLevelOrNone =
       CodeGenOpt::getLevel(CodeGenOpts.OptimizationLevel);
