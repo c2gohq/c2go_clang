@@ -1,0 +1,58 @@
+# c2go #672: an unmanaged host import whose bare name is also DEFINED inside
+# the package is one program with two meanings — -O0 call sites reach the
+# package function directly (bridge bypassed), -O2 call sites carry the
+# already-inlined cgocall bridge and resolve the name against the HOST at
+# runtime. c2go.h's C2GO_DYN note promises the bare-name collision catches
+# this, but the import wrapper's linkonce linkage lets the IR linker resolve
+# it silently in favour of the definition. c2go-lto must fail the merge
+# loudly instead; the import identity survives in the per-TU
+# `c2go.func.<name>` metadata (kind operand == "unmanaged_extern") no matter
+# the opt level or link order.
+#
+# REQUIRES: aarch64-registered-target
+# RUN: rm -rf %t && split-file %s %t
+
+# Mixed: def.ll defines @collide, imp.ll imported the same bare name.
+# RUN: not c2go-lto %t/def.ll %t/imp.ll --c2go-emit-manifest=%t/m.json 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=MIXED
+# Link order must not matter (the definition may arrive first or last).
+# RUN: not c2go-lto %t/imp.ll %t/def.ll --c2go-emit-manifest=%t/m2.json 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=MIXED
+# MIXED: error: 'collide' is an unmanaged host import in one TU but is defined inside the package in another
+# MIXED-SAME: C2GO_DYN(collide)
+
+# Pure import (no in-package definition) stays legal.
+# RUN: c2go-lto %t/imp.ll --c2go-emit-manifest=%t/pure.json
+
+# C2GO_DYN coexistence stays legal: the import lives under the reserved
+# __c2go_dynimp_ prefix and never shares the package definition's bare name.
+# RUN: c2go-lto %t/dyn.ll --c2go-emit-manifest=%t/dyn.json
+
+#--- def.ll
+target triple = "aarch64-unknown-none-elf"
+define i32 @collide() {
+  ret i32 7
+}
+
+#--- imp.ll
+; The importing TU is faithful to clang's real shape: the import's dispatch
+; wrapper is a linkonce_odr DEFINITION under the bare name, stamped
+; "c2go-wrapper-in-asm". A pure import must pass (the guard skips the
+; wrapper body); in the mixed link the strong def.ll definition displaces
+; this linkonce wrapper and the guard sees the real definition.
+target triple = "aarch64-unknown-none-elf"
+define linkonce_odr i32 @collide() #0 {
+  ret i32 0
+}
+attributes #0 = { "c2go-wrapper-in-asm" "c2go-c-name"="collide" }
+!c2go.func.collide = !{!0}
+!0 = !{!"collide", !"func collide() int32", !"unmanaged_extern"}
+
+#--- dyn.ll
+target triple = "aarch64-unknown-none-elf"
+define i32 @rename() {
+  ret i32 1
+}
+declare i32 @__c2go_dynimp_rename()
+!c2go.func.__c2go_dynimp_rename = !{!0}
+!0 = !{!"__c2go_dynimp_rename", !"func __c2go_dynimp_rename() int32", !"unmanaged_extern"}

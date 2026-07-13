@@ -684,6 +684,60 @@ int main(int argc, char **argv) {
     }
   }
 
+  // c2go (#672): reject an UNMANAGED HOST IMPORT whose bare name is also
+  // DEFINED inside the package. c2go.h documents the intent (the C2GO_DYN
+  // note): a bare `extern` import claims the bare wrapper name precisely so
+  // that an accidental same-named internal definition collides — but the
+  // wrapper is linkonce, so the IR linker resolves that collision SILENTLY
+  // in favour of the definition and the guard never fires. The result is one
+  // program with two meanings: -O0 call sites reach the package function
+  // directly (bridge bypassed), while -O2 call sites carry the already-
+  // inlined cgocall bridge and resolve the name against the HOST at runtime.
+  // Detect the mix on the merged module instead: each TU's import identity
+  // survives in its `c2go.func.<name>` MDNode (kind operand 2 ==
+  // "unmanaged_extern") regardless of inlining or link order, and the
+  // package's side is a defined Function under the same bare name.
+  // Intentional coexistence has its own spelling — C2GO_DYN(<name>) imports
+  // under the reserved __c2go_dynimp_ prefix and never shares the bare name.
+  for (NamedMDNode &NMD : Composite->named_metadata()) {
+    StringRef MDName = NMD.getName();
+    if (!MDName.starts_with(llvm::c2go::kFuncMDPrefix))
+      continue;
+    StringRef CName = MDName.drop_front(llvm::c2go::kFuncMDPrefix.size());
+    bool ImportedSomewhere = false;
+    for (const MDNode *Op : NMD.operands()) {
+      if (Op->getNumOperands() < 3)
+        continue;
+      auto *Kind = dyn_cast<MDString>(Op->getOperand(2));
+      if (Kind && Kind->getString() == "unmanaged_extern") {
+        ImportedSomewhere = true;
+        break;
+      }
+    }
+    if (!ImportedSomewhere)
+      continue;
+    Function *Def = Composite->getFunction(CName);
+    if (!Def || Def->isDeclaration())
+      continue;
+    // The import's OWN dispatch body is a linkonce_odr definition under the
+    // bare name, stamped "c2go-wrapper-in-asm" (clang emits it per-TU; the
+    // .s carries it as TEXT ·<name>). A pure import therefore always shows
+    // a defined function here — only a REAL package definition (no wrapper
+    // stamp, and strong enough to have displaced the linkonce wrapper at IR
+    // link) is the mixed-spelling error.
+    if (Def->hasFnAttribute("c2go-wrapper-in-asm"))
+      continue;
+    errs() << argv[0] << ": error: '" << CName
+           << "' is an unmanaged host import in one TU but is defined inside "
+              "the package in another; declare the package-internal reference "
+              "through a c2go_linkname header instead of a bare extern, or "
+              "spell the import C2GO_DYN("
+           << CName
+           << ") if importing the host symbol alongside the package's own "
+              "definition is intentional\n";
+    return ExitAttrConflict;
+  }
+
   // #478 split: the Andersen-lite stack-address escape audit lives in
   // C2GoEscapeAudit.cpp. It writes the per-escape lines plus the final
   // `<N> stack-address escape point(s)` summary to outs(); the bool return
