@@ -37,6 +37,16 @@
 #define unmanaged       __attribute__((c2go_unmanaged))
 #define c2go_extern     __attribute__((c2go_extern))
 
+/* Export with an explicit name-casing selector (C2GO_EXPORTED / C2GO_KEEPCASE,
+ * defined below); the bare `c2go_extern` above is C2GO_EXPORTED. Spelled with the
+ * GNU `__x__` alias `__c2go_extern__` — which is NOT itself a macro — so the
+ * object-like `c2go_extern` macro does not re-expand the inner token; no
+ * `#pragma push_macro`/`#undef` dance is needed:
+ *     c2go_extern_as(C2GO_KEEPCASE)
+ *     size_t __mbrtoc32(unsigned *pc, const char *s, size_t n, mbstate_t *st) { ... }
+ */
+#define c2go_extern_as(casing)  __attribute__((__c2go_extern__(casing)))
+
 /* Named selector values (use instead of bare 0 / 1). */
 /* c2go_extern's optional int arg = the generated .go export-name casing.
  *
@@ -61,10 +71,10 @@
  * the CamelCase form. Use the CamelCase name only from Go source (e.g. tests:
  * `libc.Strlen(...)`).
  *
- * The bare `c2go_extern` macro is C2GO_EXPORTED. To pass 0 use the raw attribute
- * `__attribute__((c2go_extern(C2GO_KEEPCASE)))` — the object-like `c2go_extern`
- * macro shadows the attribute spelling, so a wrapper macro can't carry the arg.
- * Keep-case is currently unused; these names document the values. */
+ * The bare `c2go_extern` macro is C2GO_EXPORTED. For the keep-case form use the
+ * `c2go_extern_as(...)` macro defined above, e.g. `c2go_extern_as(C2GO_KEEPCASE)`
+ * (multibyte.c's __mbrtoc32/__c32rtomb use it so their CamelCase alias would not
+ * collide with the public mbrtoc32/c32rtomb). */
 #define C2GO_EXPORTED   1   /* default: .go name = CamelCase(C symbol), e.g. sqlite3_open -> Sqlite3Open */
 #define C2GO_KEEPCASE   0   /* keep the C symbol's casing verbatim */
 
