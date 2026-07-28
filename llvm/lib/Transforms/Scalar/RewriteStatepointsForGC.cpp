@@ -43,6 +43,7 @@
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
@@ -273,6 +274,13 @@ static bool isHandledGCPointerType(Type *T, GCStrategy *GC) {
     if (isGCPointerType(VT->getElementType(), GC))
       return true;
   return false;
+}
+
+// InlineAsm is a uniqued, constant-like code descriptor used only as a call's
+// callee operand. It is pointer-typed for IR call modeling, but it is not a
+// run-time data pointer and can never be relocated by a collector.
+static bool isNonRelocatablePointerValue(const Value *V) {
+  return isa<Constant>(V) || isa<InlineAsm>(V);
 }
 
 #ifndef NDEBUG
@@ -3256,9 +3264,10 @@ static void computeLiveInValues(BasicBlock::reverse_iterator Begin,
     for (Value *V : I.operands()) {
       assert(!isUnhandledGCPointerType(V->getType(), GC) &&
              "support for FCA unimplemented");
-      if (isHandledGCPointerType(V->getType(), GC) && !isa<Constant>(V)) {
-        // The choice to exclude all things constant here is slightly subtle.
-        // There are two independent reasons:
+      if (isHandledGCPointerType(V->getType(), GC) &&
+          !isNonRelocatablePointerValue(V)) {
+        // The choice to exclude constant-like values here is slightly subtle.
+        // There are three independent reasons:
         // - We assume that things which are constant (from LLVM's definition)
         // do not move at runtime.  For example, the address of a global
         // variable is fixed, even though it's contents may not be.
@@ -3267,6 +3276,8 @@ static void computeLiveInValues(BasicBlock::reverse_iterator Begin,
         // locally exploit facts without respect to global reachability.  This
         // can create sections of code which are dynamically unreachable and
         // contain just about anything.  (see constants.ll in tests)
+        // - InlineAsm is not a Constant subclass, but its pointer value is a
+        // uniqued code descriptor rather than relocatable run-time data.
         LiveTmp.insert(V);
       }
     }
@@ -3284,7 +3295,8 @@ static void computeLiveOutSeed(BasicBlock *BB, SetVector<Value *> &LiveTmp,
       Value *V = PN->getIncomingValueForBlock(BB);
       assert(!isUnhandledGCPointerType(V->getType(), GC) &&
              "support for FCA unimplemented");
-      if (isHandledGCPointerType(V->getType(), GC) && !isa<Constant>(V))
+      if (isHandledGCPointerType(V->getType(), GC) &&
+          !isNonRelocatablePointerValue(V))
         LiveTmp.insert(V);
     }
   }

@@ -53,6 +53,24 @@ entry:
   ret ptr %out
 }
 
+; Conversely, an InlineAsm callee used after a real safepoint is not itself a
+; relocatable pointer. The data pointer operand is live and must be relocated;
+; the constant-like InlineAsm descriptor must stay out of the gc-live bundle.
+; This is the optimized musl explicit_bzero shape.
+;
+; RS4GC-LABEL: define void @real_call_before_inline_asm(ptr %p) gc "c2go-gc"
+; RS4GC: @real_call
+; RS4GC-SAME: "gc-live"(ptr %p)
+; RS4GC: %p.relocated = call {{.*}}ptr @llvm.experimental.gc.relocate
+; RS4GC: call void asm sideeffect "", "r,~{memory}"(ptr %p.relocated)
+; RS4GC: ret void
+define void @real_call_before_inline_asm(ptr %p) {
+entry:
+  call void @real_call()
+  call void asm sideeffect "", "r,~{memory}"(ptr %p)
+  ret void
+}
+
 ; A managed local remains live across both asm statements. The lightweight
 ; path must not manufacture a stackmap for either statement.
 ;
