@@ -1,0 +1,8 @@
+c2go-clang fork notice
+========================
+
+This distribution is a materially modified fork of the LLVM Project. The fork adds the c2go compilation mode, C2Go-specific Clang and LLVM behavior, Go ABI support, Plan 9 assembly emission, the `c2go-lto` tool, resource headers, tests, and documentation. Individual changes and their authors are recorded in the Git history.
+
+Upstream LLVM copyrights and notices remain with their respective holders. C2Go contributions are copyright their respective contributors and are licensed under `Apache-2.0 WITH LLVM-exception`, as described in [LICENSE.TXT](LICENSE.TXT) and [C2GO-LICENSING.md](C2GO-LICENSING.md).
+
+This fork is not an official LLVM release and is not sponsored or endorsed by the LLVM Project or LLVM Foundation. This notice supplements, and does not replace, any license or notice shipped with LLVM or bundled third-party code.
