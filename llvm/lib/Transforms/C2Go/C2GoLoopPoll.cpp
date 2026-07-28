@@ -36,7 +36,6 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
-#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Support/CommandLine.h"
@@ -89,29 +88,19 @@ static constexpr uint64_t kMaxM = 1ULL << 16;
 // design-doc value (§4.10.6); a power of two for cheap `and` mod.
 static constexpr uint64_t kFallbackM = 1024;
 
-// Free intrinsics — these lower to nothing or to non-call sequences and do
-// NOT count as a "real call" for poll eligibility. c2go #454 thin shim over
-// the shared `c2go::isNoopMorestackIntrinsic` so this list cannot drift from
-// the stackmap path (C2GoSafepoint::isPotentialMorestackCall) and the RS4GC
-// path (C2GoGCSetup::isNoopForMorestack): all three answer the same question
-// "is this intrinsic a real call that can reach morestack/GC?".
-static bool isFreeIntrinsicForLoopPoll(Intrinsic::ID Id) {
-  return c2go::isNoopMorestackIntrinsic(Id);
-}
-
 // hasAnyRealCallInBody returns true if any BB in L (including sub-loop
-// blocks) contains a CallBase that isn't a free intrinsic. inline-asm is
-// conservatively treated as a real call.
+// blocks) contains a CallBase that can reach a callee morestack prologue.
+// c2go::mayReachMorestack is shared with the lightweight stackmap and RS4GC
+// paths, so a call-free InlineAsm node neither suppresses a loop poll nor
+// acquires a fake safepoint.
 static bool hasAnyRealCallInBody(const Loop &L) {
   for (const BasicBlock *BB : L.blocks())
     for (const Instruction &I : *BB) {
       const auto *CB = dyn_cast<CallBase>(&I);
       if (!CB)
         continue;
-      if (const auto *II = dyn_cast<IntrinsicInst>(CB))
-        if (isFreeIntrinsicForLoopPoll(II->getIntrinsicID()))
-          continue;
-      return true;
+      if (c2go::mayReachMorestack(*CB))
+        return true;
     }
   return false;
 }

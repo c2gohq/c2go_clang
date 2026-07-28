@@ -22,8 +22,9 @@
 //        - add the `"gc-leaf-function"` call-site attribute to every GC-LEAF
 //          call.
 //      The safepoint set MATCHES the lightweight C2GoSafepointPass's active
-//      morestack-call set (isPotentialMorestackCall: EVERY call is a safepoint
-//      except a handful of no-op intrinsics) — NOT the legacy managed-alloca
+//      morestack-call set (isPotentialMorestackCall: every ordinary call is a
+//      safepoint; no-op intrinsics and call-free inline asm are not) — NOT the
+//      legacy managed-alloca
 //      fallback seed list from getSafepointCallees (SQLite reaches morestack
 //      through libc malloc, not
 //      runtime.mallocgc, so a runtime-name-only list would miss the real
@@ -79,16 +80,6 @@ static bool hasAnyPointer(const Function &F) {
           return true;
       }
     }
-  return false;
-}
-
-// isNoopForMorestack — #436 thin shim over the shared
-// c2go::isNoopMorestackIntrinsic predicate, kept in lockstep with
-// C2GoSafepoint::isPotentialMorestackCall (which uses the same helper). These
-// noop intrinsics are GC-leaf.
-static bool isNoopForMorestack(const CallBase *CB) {
-  if (const auto *II = dyn_cast<IntrinsicInst>(CB))
-    return c2go::isNoopMorestackIntrinsic(II->getIntrinsicID());
   return false;
 }
 
@@ -179,7 +170,7 @@ PreservedAnalyses C2GoGCSetupPass::run(Module &M, ModuleAnalysisManager &) {
       if (auto *II = dyn_cast<IntrinsicInst>(CB))
         if (II->getIntrinsicID() == Intrinsic::experimental_gc_statepoint)
           continue;
-      if (isNoopForMorestack(CB) || isUnwrappableVararg(CB)) {
+      if (!c2go::mayReachMorestack(*CB) || isUnwrappableVararg(CB)) {
         markGCLeaf(CB);
         ++NLeaf;
         continue;

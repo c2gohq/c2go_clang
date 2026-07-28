@@ -6,15 +6,17 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// c2go #436 — single shared "intrinsic-noop for morestack" predicate.
+// c2go #436 — single shared "can this IR call reach morestack" predicate.
 //
-// Two passes need an identical answer to the question "can this intrinsic
-// CallBase ever lower to a real call that reaches morestack/GC?":
+// Three passes need an identical answer to the question "can this CallBase
+// ever lower to a real call that reaches morestack/GC?":
 //
 //   * C2GoSafepoint::isPotentialMorestackCall  (LLVM stackmap path; the false
 //     branch suppresses per-call-site stackmap emission)
-//   * C2GoGCSetup::isNoopForMorestack          (RewriteStatepointsForGC path;
-//     a `true` answer downgrades the call to gc-leaf so RS4GC skips it)
+//   * C2GoGCSetup                              (RewriteStatepointsForGC path;
+//     a false answer downgrades the call to gc-leaf so RS4GC skips it)
+//   * C2GoLoopPoll::hasAnyRealCallInBody       (a false answer means the loop
+//     still needs its own cooperative-preemption poll)
 //
 // Before #436 each pass kept its own hand-maintained `switch (IntrinsicID)`
 // over the same eight noop intrinsics. The two lists are SUPPOSED to be the
@@ -23,16 +25,17 @@
 // foot-gun — one side adding (or losing) an entry silently desynchronises GC
 // coverage versus stackmap coverage.
 //
-// Implementation: a single inline `isNoopMorestackIntrinsic(Intrinsic::ID)`
-// helper that returns true for the agreed-upon noop set. Inline so neither
-// the LLVMC2Go component (Transforms/C2Go) nor the AArch64 backend needs a
-// new link dependency.
+// Implementation: retain the intrinsic-only helper for callers that need it,
+// and expose `mayReachMorestack(CallBase)` as the shared policy entry point.
+// Inline so neither the LLVMC2Go component (Transforms/C2Go) nor the target
+// backends need a new link dependency.
 //
 //===----------------------------------------------------------------------===//
 
 #ifndef LLVM_TRANSFORMS_C2GO_C2GOMORESTACKUTILS_H
 #define LLVM_TRANSFORMS_C2GO_C2GOMORESTACKUTILS_H
 
+#include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Intrinsics.h"
 
 namespace llvm {
@@ -43,9 +46,8 @@ namespace c2go {
 /// reach morestack / GC.
 ///
 /// Caller responsibility: invoke ONLY for intrinsic calls (i.e. on an
-/// `IntrinsicInst`'s `getIntrinsicID()`). Non-intrinsic calls (libc / Go
-/// runtime / indirect / inline-asm) are NOT covered here — every such call is
-/// a potential safepoint by definition.
+/// `IntrinsicInst`'s `getIntrinsicID()`). Use mayReachMorestack() for a
+/// general CallBase.
 inline bool isNoopMorestackIntrinsic(Intrinsic::ID Id) {
   switch (Id) {
   case Intrinsic::experimental_stackmap:
@@ -68,6 +70,23 @@ inline bool isNoopMorestackIntrinsic(Intrinsic::ID Id) {
     // (or be left as a libcall) → may reach morestack/GC.
     return false;
   }
+}
+
+/// Return true when CB can lower to a real function call whose callee may run
+/// a Go morestack prologue and therefore trigger copystack / GC.
+///
+/// LLVM represents inline asm as a CallBase even when the emitted instruction
+/// stream contains no function call. c2go gives inline asm a call-free
+/// contract: calls must remain visible as IR calls, while hiding CALL, BL, or
+/// BLR inside an asm template is unsupported because it bypasses the Go calling
+/// convention and per-return-PC stackmap machinery. Consequently an InlineAsm
+/// CallBase is not itself a morestack site.
+inline bool mayReachMorestack(const CallBase &CB) {
+  if (CB.isInlineAsm())
+    return false;
+  if (Intrinsic::ID Id = CB.getIntrinsicID(); Id != Intrinsic::not_intrinsic)
+    return !isNoopMorestackIntrinsic(Id);
+  return true;
 }
 
 } // namespace c2go

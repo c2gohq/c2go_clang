@@ -311,18 +311,15 @@ static CallInst *emitStackmapBefore(CallBase *CB, uint64_t Id,
 // at EVERY call's return PC — not just the legacy managed-alloca seed list
 // (SQLite reaches morestack through libc malloc, never runtime.mallocgc).
 //
-// Excluded (#436, via c2go::isNoopMorestackIntrinsic): our own stackmap
-// intrinsic (no PC of its own / not a real call) and side-effect-free debug /
-// lifetime / pseudo intrinsics that lower to nothing and never reach
-// morestack. Everything else — including indirect and inline-asm calls — is
-// treated as a potential safepoint (conservative: an extra map is harmless;
-// a missing one is a GC bug). The exclusion set is shared with
-// C2GoGCSetup::isNoopForMorestack so the stackmap path and the RS4GC path
-// cannot drift.
+// Excluded (#436, via c2go::mayReachMorestack): our own stackmap intrinsic
+// (no PC of its own / not a real call), side-effect-free debug / lifetime /
+// pseudo intrinsics that lower to nothing, and InlineAsm CallBases. LLVM uses
+// CallBase to model inline asm operands and effects, but c2go's supported
+// inline-asm contract is call-free, so the asm node itself cannot reach a
+// callee morestack prologue. The shared predicate keeps the stackmap, RS4GC,
+// and loop-poll paths in lockstep.
 static bool isPotentialMorestackCall(CallBase *CB) {
-  if (auto *II = dyn_cast<IntrinsicInst>(CB))
-    return !c2go::isNoopMorestackIntrinsic(II->getIntrinsicID());
-  return true;
+  return c2go::mayReachMorestack(*CB);
 }
 
 // #307 — idempotency guard. C2GoSafepointPass runs TWICE in c2go-mode: once
