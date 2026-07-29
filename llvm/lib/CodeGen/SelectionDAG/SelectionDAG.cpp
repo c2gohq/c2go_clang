@@ -69,6 +69,7 @@
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include "llvm/Transforms/Utils/SizeOpts.h"
 #include <algorithm>
 #include <cassert>
@@ -2066,9 +2067,48 @@ SDValue SelectionDAG::getExternalSymbol(const char *Sym, EVT VT) {
   return SDValue(N, 0);
 }
 
+// Recover the frontend's direct-GoABI0 c2go_linkname route for a backend
+// libcall. Unlike an IR CallInst, a libcall first created during SelectionDAG
+// lowering never passes through C2GoLibCallRoutingPass, so symbol and CC must
+// be selected together here.
+static StringRef lookupC2GoLibCallRoute(const SelectionDAG &DAG,
+                                        StringRef CName) {
+  const Module *M = DAG.getMachineFunction().getFunction().getParent();
+  if (!M || !M->getModuleFlag(c2go::kGoabiModuleFlag))
+    return {};
+  const NamedMDNode *NMD = M->getNamedMetadata(c2go::kLibCallRoutesMDName);
+  if (!NMD)
+    return {};
+
+  StringRef Found;
+  for (const MDNode *Entry : NMD->operands()) {
+    if (!Entry || Entry->getNumOperands() != 2)
+      continue;
+    const auto *Name = dyn_cast_or_null<MDString>(Entry->getOperand(0));
+    const auto *Target = dyn_cast_or_null<MDString>(Entry->getOperand(1));
+    if (!Name || !Target || Name->getString() != CName)
+      continue;
+    if (!Found.empty() && Found != Target->getString())
+      report_fatal_error("conflicting c2go libcall routes for '" + CName +
+                         "'");
+    Found = Target->getString();
+  }
+  return Found;
+}
+
 SDValue SelectionDAG::getExternalSymbol(RTLIB::LibcallImpl Libcall, EVT VT) {
   StringRef SymName = TLI->getLibcallImplName(Libcall);
+  if (StringRef Route = lookupC2GoLibCallRoute(*this, SymName); !Route.empty())
+    SymName = getMachineFunction().createExternalSymbolName(Route);
   return getExternalSymbol(SymName.data(), VT);
+}
+
+CallingConv::ID
+SelectionDAG::getLibcallCallingConv(RTLIB::LibcallImpl Libcall) const {
+  StringRef SymName = TLI->getLibcallImplName(Libcall);
+  if (!lookupC2GoLibCallRoute(*this, SymName).empty())
+    return CallingConv::GoABI0;
+  return TLI->getLibcallImplCallingConv(Libcall);
 }
 
 SDValue SelectionDAG::getMCSymbol(MCSymbol *Sym, EVT VT) {
@@ -2093,6 +2133,8 @@ SDValue SelectionDAG::getTargetExternalSymbol(const char *Sym, EVT VT,
 SDValue SelectionDAG::getTargetExternalSymbol(RTLIB::LibcallImpl Libcall,
                                               EVT VT, unsigned TargetFlags) {
   StringRef SymName = TLI->getLibcallImplName(Libcall);
+  if (StringRef Route = lookupC2GoLibCallRoute(*this, SymName); !Route.empty())
+    SymName = getMachineFunction().createExternalSymbolName(Route);
   return getTargetExternalSymbol(SymName.data(), VT, TargetFlags);
 }
 
@@ -9164,7 +9206,7 @@ SelectionDAG::getMemcmp(SDValue Chain, const SDLoc &dl, SDValue Mem0,
   CLI.setDebugLoc(dl)
       .setChain(Chain)
       .setLibCallee(
-          TLI->getLibcallImplCallingConv(MemcmpImpl),
+          getLibcallCallingConv(MemcmpImpl),
           Type::getInt32Ty(*getContext()),
           getExternalSymbol(MemcmpImpl, TLI->getPointerTy(getDataLayout())),
           std::move(Args))
@@ -9191,7 +9233,7 @@ std::pair<SDValue, SDValue> SelectionDAG::getStrcpy(SDValue Chain,
   CLI.setDebugLoc(dl)
       .setChain(Chain)
       .setLibCallee(
-          TLI->getLibcallImplCallingConv(LCImpl), CI->getType(),
+          getLibcallCallingConv(LCImpl), CI->getType(),
           getExternalSymbol(LCImpl, TLI->getPointerTy(getDataLayout())),
           std::move(Args))
       .setTailCall(IsTailCall);
@@ -9217,7 +9259,7 @@ std::pair<SDValue, SDValue> SelectionDAG::getStrlen(SDValue Chain,
 
   CLI.setDebugLoc(dl)
       .setChain(Chain)
-      .setLibCallee(TLI->getLibcallImplCallingConv(StrlenImpl), CI->getType(),
+      .setLibCallee(getLibcallCallingConv(StrlenImpl), CI->getType(),
                     getExternalSymbol(
                         StrlenImpl, TLI->getProgramPointerTy(getDataLayout())),
                     std::move(Args))
@@ -9296,7 +9338,7 @@ SDValue SelectionDAG::getMemcpy(
   CLI.setDebugLoc(dl)
       .setChain(Chain)
       .setLibCallee(
-          TLI->getLibcallImplCallingConv(MemCpyImpl),
+          getLibcallCallingConv(MemCpyImpl),
           Dst.getValueType().getTypeForEVT(*getContext()),
           getExternalSymbol(MemCpyImpl, TLI->getPointerTy(getDataLayout())),
           std::move(Args))
@@ -9330,7 +9372,7 @@ SDValue SelectionDAG::getAtomicMemcpy(SDValue Chain, const SDLoc &dl,
   CLI.setDebugLoc(dl)
       .setChain(Chain)
       .setLibCallee(
-          TLI->getLibcallImplCallingConv(LibcallImpl),
+          getLibcallCallingConv(LibcallImpl),
           Type::getVoidTy(*getContext()),
           getExternalSymbol(LibcallImpl, TLI->getPointerTy(getDataLayout())),
           std::move(Args))
@@ -9402,7 +9444,7 @@ SDValue SelectionDAG::getMemmove(SDValue Chain, const SDLoc &dl, SDValue Dst,
   CLI.setDebugLoc(dl)
       .setChain(Chain)
       .setLibCallee(
-          TLI->getLibcallImplCallingConv(MemmoveImpl),
+          getLibcallCallingConv(MemmoveImpl),
           Dst.getValueType().getTypeForEVT(*getContext()),
           getExternalSymbol(MemmoveImpl, TLI->getPointerTy(getDataLayout())),
           std::move(Args))
@@ -9436,7 +9478,7 @@ SDValue SelectionDAG::getAtomicMemmove(SDValue Chain, const SDLoc &dl,
   CLI.setDebugLoc(dl)
       .setChain(Chain)
       .setLibCallee(
-          TLI->getLibcallImplCallingConv(LibcallImpl),
+          getLibcallCallingConv(LibcallImpl),
           Type::getVoidTy(*getContext()),
           getExternalSymbol(LibcallImpl, TLI->getPointerTy(getDataLayout())),
           std::move(Args))
@@ -9509,7 +9551,7 @@ SDValue SelectionDAG::getMemset(SDValue Chain, const SDLoc &dl, SDValue Dst,
     Args.emplace_back(Dst, PointerType::getUnqual(Ctx));
     Args.emplace_back(Size, DL.getIntPtrType(Ctx));
     CLI.setLibCallee(
-        TLI->getLibcallImplCallingConv(BzeroImpl), Type::getVoidTy(Ctx),
+        getLibcallCallingConv(BzeroImpl), Type::getVoidTy(Ctx),
         getExternalSymbol(BzeroImpl, TLI->getPointerTy(DL)), std::move(Args));
   } else {
     RTLIB::LibcallImpl MemsetImpl = TLI->getLibcallImpl(RTLIB::MEMSET);
@@ -9518,7 +9560,7 @@ SDValue SelectionDAG::getMemset(SDValue Chain, const SDLoc &dl, SDValue Dst,
     Args.emplace_back(Dst, PointerType::getUnqual(Ctx));
     Args.emplace_back(Src, Src.getValueType().getTypeForEVT(Ctx));
     Args.emplace_back(Size, DL.getIntPtrType(Ctx));
-    CLI.setLibCallee(TLI->getLibcallImplCallingConv(MemsetImpl),
+    CLI.setLibCallee(getLibcallCallingConv(MemsetImpl),
                      Dst.getValueType().getTypeForEVT(Ctx),
                      getExternalSymbol(MemsetImpl, TLI->getPointerTy(DL)),
                      std::move(Args));
@@ -9561,7 +9603,7 @@ SDValue SelectionDAG::getAtomicMemset(SDValue Chain, const SDLoc &dl,
   CLI.setDebugLoc(dl)
       .setChain(Chain)
       .setLibCallee(
-          TLI->getLibcallImplCallingConv(LibcallImpl),
+          getLibcallCallingConv(LibcallImpl),
           Type::getVoidTy(*getContext()),
           getExternalSymbol(LibcallImpl, TLI->getPointerTy(getDataLayout())),
           std::move(Args))
@@ -14301,7 +14343,7 @@ SDValue SelectionDAG::makeStateFunctionCall(unsigned LibFunc, SDValue Ptr,
       getExternalSymbol(LibcallImpl, TLI->getPointerTy(getDataLayout()));
   TargetLowering::CallLoweringInfo CLI(*this);
   CLI.setDebugLoc(DLoc).setChain(InChain).setLibCallee(
-      TLI->getLibcallImplCallingConv(LibcallImpl),
+      getLibcallCallingConv(LibcallImpl),
       Type::getVoidTy(*getContext()), Callee, std::move(Args));
   return TLI->LowerCallTo(CLI).second;
 }

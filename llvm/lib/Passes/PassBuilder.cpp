@@ -198,6 +198,7 @@
 #include "llvm/Transforms/CFGuard.h"
 #include "llvm/Transforms/C2Go/C2GoEscapeCheck.h"
 #include "llvm/Transforms/C2Go/C2GoGCSetup.h"
+#include "llvm/Transforms/C2Go/C2GoLibCallRouting.h"
 #include "llvm/Transforms/C2Go/C2GoLoopPoll.h"
 #include "llvm/Transforms/C2Go/C2GoMemcpyTyping.h"
 #include "llvm/Transforms/C2Go/C2GoSafepoint.h"

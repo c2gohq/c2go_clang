@@ -2306,7 +2306,7 @@ bool VectorLegalizer::tryExpandVecMathCall(SDNode *Node, RTLIB::Libcall LC,
   // Emit a call to the vector function.
   SDValue Callee =
       DAG.getExternalSymbol(LCImpl, TLI.getPointerTy(DAG.getDataLayout()));
-  CallingConv::ID CC = RTLCI.getLibcallImplCallingConv(LCImpl);
+  CallingConv::ID CC = DAG.getLibcallCallingConv(LCImpl);
 
   TargetLowering::CallLoweringInfo CLI(DAG);
   CLI.setDebugLoc(DL)

@@ -4,6 +4,7 @@ add_llvm_component_library(LLVMC2Go
   C2GoGCSetup.cpp
   C2GoGCMaskUtils.cpp
   C2GoLeafEligibility.cpp
+  C2GoLibCallRouting.cpp
   C2GoLoopPoll.cpp
   C2GoMemcpyTyping.cpp
   C2GoPipeline.cpp

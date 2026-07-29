@@ -66,6 +66,7 @@
 #include "llvm/TargetParser/SubtargetFeature.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/C2Go/C2GoEscapeCheck.h"
+#include "llvm/Transforms/C2Go/C2GoLibCallRouting.h"
 #include "llvm/Transforms/C2Go/C2GoMemcpyTyping.h"
 #include "llvm/Transforms/C2Go/C2GoPipeline.h"
 #include "llvm/Transforms/C2Go/C2GoSafepoint.h"
@@ -978,13 +979,17 @@ static void addC2GoLatePasses(llvm::ModulePassManager &MPM,
   //   1. MemcpyTyping   — lock in `!c2go.elem.type` routing on raw
   //                       memcpy/memmove BEFORE the GC pipeline (the
   //                       resulting `runtime.typedmemmove` is gc-leaf).
-  //   2. Poll group     — inject cooperative Gosched() polls BEFORE the
+  //   2. Libcall route  — redirect libc calls synthesized by the optimizer
+  //                       to their preserved c2go_linkname GoABI0 targets.
+  //                       This must happen before the GC group so those new
+  //                       Go calls receive statepoints.
+  //   3. Poll group     — inject cooperative Gosched() polls BEFORE the
   //                       GC pipeline so RS4GC wraps each new poll call
   //                       in a gc.statepoint (the new call counts as a
   //                       real safepoint for liveness — the whole point
   //                       of injection; matches §4.10.6).
-  //   3. GC group       — RS4GC (or lightweight C2GoSafepointPass).
-  //   4. Leaf group     — MemcpyTyping + WriteBarriers AFTER the GC
+  //   4. GC group       — RS4GC (or lightweight C2GoSafepointPass).
+  //   5. Leaf group     — MemcpyTyping + WriteBarriers AFTER the GC
   //                       pipeline. Both emit only `gc-leaf-function`
   //                       callees (`runtime.typedmemmove`,
   //                       `_c2go_writePtr`), so they do not need a
@@ -994,8 +999,9 @@ static void addC2GoLatePasses(llvm::ModulePassManager &MPM,
   //                       round 23 regression in which Layer 3 added
   //                       WriteBarriers but Layer 1 had already consumed
   //                       its pass slot pre-RS4GC. See round 24 prompt.
-  //   5. EscapeCheck    — #289 client B (default-OFF no-op).
+  //   6. EscapeCheck    — #289 client B (default-OFF no-op).
   MPM.addPass(C2GoMemcpyTypingPass());
+  MPM.addPass(C2GoLibCallRoutingPass());
   addC2GoLatePollPasses(MPM);
   addC2GoLateGCPasses(MPM, UseStatepoint);
   addC2GoLateLeafPasses(MPM);

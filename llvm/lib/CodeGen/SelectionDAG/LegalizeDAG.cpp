@@ -2160,7 +2160,7 @@ SelectionDAGLegalize::ExpandLibCall(RTLIB::Libcall LC, SDNode *Node,
   if (isTailCall)
     InChain = TCChain;
 
-  CallingConv::ID LibCC = TLI.getLibcallImplCallingConv(LCImpl);
+  CallingConv::ID LibCC = DAG.getLibcallCallingConv(LCImpl);
 
   // c2go: a scalar FP libm libcall expanded here (e.g. an `@llvm.atan`/
   // `@llvm.rint` intrinsic that has no hardware instruction on the target)
@@ -2424,7 +2424,7 @@ SelectionDAGLegalize::ExpandDivRemLibCall(SDNode *Node,
   TargetLowering::CallLoweringInfo CLI(DAG);
   CLI.setDebugLoc(dl)
       .setChain(InChain)
-      .setLibCallee(TLI.getLibcallImplCallingConv(LibcallImpl), RetTy, Callee,
+      .setLibCallee(DAG.getLibcallCallingConv(LibcallImpl), RetTy, Callee,
                     std::move(Args))
       .setSExtResult(isSigned)
       .setZExtResult(!isSigned);
@@ -2488,7 +2488,7 @@ SDValue SelectionDAGLegalize::ExpandSincosStretLibCall(SDNode *Node) const {
       *DAG.getContext(), TM.getTargetTriple(), DL, SincosStret);
 
   Type *SincosStretRetTy = FuncTy->getReturnType();
-  CallingConv::ID CallConv = CallsInfo.getLibcallImplCallingConv(SincosStret);
+  CallingConv::ID CallConv = DAG.getLibcallCallingConv(SincosStret);
 
   SDValue Callee =
       DAG.getExternalSymbol(SincosStret, TLI.getProgramPointerTy(DL));

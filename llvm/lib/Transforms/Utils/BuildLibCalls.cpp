@@ -25,6 +25,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/Support/TypeSize.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include <optional>
 
 using namespace llvm;
@@ -1539,6 +1540,22 @@ FunctionCallee llvm::getOrInsertLibFunc(Module *M, const TargetLibraryInfo &TLI,
   return getOrInsertLibFunc(M, TLI, TheLibFunc, T, AttributeList());
 }
 
+static bool hasC2GoLibCallRoute(const Module &M, StringRef CName) {
+  const NamedMDNode *NMD = M.getNamedMetadata(c2go::kLibCallRoutesMDName);
+  if (!NMD)
+    return false;
+  for (const MDNode *Entry : NMD->operands()) {
+    if (!Entry || Entry->getNumOperands() != 2)
+      continue;
+    const auto *Name = dyn_cast_or_null<MDString>(Entry->getOperand(0));
+    const auto *Target = dyn_cast_or_null<MDString>(Entry->getOperand(1));
+    if (Name && Target && !Target->getString().empty() &&
+        Name->getString() == CName)
+      return true;
+  }
+  return false;
+}
+
 bool llvm::isLibFuncEmittable(const Module *M, const TargetLibraryInfo *TLI,
                               LibFunc TheLibFunc) {
   StringRef FuncName = TLI->getName(TheLibFunc);
@@ -1551,6 +1568,23 @@ bool llvm::isLibFuncEmittable(const Module *M, const TargetLibraryInfo *TLI,
     if (auto *F = dyn_cast<Function>(GV))
       return TLI->isValidProtoForLibFunc(*F->getFunctionType(), TheLibFunc, *M);
     return false;
+  }
+
+  // A c2go module cannot resolve a standard C spelling merely because the
+  // target platform normally provides libc. If no declaration exists, allow
+  // LLVM to invent the call only when clang preserved a direct-GoABI0 route.
+  // The four raw memory primitives are the intentional exception: c2go's
+  // memcpy-typing/backend path owns them and c2go-libc provides ABI0 fallbacks.
+  if (M->getModuleFlag(c2go::kGoabiModuleFlag)) {
+    switch (TheLibFunc) {
+    case LibFunc_bzero:
+    case LibFunc_memcpy:
+    case LibFunc_memmove:
+    case LibFunc_memset:
+      return true;
+    default:
+      return hasC2GoLibCallRoute(*M, FuncName);
+    }
   }
 
   return true;

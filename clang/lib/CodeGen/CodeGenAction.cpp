@@ -68,6 +68,7 @@
 #include "llvm/Transforms/IPO/Internalize.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 
+#include <map>
 #include <optional>
 using namespace clang;
 using namespace llvm;
@@ -433,6 +434,54 @@ collectC2GoModuleGCMaskVars(const llvm::Module *M) {
   return llvm::c2go::collectGCMaskVarsFromModule(*M);
 }
 
+// Preserve every direct-GoABI0 c2go_linkname route independently of whether
+// CodeGen happened to materialise the declaration as an llvm::Function. LLVM
+// optimisations are allowed to synthesize standard libc calls after AST
+// lowering (LoopIdiomRecognize's loop -> strlen and InstCombine's printf ->
+// puts are canonical examples). Such calls use the original C spelling and
+// therefore cannot recover the declaration's AsmLabel or calling convention
+// from IR alone.
+//
+// The compact named-metadata table is consumed after the normal optimisation
+// pipeline by C2GoLibCallRoutingPass, and again by SelectionDAG for libcalls
+// first materialised during instruction selection. Recording only
+// C2GO_GOABI0 routes is essential: a linkname without that selector targets a
+// Go ABIInternal symbol and must continue through the existing local wrapper.
+static void emitC2GoLibCallRoutes(ASTContext &Ctx, llvm::Module &M) {
+  std::map<std::string, std::string> Routes;
+  for (const Decl *D : Ctx.getTranslationUnitDecl()->decls()) {
+    const auto *FD = dyn_cast<FunctionDecl>(D);
+    if (!FD)
+      continue;
+    const auto *LA = FD->getAttr<C2GoLinknameAttr>();
+    if (!LA || LA->getHasAbi0() == 0)
+      continue;
+
+    std::string CName = FD->getNameAsString();
+    std::string Target = LA->getName().str();
+    if (CName.empty() || Target.empty())
+      continue;
+
+    auto [It, Inserted] = Routes.emplace(CName, Target);
+    if (!Inserted && It->second != Target)
+      M.getContext().emitError(
+          "conflicting c2go libcall routes for C function '" + CName + "': '" +
+          It->second + "' versus '" + Target + "'");
+  }
+
+  if (Routes.empty())
+    return;
+
+  llvm::LLVMContext &LLVMCtx = M.getContext();
+  llvm::NamedMDNode *NMD =
+      M.getOrInsertNamedMetadata(llvm::c2go::kLibCallRoutesMDName);
+  for (const auto &[CName, Target] : Routes) {
+    llvm::Metadata *Ops[] = {llvm::MDString::get(LLVMCtx, CName),
+                             llvm::MDString::get(LLVMCtx, Target)};
+    NMD->addOperand(llvm::MDNode::get(LLVMCtx, Ops));
+  }
+}
+
 // c2go: build the sidecar manifest JSON described in c2go_design.md
 // v14 §4.7, consumed by c2gobind to produce Go declarations AND by
 // the in-clang Plan 9 .s emitter (BackendUtil::RunC2GoPlan9Pipeline
@@ -443,6 +492,9 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
                                             DiagnosticsEngine &Diags,
                                             llvm::Module *Mod,
                                             CodeGen::CodeGenModule *CGM) {
+  if (Mod)
+    emitC2GoLibCallRoutes(Ctx, *Mod);
+
   llvm::json::Object Root;
   Root["pkgpath"] = LangOpts.C2GoPackagePath.empty()
                        ? "main"

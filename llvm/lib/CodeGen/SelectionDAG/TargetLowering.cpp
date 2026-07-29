@@ -203,7 +203,7 @@ TargetLowering::makeLibCall(SelectionDAG &DAG, RTLIB::LibcallImpl LibcallImpl,
       signExtend = zeroExtend = false;
   }
 
-  CallingConv::ID LibCC = getLibcallImplCallingConv(LibcallImpl);
+  CallingConv::ID LibCC = DAG.getLibcallCallingConv(LibcallImpl);
 
   // c2go: this libcall was synthesized here at ISel — either from an
   // `@llvm.<fn>` FP intrinsic that the middle-end folded a libm call into, or
@@ -12424,7 +12424,7 @@ bool TargetLowering::expandMultipleResultFPLibCall(
   // here target c2go-provided GoABI0 Go-side symbols, not the default C CC —
   // the third and last scalar-FP libcall emitter alongside makeLibCall and
   // SelectionDAGLegalize::ExpandLibCall. Same gate/rationale as those two.
-  CallingConv::ID LibCC = getLibcallImplCallingConv(LibcallImpl);
+  CallingConv::ID LibCC = DAG.getLibcallCallingConv(LibcallImpl);
   if (DAG.getMachineFunction().getFunction().getParent()->getModuleFlag(
           llvm::c2go::kGoabiModuleFlag)) {
     bool AnyFP = RetType->isFloatingPointTy();
