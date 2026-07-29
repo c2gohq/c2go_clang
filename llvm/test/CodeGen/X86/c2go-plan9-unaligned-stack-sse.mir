@@ -1,0 +1,75 @@
+# RUN: llc -start-before=x86-asm-printer \
+# RUN:     -mtriple=x86_64-unknown-linux-gnu -output-asm-variant=2 \
+# RUN:     -filetype=asm -o - %s | FileCheck %s
+#
+# A Go amd64 TEXT entry guarantees only 8-byte stack alignment. LLVM can
+# still select aligned 128-bit memory moves for an 8-byte-aligned IR slot
+# (the optimized musl qsort initializer is a real example). The ordinary
+# X86 prologue would realign SP, but c2go replaces that prologue with a Go
+# frame. Pin the final Plan 9 printer boundary: memory forms must use the
+# unaligned encodings, while register-to-register moves remain unchanged.
+#
+# CHECK-LABEL: TEXT ·unaligned_stack_sse(SB)
+# CHECK:       MOVUPS X0, -16(BP)
+# CHECK:       MOVUPS -16(BP), X1
+# CHECK:       MOVUPD X1, -32(BP)
+# CHECK:       MOVUPD -32(BP), X2
+# CHECK:       MOVOU X2, -48(BP)
+# CHECK:       MOVOU -48(BP), X3
+# CHECK:       MOVAPS X3, 0(AX)
+# CHECK:       MOVAPS 0(AX), X4
+# CHECK:       MOVAPD X4, 16(AX)
+# CHECK:       MOVAPD 16(AX), X5
+# CHECK:       MOVO X5, 32(AX)
+# CHECK:       MOVO 32(AX), X6
+# CHECK:       MOVAPS X6, X7
+# CHECK:       MOVAPD X7, X8
+# CHECK-NOT:   MOVAPS {{.*}}(BP)
+# CHECK-NOT:   MOVAPD {{.*}}(BP)
+# CHECK-NOT:   MOVO {{.*}}(BP)
+
+--- |
+  target triple = "x86_64-unknown-linux-gnu"
+
+  define internal goabi0cc void @unaligned_stack_sse() #0 {
+  entry:
+    ret void
+  }
+
+  attributes #0 = { "c2go-argsize"="0" }
+
+  !llvm.module.flags = !{!0}
+  !0 = !{i32 1, !"c2go.goabi", i32 1}
+
+...
+---
+name:            unaligned_stack_sse
+alignment:       16
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       0
+  maxAlignment:    8
+  adjustsStack:    false
+  hasCalls:        false
+  maxCallFrameSize: 0
+machineFunctionInfo: {}
+body:             |
+  bb.0.entry:
+    liveins: $rax, $rbp, $xmm0
+
+    MOVAPSmr $rbp, 1, $noreg, -16, $noreg, $xmm0
+    $xmm1 = MOVAPSrm $rbp, 1, $noreg, -16, $noreg
+    MOVAPDmr $rbp, 1, $noreg, -32, $noreg, $xmm1
+    $xmm2 = MOVAPDrm $rbp, 1, $noreg, -32, $noreg
+    MOVDQAmr $rbp, 1, $noreg, -48, $noreg, $xmm2
+    $xmm3 = MOVDQArm $rbp, 1, $noreg, -48, $noreg
+    MOVAPSmr $rax, 1, $noreg, 0, $noreg, $xmm3
+    $xmm4 = MOVAPSrm $rax, 1, $noreg, 0, $noreg
+    MOVAPDmr $rax, 1, $noreg, 16, $noreg, $xmm4
+    $xmm5 = MOVAPDrm $rax, 1, $noreg, 16, $noreg
+    MOVDQAmr $rax, 1, $noreg, 32, $noreg, $xmm5
+    $xmm6 = MOVDQArm $rax, 1, $noreg, 32, $noreg
+    $xmm7 = MOVAPSrr $xmm6
+    $xmm8 = MOVAPDrr $xmm7
+    RET64 $noreg
+...

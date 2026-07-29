@@ -1025,35 +1025,59 @@ bool X86Plan9InstPrinter::tryPrintGPRMemImm(const MCInst *MI,
 
 // SSE / SIMD moves. Covers MOVSS/MOVSD/MOVAPS/MOVUPS/MOVAPD/MOVUPD
 // in both rr/rm/mr shapes, plus CVTTSD2SI.
+//
+// Go's amd64 TEXT entry provides only 8-byte stack alignment.  LLVM may still
+// select an aligned 128-bit move for an 8-byte-aligned stack object (for
+// example, when lowering a 16-byte memcpy).  A native X86 prologue would
+// realign SP, but the c2go Plan 9 path replaces that prologue with a Go frame.
+// Therefore aligned moves whose memory base is RSP/RBP are deliberately
+// printed with the equivalent unaligned encoding.  Moves through other bases
+// keep LLVM's selected spelling, as do register-to-register forms.
 bool X86Plan9InstPrinter::tryPrintSSEMov(const MCInst *MI, raw_ostream &O) {
   unsigned Op = MI->getOpcode();
   StringRef Nm = MII.getName(Op);
   struct Map { const char *Root; const char *P9; };
   static const Map kRoots[] = {
-    {"MOVSSrr", "MOVSS"}, {"MOVSDrr", "MOVSD"},
-    {"MOVSSrm", "MOVSS"}, {"MOVSDrm", "MOVSD"},
-    {"MOVSSmr", "MOVSS"}, {"MOVSDmr", "MOVSD"},
-    {"MOVAPSrr", "MOVAPS"}, {"MOVAPDrr", "MOVAPD"},
-    {"MOVAPSrm", "MOVAPS"}, {"MOVAPDrm", "MOVAPD"},
-    {"MOVAPSmr", "MOVAPS"}, {"MOVAPDmr", "MOVAPD"},
-    {"MOVUPSrr", "MOVUPS"}, {"MOVUPDrr", "MOVUPD"},
-    {"MOVUPSrm", "MOVUPS"}, {"MOVUPDrm", "MOVUPD"},
-    {"MOVUPSmr", "MOVUPS"}, {"MOVUPDmr", "MOVUPD"},
-    {"CVTTSD2SI64rr", "CVTTSD2SQ"}, {"CVTTSD2SIrr", "CVTTSD2SL"},
-    {"CVTTSD2SI64rm", "CVTTSD2SQ"}, {"CVTTSD2SIrm", "CVTTSD2SL"},
-    {"CVTTSS2SI64rr", "CVTTSS2SQ"}, {"CVTTSS2SIrr", "CVTTSS2SL"},
-    {"CVTSI2SD64rr",  "CVTSQ2SD"},  {"CVTSI2SDrr",  "CVTSL2SD"},
-    {"CVTSI2SS64rr",  "CVTSQ2SS"},  {"CVTSI2SSrr",  "CVTSL2SS"},
-    {"ADDSDrr", "ADDSD"}, {"ADDSSrr", "ADDSS"},
-    {"SUBSDrr", "SUBSD"}, {"SUBSSrr", "SUBSS"},
-    {"MULSDrr", "MULSD"}, {"MULSSrr", "MULSS"},
-    {"DIVSDrr", "DIVSD"}, {"DIVSSrr", "DIVSS"},
+      {"MOVSSrr", "MOVSS"},           {"MOVSDrr", "MOVSD"},
+      {"MOVSSrm", "MOVSS"},           {"MOVSDrm", "MOVSD"},
+      {"MOVSSmr", "MOVSS"},           {"MOVSDmr", "MOVSD"},
+      {"MOVAPSrr", "MOVAPS"},         {"MOVAPDrr", "MOVAPD"},
+      {"MOVAPSrm", "MOVAPS"},         {"MOVAPDrm", "MOVAPD"},
+      {"MOVAPSmr", "MOVAPS"},         {"MOVAPDmr", "MOVAPD"},
+      {"MOVUPSrr", "MOVUPS"},         {"MOVUPDrr", "MOVUPD"},
+      {"MOVUPSrm", "MOVUPS"},         {"MOVUPDrm", "MOVUPD"},
+      {"MOVUPSmr", "MOVUPS"},         {"MOVUPDmr", "MOVUPD"},
+      {"MOVDQArm", "MOVO"},           {"MOVDQAmr", "MOVO"},
+      {"CVTTSD2SI64rr", "CVTTSD2SQ"}, {"CVTTSD2SIrr", "CVTTSD2SL"},
+      {"CVTTSD2SI64rm", "CVTTSD2SQ"}, {"CVTTSD2SIrm", "CVTTSD2SL"},
+      {"CVTTSS2SI64rr", "CVTTSS2SQ"}, {"CVTTSS2SIrr", "CVTTSS2SL"},
+      {"CVTSI2SD64rr", "CVTSQ2SD"},   {"CVTSI2SDrr", "CVTSL2SD"},
+      {"CVTSI2SS64rr", "CVTSQ2SS"},   {"CVTSI2SSrr", "CVTSL2SS"},
+      {"ADDSDrr", "ADDSD"},           {"ADDSSrr", "ADDSS"},
+      {"SUBSDrr", "SUBSD"},           {"SUBSSrr", "SUBSS"},
+      {"MULSDrr", "MULSD"},           {"MULSSrr", "MULSS"},
+      {"DIVSDrr", "DIVSD"},           {"DIVSSrr", "DIVSS"},
   };
   const char *MnP9 = nullptr;
   for (auto &E : kRoots) {
     if (Nm == E.Root) { MnP9 = E.P9; break; }
   }
   if (!MnP9) return false;
+
+  auto stackSafeMnemonic = [&](unsigned MemStart) -> const char * {
+    if (MI->getNumOperands() <= MemStart || !MI->getOperand(MemStart).isReg())
+      return MnP9;
+    MCRegister Base = MI->getOperand(MemStart).getReg();
+    if (Base != X86::RSP && Base != X86::RBP)
+      return MnP9;
+    if (Nm.starts_with("MOVAPS"))
+      return "MOVUPS";
+    if (Nm.starts_with("MOVAPD"))
+      return "MOVUPD";
+    if (Nm.starts_with("MOVDQA"))
+      return "MOVOU";
+    return MnP9;
+  };
 
   bool IsRR = Nm.ends_with("rr");
   bool IsRM = Nm.ends_with("rm");
@@ -1079,7 +1103,7 @@ bool X86Plan9InstPrinter::tryPrintSSEMov(const MCInst *MI, raw_ostream &O) {
   if (IsRM) {
     // {Rd, Base, Scale, Idx, Disp, Seg}
     if (MI->getNumOperands() < 6 || !MI->getOperand(0).isReg()) return false;
-    O << "\t" << MnP9 << " ";
+    O << "\t" << stackSafeMnemonic(/*MemStart=*/1) << " ";
     printPlan9MemRef(O, MI, /*OpStart=*/1, MRI);
     O << ", ";
     printPlan9Reg(O, MI->getOperand(0).getReg(), MRI);
@@ -1089,7 +1113,7 @@ bool X86Plan9InstPrinter::tryPrintSSEMov(const MCInst *MI, raw_ostream &O) {
   if (IsMR) {
     // {Base, Scale, Idx, Disp, Seg, Rs}
     if (MI->getNumOperands() < 6 || !MI->getOperand(5).isReg()) return false;
-    O << "\t" << MnP9 << " ";
+    O << "\t" << stackSafeMnemonic(/*MemStart=*/0) << " ";
     printPlan9Reg(O, MI->getOperand(5).getReg(), MRI);
     O << ", ";
     printPlan9MemRef(O, MI, /*OpStart=*/0, MRI);
