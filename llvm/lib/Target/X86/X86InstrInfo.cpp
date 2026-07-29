@@ -4812,6 +4812,8 @@ STATISTIC(NumX86C2GoPtrSpillSlots,
 //     pointer-derived, OR-disjoint (aligned ptr + small offset, the X86
 //     analogue of AArch64 ORRXri+disjoint), CMOV of two ptr values, and a PHI
 //     of all-pointer incomings;
+//   * width invariant: a vreg narrower than the target pointer width cannot
+//     hold a complete pointer and is rejected before walking its definitions;
 //   * NOT propagated (would over-mark): SUB (pointer difference → int),
 //     compares, multiplies, non-disjoint OR/AND, and — critically — LOADs (the
 //     MIR carries no IR pointer-ness; under-marking here is SOUND, mirror of
@@ -4821,8 +4823,12 @@ STATISTIC(NumX86C2GoPtrSpillSlots,
 // root via ANY def is marked) and the self-cycle → false rule (#370 integer
 // induction PHI fix) are preserved verbatim.
 static bool x86C2GoIsPtrDerived(Register Reg, const MachineRegisterInfo &MRI,
-                                unsigned Depth, SmallSet<Register, 16> &Seen) {
+                                unsigned PointerSizeInBits, unsigned Depth,
+                                SmallSet<Register, 16> &Seen) {
   if (!Reg.isVirtual() || Depth > 24)
+    return false;
+  const TargetRegisterInfo *TRI = MRI.getTargetRegisterInfo();
+  if (TRI->getRegSizeInBits(*MRI.getRegClass(Reg)) != PointerSizeInBits)
     return false;
   if (!Seen.insert(Reg).second)
     // Self-cycle (typically an integer induction PHI back-edge). Conservatively
@@ -4864,7 +4870,8 @@ static bool x86C2GoIsPtrDerived(Register Reg, const MachineRegisterInfo &MRI,
         return false;
       const MachineOperand &MO = Def->getOperand(OpIdx);
       return MO.isReg() && MO.getReg().isVirtual() &&
-             x86C2GoIsPtrDerived(MO.getReg(), MRI, Depth + 1, Seen);
+             x86C2GoIsPtrDerived(MO.getReg(), MRI, PointerSizeInBits, Depth + 1,
+                                 Seen);
     };
     switch (Def->getOpcode()) {
     // Address materialization (LEA). On X86 `&fi`, `&global`, `&s.field`,
@@ -4932,7 +4939,8 @@ static bool x86C2GoIsPtrDerived(Register Reg, const MachineRegisterInfo &MRI,
         const MachineOperand &MO = Def->getOperand(I);
         if (!MO.isReg() || !MO.getReg().isVirtual())
           return false;
-        if (!x86C2GoIsPtrDerived(MO.getReg(), MRI, Depth + 1, Seen))
+        if (!x86C2GoIsPtrDerived(MO.getReg(), MRI, PointerSizeInBits, Depth + 1,
+                                 Seen))
           return false;
         Any = true;
       }
@@ -4961,7 +4969,9 @@ static bool x86C2GoIsPtrDerived(Register Reg, const MachineRegisterInfo &MRI,
 bool X86InstrInfo::isC2GoPointerDerivedReg(
     Register Reg, const MachineRegisterInfo &MRI) const {
   SmallSet<Register, 16> Seen;
-  return x86C2GoIsPtrDerived(Reg, MRI, 0, Seen);
+  unsigned PointerSizeInBits =
+      MRI.getMF().getDataLayout().getPointerSizeInBits();
+  return x86C2GoIsPtrDerived(Reg, MRI, PointerSizeInBits, 0, Seen);
 }
 
 // c2go GC Approach B (#330) #375 slice 3 / #426 (X86 port, #298): TII
@@ -4986,10 +4996,11 @@ void X86InstrInfo::storeRegToStackSlot(
     Register VReg, MachineInstr::MIFlag Flags) const {
   const MachineFunction &MF = *MBB.getParent();
   const MachineFrameInfo &MFI = MF.getFrameInfo();
-  assert(MFI.getObjectSize(FrameIdx) >= RI.getSpillSize(*RC) &&
+  const unsigned SpillSize = RI.getSpillSize(*RC);
+  assert(MFI.getObjectSize(FrameIdx) >= SpillSize &&
          "Stack slot too small for store");
 
-  unsigned Alignment = std::max<uint32_t>(RI.getSpillSize(*RC), 16);
+  unsigned Alignment = std::max<uint32_t>(SpillSize, 16);
   bool isAligned =
       (Subtarget.getFrameLowering()->getStackAlign() >= Alignment) ||
       (RI.canRealignStack(MF) && !MFI.isFixedObjectIndex(FrameIdx));
@@ -5006,12 +5017,16 @@ void X86InstrInfo::storeRegToStackSlot(
   // and, when pointer-derived, tag the spill slot on X86MachineFunctionInfo so
   // the M5 per-PC liveness pass / locals pointer bitmap mark it. Gated on the
   // `c2go.goabi` module flag — non-c2go translation units are byte-identical.
+  // A Go locals-map bit describes one pointer-sized word, so a narrower spill
+  // slot can never be tagged even if a conservative def-chain walk reaches an
+  // address root through an earlier COPY.
   // Physical SrcRegs (CSR spills, RegAllocFast, scavenger) return false from
   // the derivation walk because x86C2GoIsPtrDerived early-exits on
   // !Reg.isVirtual(). Mirror of AArch64InstrInfo.cpp.
   if (MF.getFunction().getParent()->getModuleFlag(
           llvm::c2go::kGoabiModuleFlag) &&
-      SrcReg.isVirtual() && isC2GoPointerDerivedReg(SrcReg, MF.getRegInfo())) {
+      SpillSize == MF.getDataLayout().getPointerSize() && SrcReg.isVirtual() &&
+      isC2GoPointerDerivedReg(SrcReg, MF.getRegInfo())) {
     auto *X86FI = const_cast<MachineFunction &>(MF).getInfo<X86MachineFunctionInfo>();
     if (X86FI->getC2GoSpillSlotTag(FrameIdx).empty()) {
       X86FI->setC2GoSpillSlotTag(FrameIdx, "ptr");

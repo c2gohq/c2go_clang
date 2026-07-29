@@ -1,0 +1,67 @@
+# RUN: llc -O2 -start-before=greedy -mtriple=x86_64-unknown-linux-gnu \
+# RUN:   --output-asm-variant=2 -o - %s | FileCheck %s
+#
+# A gr32 value cannot hold a complete pointer on x86-64.  Here the COPY can
+# lead the pointer-derived-register classifier back to the frame-index LEA,
+# but the value is truncated and then used as an integer before regalloc spills
+# it across the no-preserved-register safepoint.  Its four-byte spill slot must
+# not enter the Go locals pointer map.
+#
+# CHECK-LABEL: TEXT {{[^[:space:]]+}}narrow_spill(SB)
+# CHECK:       FUNCDATA $1, gclocals·{{[0-9a-f]+}}(SB)
+# CHECK-NEXT:  DATA gclocals·{{[0-9a-f]+}}+0(SB)/4, $1
+# CHECK-NEXT:  DATA gclocals·{{[0-9a-f]+}}+4(SB)/4, $8
+# CHECK-NEXT:  DATA gclocals·{{[0-9a-f]+}}+8(SB)/1, $0x00
+
+--- |
+  target triple = "x86_64-unknown-linux-gnu"
+
+  @seed = external global i32
+
+  declare c2goabiinternalcc void @safepoint()
+
+  define internal c2goabiinternalcc i32 @narrow_spill() #0 gc "c2go-gc" {
+  entry:
+    %slot = alloca i8, align 1
+    ret i32 0
+  }
+
+  attributes #0 = { "c2go-reg-return" "c2go-argsize"="0" noinline }
+
+  !llvm.module.flags = !{!0, !1}
+  !0 = !{i32 1, !"c2go.goabi", i32 1}
+  !1 = !{i32 1, !"c2go.x86-leaf-abi", i32 1}
+
+...
+---
+name:            narrow_spill
+alignment:       16
+tracksRegLiveness: true
+noPhis:          true
+isSSA:           false
+registers:
+  - { id: 0, class: gr64_with_sub_8bit, preferred-register: '', flags: [  ] }
+  - { id: 1, class: gr32, preferred-register: '', flags: [  ] }
+  - { id: 2, class: gr64, preferred-register: '', flags: [  ] }
+frameInfo:
+  maxAlignment:    1
+  adjustsStack:    true
+  hasCalls:        true
+  maxCallFrameSize: 4294967295
+stack:
+  - { id: 0, name: slot, type: default, offset: 0, size: 1, alignment: 1,
+      stack-id: default }
+machineFunctionInfo:
+  amxProgModel:    None
+body:             |
+  bb.0.entry:
+    %0:gr64_with_sub_8bit = LEA64r %stack.0.slot, 1, $noreg, 0, $noreg
+    %1:gr32 = COPY %0.sub_32bit
+    %2:gr64 = MOV64rm $rip, 1, $noreg, target-flags(x86-gotpcrel) @seed, $noreg :: (load (s64) from got)
+    %1:gr32 = ADD32rm %1, %2, 1, $noreg, 0, $noreg, implicit-def dead $eflags :: (volatile dereferenceable load (s32) from @seed)
+    ADJCALLSTACKDOWN64 0, 0, 0, implicit-def dead $rsp, implicit-def dead $eflags, implicit-def dead $ssp, implicit $rsp, implicit $ssp
+    STATEPOINT 2882400000, 0, 0, target-flags(x86-plt) @safepoint, 2, 129, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, csr_64_noneregs, implicit-def $rsp, implicit-def $ssp
+    ADJCALLSTACKUP64 0, 0, implicit-def dead $rsp, implicit-def dead $eflags, implicit-def dead $ssp, implicit $rsp, implicit $ssp
+    $eax = COPY %1
+    RET 0, killed $eax
+...
