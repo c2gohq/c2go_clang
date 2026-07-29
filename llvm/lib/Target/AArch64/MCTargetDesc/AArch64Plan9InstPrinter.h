@@ -104,6 +104,10 @@ private:
   bool tryPrintADRPPairCompletion(const MCInst *MI, raw_ostream &O);
   void flushPendingADRP(raw_ostream &O); // emit MOVD $·sym(SB), Rd
   bool tryPrintADR(const MCInst *MI, raw_ostream &O);             // ADR
+  // ADDXri Rd, Rn, :lo12:sym after a non-adjacent ADRP. The ADRP was
+  // already lowered to the full address, so preserve this instruction as a
+  // register move instead of adding the low 12 bits a second time.
+  bool tryPrintADDXriViaMaterializedAddress(const MCInst *MI, raw_ostream &O);
   bool tryPrintLDRLiteral(const MCInst *MI, raw_ostream &O);      // LDRXl etc.
   // LDR/STR with `:lo12:sym` whose base register was set up by an
   // earlier ADRP (tracked via RegHoldsPage). Handles W/X/B/H/S/D/Q

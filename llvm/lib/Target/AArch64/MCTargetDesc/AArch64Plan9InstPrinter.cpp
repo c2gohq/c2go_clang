@@ -846,6 +846,40 @@ bool AArch64Plan9InstPrinter::tryPrintADR(const MCInst *MI, raw_ostream &O) {
   return true;
 }
 
+bool AArch64Plan9InstPrinter::tryPrintADDXriViaMaterializedAddress(
+    const MCInst *MI, raw_ostream &O) {
+  if (MI->getOpcode() != AArch64::ADDXri || MI->getNumOperands() < 3 ||
+      !MI->getOperand(0).isReg() || !MI->getOperand(1).isReg() ||
+      !MI->getOperand(2).isExpr() ||
+      !referencesLo12(MI->getOperand(2).getExpr()))
+    return false;
+
+  StringRef Sym = getReferencedSymbolName(MI->getOperand(2).getExpr());
+  if (Sym.empty())
+    return false;
+
+  MCRegister Rn = MI->getOperand(1).getReg();
+  auto It = RegHoldsPage.find(canonicalXReg(Rn).id());
+  // A known different symbol is evidence that this is not the ADRP companion
+  // we are looking for. With no entry, the tracker may simply have been
+  // cleared at a label: AArch64 address lowering still constructs PAGE and
+  // PAGEOFF from the same symbol, so the base contains this symbol's full
+  // address under our ADRP lowering (the same invariant used for Q loads).
+  if (It != RegHoldsPage.end() && It->second != Sym)
+    return false;
+
+  MCRegister Rd = MI->getOperand(0).getReg();
+  O << "\tMOVD ";
+  printPlan9GPR(O, Rn);
+  O << ", ";
+  printPlan9GPR(O, Rd);
+  O << "\n";
+
+  invalidateRegDefs(MI);
+  rememberRegHoldsPage(Rd, Sym);
+  return true;
+}
+
 // Map an AArch64 LDR/STR opcode to the Plan 9 mnemonic that loads/
 // stores from a labeled symbol. Returns nullptr if the opcode isn't
 // a recognised LDR/STR-with-immediate-base form.
@@ -1403,7 +1437,10 @@ bool AArch64Plan9InstPrinter::tryPrintArithSReg(const MCInst *MI,
   bool RnIsZR = (Rn == AArch64::XZR || Rn == AArch64::WZR);
   // ORR Rd, ZR, Rm (no shift) == MOV Rd, Rm.
   if ((Op == AArch64::ORRWrs || Op == AArch64::ORRXrs) && RnIsZR && NoShift) {
-    O << "\t" << (Is64 ? "MOVD " : "MOVW ");
+    // Writing a W register zeroes the upper half of the corresponding X
+    // register. Go's Plan 9 MOVW register form instead sign-extends (SXTW),
+    // so the 32-bit alias must use MOVWU to preserve AArch64 semantics.
+    O << "\t" << (Is64 ? "MOVD " : "MOVWU ");
     printPlan9GPR(O, Rm);
     O << ", ";
     printPlan9GPR(O, Rd);
@@ -2158,6 +2195,12 @@ bool AArch64Plan9InstPrinter::tryPrintInst(const MCInst *MI,
     invalidateRegDefs(MI);
     return true;
   }
+  // A non-adjacent ADRP has already been emitted as a complete SB-relative
+  // address by flushPendingADRP. Its :lo12: ADD is therefore a register copy,
+  // not another address calculation. Keep one emitted instruction so raw
+  // PC-relative WORD fallbacks retain their expected layout.
+  if (tryPrintADDXriViaMaterializedAddress(MI, O))
+    return true;
   // #271: SP-relative adjust / load / store / pair. These run after the
   // symbol-bearing LDR/STR printers (those require an MCExpr imm operand
   // and never have base=SP) and before ADRP buffering. Translating them
