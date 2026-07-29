@@ -482,6 +482,11 @@ LLVM_ABI unsigned replaceDominatedUsesWithIf(
 /// execution.  During a call or invoke to such a function, the callers stack
 /// does not have to be made parseable.
 ///
+/// A call-site `gc-safepoint` string attribute is an explicit non-leaf override
+/// and takes precedence over both `gc-leaf-function` and TargetLibraryInfo.
+/// Frontends with a runtime-specific libc implementation can use it when a
+/// canonical libc name is not actually leaf with respect to their collector.
+///
 /// Most passes can and should ignore this information, and it is only used
 /// during lowering by the GC infrastructure.
 LLVM_ABI bool callsGCLeafFunction(const CallBase *Call,

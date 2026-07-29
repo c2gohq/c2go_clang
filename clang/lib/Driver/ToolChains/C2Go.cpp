@@ -9,6 +9,7 @@
 #include "C2Go.h"
 #include "clang/Driver/CommonArgs.h"
 #include "clang/Driver/Compilation.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 
 using namespace clang::driver;
@@ -35,6 +36,16 @@ void c2go::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   // SQLite's sqlite3VdbeExec carries one accepted escape). Standalone build-
   // gating callers (the WF2 archive build) keep the default exit-1 contract.
   CmdArgs.push_back("--c2go-escape-nonfatal");
+
+  // The late GC pipeline now runs in this process for driver-routed pre-link
+  // bitcode. Preserve the shared c2go emergency switch that cc1 also saw. Do
+  // not forward arbitrary -mllvm options: c2go-lto intentionally exposes a
+  // smaller command-line surface than clang's backend.
+  for (const Arg *A : Args.filtered(options::OPT_mllvm)) {
+    llvm::StringRef V = A->getValue(0);
+    if (V.starts_with("-c2go-disable="))
+      CmdArgs.push_back(Args.MakeArgString(V));
+  }
 
   // Forward the c2go output paths. c2go-lto writes the merged Plan 9 .s and GC
   // manifest to these, exactly as cc1 does for a single-file -fc2go compile.

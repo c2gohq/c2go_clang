@@ -3282,6 +3282,12 @@ unsigned llvm::replaceDominatedUsesWithIf(
 
 bool llvm::callsGCLeafFunction(const CallBase *Call,
                                const TargetLibraryInfo &TLI) {
+  // An explicit call-site safepoint contract overrides every inferred leaf
+  // source below, including TargetLibraryInfo. This is required by runtimes
+  // that provide libc-named functions which can enter their collector.
+  if (Call->hasFnAttr("gc-safepoint"))
+    return false;
+
   // Check if the function is specifically marked as a gc leaf function.
   if (Call->hasFnAttr("gc-leaf-function"))
     return true;

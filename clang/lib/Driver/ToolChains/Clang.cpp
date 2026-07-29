@@ -6780,6 +6780,11 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
       (Args.hasArg(options::OPT_fc2go_emit_manifest_EQ) ||
        Args.hasArg(options::OPT_fc2go_emit_plan9_asm_EQ));
   if (C2GoLtoRoutedBC) {
+    // Keep the per-TU IR in pre-RS4GC form. c2go-lto links and inlines first,
+    // then runs the complete c2go late pipeline once on the combined module.
+    // Without this phase boundary, an inlined callee can introduce a new
+    // safepoint call after liveness was already computed for the caller.
+    CmdArgs.push_back("-fc2go-lto-prelink");
     Args.ClaimAllArgs(options::OPT_fc2go_emit_manifest_EQ);
     Args.ClaimAllArgs(options::OPT_fc2go_emit_plan9_asm_EQ);
   } else {

@@ -166,6 +166,9 @@ CODEGENOPT(PrepareForLTO     , 1, 0, Benign) ///< Set when -flto is enabled on t
                                              ///< compile step.
 CODEGENOPT(PrepareForThinLTO , 1, 0, Benign) ///< Set when -flto=thin is enabled on the
                                              ///< compile step.
+CODEGENOPT(C2GoLTOPreLink    , 1, 0, Benign) ///< Defer c2go's safepoint/GC
+                                             ///< lowering until c2go-lto has
+                                             ///< linked and inlined all TUs.
 CODEGENOPT(LTOUnit, 1, 0, Benign) ///< Emit IR to support LTO unit features (CFI, whole
                                  ///< program vtable opt).
 CODEGENOPT(FatLTO, 1, 0, Benign) ///< Set when -ffat-lto-objects is enabled.

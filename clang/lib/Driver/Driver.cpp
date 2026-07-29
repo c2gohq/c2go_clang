@@ -4452,10 +4452,10 @@ void Driver::BuildActions(Compilation &C, DerivedArgList &Args,
         break;
       }
 
-      // c2go: stop each TU at bitcode (running the full per-TU middle-end,
-      // including the -O2 c2go OptimizerLast passes that embed the manifest) and
-      // queue it; c2go-lto links the set below (one TU or several). Mirrors the
-      // -flto bitcode emit, but the "linker" is c2go-lto.
+      // c2go: stop each TU at optimized pre-link bitcode and queue it. The cc1
+      // job defers c2go's late safepoint/GC pipeline; c2go-lto links and
+      // inlines first, then runs that pipeline once on the combined module.
+      // This mirrors -flto bitcode emit, but the "linker" is c2go-lto.
       if (C2GoLtoMode && Phase == phases::Backend) {
         Current = C.MakeAction<BackendJobAction>(Current, types::TY_LLVM_BC);
         C2GoLtoInputs.push_back(Current);

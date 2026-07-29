@@ -1988,20 +1988,12 @@ static void c2goExpandDirectAllocaFields(const MachineFunction &MF,
     StackOffset SO = TFL->getFrameIndexReference(MF, FI, FrameReg);
     if (FrameReg != AArch64::SP || SO.getFixed() != Off)
       continue;
-    // #327: do NOT expand vararg-pack allocas (`!c2go.va.pack`: the
-    // c2go.va.argptrs arrays and their c2go.va.slot storage). RS4GC keeps their
-    // address live across UNRELATED safepoints (e.g. sqlite3RunParser), and
-    // stack-coloring merges disjoint-lifetime va slots, so at such a PC the slot
-    // holds another pack's stale content or an uninitialized word (0x1) —
-    // expanding the pointer field there marks a non-pointer ("bad pointer in
-    // frame ... 0x1"). The pack address is still relocated as an Indirect spill
-    // where it is genuinely live; its interior `&slot` pointers are stack-local
-    // in an unmanaged (managed(0)) workload — same conservative under-marking
-    // class as the union-ambiguous #312 words. (Genuine in-memory pointer
-    // fields of plain C aggregates like yyParser.yytos are NOT va-pack-flagged
-    // and ARE expanded, so copystack still relocates them per-PC.)
-    if (AI->getMetadata(llvm::c2go::kVaPackMD))
-      continue;
+    // #670: vararg packs must be expanded here as well. argptrs[] stores
+    // pointers to c2go.va.slot objects in this frame; if a callee grows the Go
+    // stack, every such entry must be relocated before the callee dereferences
+    // it. C2GoFoldAllocaRelocates entry-zeroes all pointer-bearing pack fields,
+    // and stack coloring keeps pointer layouts compatible, so an RS4GC
+    // over-approximation at another PC is a safe null/stale-stack-pointer mark.
     // #312: skip union-ambiguous pointer words (a union word that is a pointer
     // in one member and an integer in another) — same conservative
     // under-marking as the lightweight path; the static FUNCDATA map cannot

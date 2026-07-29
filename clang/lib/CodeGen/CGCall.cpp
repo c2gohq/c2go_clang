@@ -4502,9 +4502,9 @@ void CodeGenFunction::EmitC2GoVarArgPack(CallArgList &Args, unsigned NumFixed) {
     llvm::LLVMContext &Ctx = AI->getContext();
     llvm::Metadata *Ops[] = {llvm::MDString::get(Ctx, "c2go.va")};
     AI->setMetadata(llvm::c2go::kPtrManagedMD, llvm::MDNode::get(Ctx, Ops));
-    // #327: also flag the argptrs array as a vararg pack (see the va.slot
-    // tagging below) so the statepoint path excludes it from per-PC
-    // aggregate-field expansion.
+    // Also flag the argptrs array as a vararg pack (see the va.slot tagging
+    // below). The late statepoint path entry-zeroes and field-expands it so
+    // copystack relocates its stack-interior `&slot` entries (#670).
     AI->setMetadata(llvm::c2go::kVaPackMD, llvm::MDNode::get(Ctx, {}));
   }
 
@@ -4514,15 +4514,11 @@ void CodeGenFunction::EmitC2GoVarArgPack(CallArgList &Args, unsigned NumFixed) {
     const CallArg &A = Args[NumFixed + i];
     QualType Ty = A.getType();
     RawAddress Storage = CreateMemTemp(Ty, "c2go.va.slot");
-    // #327: mark the vararg storage slot `!c2go.va.pack` (a dedicated flag,
-    // NOT c2go.ptr.managed — we must not change StackColoring / the lightweight
-    // -O0 gclocals behavior). The statepoint GC path (the #327 fold pass /
-    // LowerSTATEPOINT) uses this flag to EXCLUDE vararg-pack allocas from
-    // per-PC aggregate-field expansion: RS4GC keeps their ADDRESS live across
-    // unrelated safepoints, but each slot's pointer content is only valid in
-    // the narrow window right before its own vararg call (and stack-coloring
-    // merges disjoint-lifetime va slots), so expanding the field elsewhere
-    // marks an uninitialized word as a pointer ("bad pointer in frame ... 0x1").
+    // Mark the storage slot `!c2go.va.pack` (a dedicated flag, NOT
+    // c2go.ptr.managed, because the slot keeps its actual value type). The late
+    // GC pass zero-initializes any pointer-bearing fields and the target
+    // statepoint emitter expands them per PC; this lets both a pointer-valued
+    // vararg and argptrs[]'s `&slot` survive Go stack growth (#670).
     if (auto *AI = dyn_cast<llvm::AllocaInst>(
             Storage.getPointer()->stripPointerCasts())) {
       llvm::LLVMContext &Ctx = AI->getContext();

@@ -86,6 +86,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/CodeGen.h"
+#include "llvm/Support/C2GoEmergencyFlag.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/InitLLVM.h"
@@ -144,11 +145,11 @@ static cl::opt<std::string>
 // c2go WF2 (#319, real M4): emit a Plan 9 (.s) using the same neutral
 // aarch64-ELF + MCPlan9AsmStreamer pipeline that clang's
 // EmitAssemblyHelper::RunC2GoPlan9Pipeline runs. The combined bitcode
-// is expected to already carry RS4GC + Approach B IR-side fixups
-// (these run inside the OptimizerLast callback during the upstream
-// `-fc2go -O2 -emit-llvm` compile and get serialised into the bc), so
-// this tool only drives the codegen pipeline; the AArch64 backend
-// auto-injects M1/M3/M5 MachineFunction passes via addPreEmitPass2.
+// is expected to have completed c2go's late IR pipeline. Driver-produced
+// inputs carry `c2go.lto.prelink=1`; main() links and inlines those inputs,
+// runs the shared late pipeline exactly once, and marks the flag consumed
+// before this helper drives codegen. The AArch64 backend auto-injects
+// M1/M3/M5 MachineFunction passes via addPreEmitPass2.
 static cl::opt<std::string>
     EmitAsm("c2go-emit-asm",
             cl::desc("Emit Plan 9 .s (via MCPlan9AsmStreamer) to <file>"),
@@ -224,8 +225,7 @@ namespace {
 //   * Approach B M1/M3/M5 are MachineFunction passes injected by
 //     AArch64PassConfig::addPreEmitPass2, so addPassesToEmitFile
 //     transparently picks them up — no extra IR pipeline needed here
-//     (the bc already carries RS4GC + GCSetup + FoldAlloca, run by the
-//     upstream `-fc2go -O2 -emit-llvm` OptimizerLast callback);
+//     (the combined IR already carries RS4GC + GCSetup + FoldAlloca);
 //   * the two AArch64 backend c2go knobs (ForceBlockAddressJumpTable +
 //     DisableRegisterCoalescing) are set on this Plan-9-codegen TargetMachine
 //     via `llvm::c2go::setForceBlockAddressJumpTable` /
@@ -597,15 +597,9 @@ int main(int argc, char **argv) {
     return ExitToolError;
   }
 
-  // c2go: c2go-lto behaves as a bitcode LINKER — it PRESERVES the entry
-  // pipeline's optimization level instead of imposing one. The codegen TM is
-  // already created at the bitcode's recorded -O level (kOptLevelFlag, see the
-  // emit helper), so at -O0 the c2go OptimizerLast transforms (RS4GC / GCSetup /
-  // the ABIInternal leaf-flip) — which clang only schedules at -O>=2 — simply
-  // stayed disabled and c2go-lto links + emits a plain stack-ABI0 .s. The
-  // cross-TU inliner + late-leaf replay below is therefore gated on -O>=2 too.
-  // (This supersedes the old #433 hard -O2 / no-optnone requirement, which is
-  // incompatible with c2go-lto being a drop-in bitcode linker.)
+  // Preserve the producer's optimization level. It gates the cross-TU inliner
+  // and selects statepoint GC at -O2+ versus the lightweight safepoint path at
+  // -O0/-O1; it does not make c2go-lto impose an extra generic opt pipeline.
   int BitcodeOptLevel = 3; // flag-absent (pre-#433 bc) => treat as -O>=2
   if (auto *F = Composite->getModuleFlag(c2go::kOptLevelFlag))
     if (auto *CAM = dyn_cast<ConstantAsMetadata>(F))
@@ -754,26 +748,32 @@ int main(int argc, char **argv) {
                                          : static_cast<raw_ostream &>(outs());
   bool EscapeClean = c2go::runAndersenEscapeAudit(*Composite, EscapeOS);
 
-  // c2go #303: cross-TU inlining via NewPM ModuleInlinerWrapperPass.
+  // Driver-produced pre-link inputs carry kLTOPreLinkFlag=1. Legacy inputs may
+  // predate that protocol; a function with an attached GC strategy identifies
+  // already-RS4GC IR, while plain hand-written/test IR is safe to treat as
+  // pre-link. Never inline already-lowered IR: inlining can create a new call
+  // in a function whose gc-live set has already been frozen.
+  std::optional<bool> PreLinkFlag;
+  if (auto *F = Composite->getModuleFlag(c2go::kLTOPreLinkFlag))
+    if (auto *CAM = dyn_cast<ConstantAsMetadata>(F))
+      if (auto *CI = dyn_cast<ConstantInt>(CAM->getValue()))
+        PreLinkFlag = CI->getZExtValue() != 0;
+
+  bool HasPostRS4GCFunction = false;
+  for (const Function &F : *Composite)
+    HasPostRS4GCFunction |= !F.isDeclaration() && F.hasGC();
+  const bool NeedsLatePipeline = PreLinkFlag.value_or(!HasPostRS4GCFunction);
+  const bool CanInline =
+      NeedsLatePipeline && RunInliner && BitcodeOptLevel >= 2;
+
+  // c2go #303: cross-TU inlining via NewPM ModuleInlinerWrapperPass, followed
+  // by the complete c2go late sequence on pre-link IR. PointsTo above remains
+  // pre-inline so diagnostics retain their original source call sites.
   //
-  // Order matters:
-  //   1. PointsTo (above) runs on the pre-inline IR so escape diagnostics
-  //      still point at the original C-source call site.
-  //   2. Inliner runs here, before manifest emit and before Plan 9 codegen,
-  //      so:
-  //        - c2go-boundary functions (external linkage by construction) are
-  //          preserved; the inliner only deletes internal+no-use functions.
-  //        - The Plan 9 .s benefits from cross-TU inlining: an internal
-  //          helper in TU B called from TU A is now folded into A's body.
-  //   3. Manifest / codegen below see the inlined IR.
-  //
-  // We do NOT call buildLTODefaultPipeline: that brings in IPO transforms
-  // (GlobalOpt, DAE, ArgPromotion, etc.) which can break c2go invariants
-  // (CSR_AArch64_NoRegs contract, FUNCDATA/PCDATA pairing, RS4GC results).
-  // Just the inliner is the minimum surface area #303 asks for. Gated on
-  // -O>=2: at -O0 c2go-lto is a pure linker and runs no optimization/late
-  // passes (the entry pipeline did not run them either).
-  if (RunInliner && BitcodeOptLevel >= 2) {
+  // We do NOT call buildLTODefaultPipeline: GlobalOpt, DAE, ArgPromotion, and
+  // Internalize can break c2go's ABI and metadata invariants. The inliner is
+  // the intentionally narrow IPO surface.
+  {
     LoopAnalysisManager LAM;
     FunctionAnalysisManager FAM;
     CGSCCAnalysisManager CGAM;
@@ -817,56 +817,27 @@ int main(int argc, char **argv) {
     PB.registerLoopAnalyses(LAM);
     PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
-    // Snapshot c2go-boundary function names BEFORE inlining so we can
-    // assert post-inline that they still survive (external linkage by
-    // construction makes this true today; the assert is cheap insurance
-    // against future inliner / linkage changes).
+    // Snapshot c2go-boundary names only when the inliner will run, then assert
+    // that its external-linkage contract preserved them.
     SmallVector<std::string, 32> BoundaryNames;
-    for (Function &F : *Composite)
-      if (F.hasFnAttribute("c2go-boundary"))
-        BoundaryNames.emplace_back(F.getName().str());
+    if (CanInline)
+      for (Function &F : *Composite)
+        if (F.hasFnAttribute("c2go-boundary"))
+          BoundaryNames.emplace_back(F.getName().str());
 
     ModulePassManager MPM;
-    MPM.addPass(ModuleInlinerWrapperPass(getInlineParams()));
-    // #372 / round 24 — re-run the *leaf* portion of the c2go late pipeline
-    // after cross-TU inlining: MemcpyTyping + WriteBarriers. Both emit only
-    // `gc-leaf-function` callees (typed memmove / `_c2go_writePtr`), so the
-    // calls they introduce do NOT need to be wrapped in gc.statepoints by a
-    // follow-up RS4GC.
-    //
-    // Cross-TU inlining surfaces fresh instances of these issues that the
-    // per-TU late pipeline could not see:
-    //   * inlined raw `@llvm.memset/memcpy/memmove` need typed routing
-    //     (MemcpyTyping) so they don't lower via the AAPCS libcall.
-    //   * inlined managed-pointer stores need write barriers
-    //     (WriteBarriers — fast-path stores already barriered carry
-    //     `!c2go.wb.done` so the pass is idempotent; see #371).
-    //
-    // We deliberately do NOT replay LoopPoll here: `runtime.Gosched()` is a
-    // real cooperative safepoint whose wrap-in-gc.statepoint is performed
-    // by RS4GC at Layer 1. Emitting a fresh Gosched() call AFTER RS4GC has
-    // already run would yield an un-wrapped GoABI0 call — a GC blind spot.
-    // The per-TU loop polls placed at Layer 1 are preserved by ordinary
-    // inlining; cross-TU long loops are extremely rare and accepted as
-    // "no extra poll" (LoopPoll's overall budget is conservative anyway).
-    //
-    // We also deliberately do NOT re-run C2GoGCSetup + RS4GC: BackendUtil
-    // already ran them at OptimizerLastEP, so the bitcode is already in
-    // post-RS4GC form. RS4GC asserts "repeat safepoint insertion is not
-    // supported"; running it twice would crash. The newly-inlined GoABI0
-    // calls (including write-barrier slow paths) are still required to be
-    // wrapped in statepoints — for `_c2go_writePtr` specifically RS4GC's
-    // own "gc-leaf-function" exemption applies (the shim is declared as
-    // such, see C2GoWriteBarriers.cpp), so no wrap is needed.
-    //
-    // Round 23 regression note (commit af15fda9): moving WriteBarriers out
-    // of this Layer 3 replay broke -O2 SQLite (`adjustpointers` crash in
-    // `selectExpander` frame) because the cross-TU inliner exposed
-    // managed-store sites in newly-merged callees that the per-TU pass had
-    // not seen. GPT round 5 reverted that decision. See round 24 prompt.
-    //
-    // EscapeCheck (#289) runs after the boundary survival assert, below.
-    addC2GoLateLeafPasses(MPM);
+    if (CanInline)
+      MPM.addPass(ModuleInlinerWrapperPass(getInlineParams()));
+
+    if (NeedsLatePipeline) {
+      const bool UseStatepoint =
+          BitcodeOptLevel >= 2 && !llvm::c2go::isC2GoDisabled("statepoint-gc");
+      addC2GoLatePasses(MPM, UseStatepoint);
+    } else if (BitcodeOptLevel >= 2) {
+      // Compatibility for legacy already-RS4GC bitcode: do not inline or rerun
+      // GC lowering, but retain the old idempotent late-leaf cleanup.
+      addC2GoLateLeafPasses(MPM);
+    }
 
     // c2go #437(b/c) test hook — inject a banned IPO pass when the hidden
     // CLI flag is set so the BeforeNonSkippedPassCallback above fires.
@@ -890,6 +861,10 @@ int main(int argc, char **argv) {
       }
     }
     MPM.run(*Composite, MAM);
+
+    if (NeedsLatePipeline && PreLinkFlag)
+      Composite->setModuleFlag(Module::Error, c2go::kLTOPreLinkFlag,
+                               uint32_t(0));
 
     for (StringRef Name : BoundaryNames) {
       if (!Composite->getNamedValue(Name)) {

@@ -1586,6 +1586,13 @@ void CodeGenModule::Release() {
     getModule().addModuleFlag(llvm::Module::Error,
                               llvm::c2go::kOptLevelFlag,
                               uint32_t(CodeGenOpts.OptimizationLevel));
+    // The clang driver routes every c2go .s/manifest build through c2go-lto.
+    // Those per-TU bitcodes must remain pre-RS4GC until the whole-module
+    // inliner has finished; otherwise inlining can expose an ordinary call
+    // inside an already-lowered function and the new call has no gc-live set.
+    if (CodeGenOpts.C2GoLTOPreLink)
+      getModule().addModuleFlag(llvm::Module::Error,
+                                llvm::c2go::kLTOPreLinkFlag, uint32_t(1));
     // c2go #433: also stamp the target CPU + target-features so a downstream
     // tool (c2go-lto's Plan-9 codegen) can rebuild a TargetMachine that
     // matches the .bc producer's view — the previous WF2 path hard-wired

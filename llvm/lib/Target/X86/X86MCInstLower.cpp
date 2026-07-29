@@ -923,15 +923,10 @@ static void c2goExpandDirectAllocaFields(const MachineFunction &MF,
         FrameSize, FrameUsesFP, FrameReg == X86::RSP, SO.getFixed());
     if (!RefBitOff || *RefBitOff != BitOff)
       continue;
-    // Mirror AArch64 #327: never expand vararg-pack allocas — RS4GC keeps
-    // their address live across UNRELATED safepoints and stack-coloring
-    // merges disjoint-lifetime va slots, so at such a PC the slot holds
-    // another pack's stale content or 0x1. The pack address is still
-    // relocated as an Indirect spill where genuinely live; interior &slot
-    // pointers are stack-local in managed(0) workloads — same conservative
-    // under-marking class as #312 union-ambig words.
-    if (AI->getMetadata(llvm::c2go::kVaPackMD))
-      continue;
+    // #670 mirror: vararg argptrs[] fields point at c2go.va.slot objects in
+    // this frame and must be relocated when the callee grows the Go stack.
+    // The late fold pass entry-zeroes every pointer-bearing pack field and
+    // stack coloring preserves pointer layouts, making per-PC expansion safe.
     // #312: skip union-ambiguous pointer words.
     DenseSet<int64_t> SkipBytes;
     if (const MDNode *MD = AI->getMetadata(llvm::c2go::kUnionAmbigWordsMD))

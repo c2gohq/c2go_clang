@@ -18,7 +18,8 @@
 //      spilling every live pointer to a tracked slot) or GC-LEAF (RS4GC leaves
 //      it alone). RS4GC wraps every non-leaf call that carries a deopt bundle
 //      (RewriteStatepointsForGC.cpp NeedsRewrite / callsGCLeafFunction), so we:
-//        - add an empty `[ "deopt"() ]` bundle to every SAFEPOINT call, and
+//        - add an empty `[ "deopt"() ]` bundle plus the explicit call-site
+//          `gc-safepoint` non-leaf override to every SAFEPOINT call, and
 //        - add the `"gc-leaf-function"` call-site attribute to every GC-LEAF
 //          call.
 //      The safepoint set MATCHES the lightweight C2GoSafepointPass's active
@@ -98,6 +99,21 @@ static void markGCLeaf(CallBase *CB) {
   CB->addFnAttr(Attribute::get(CB->getContext(), "gc-leaf-function"));
 }
 
+// Override TargetLibraryInfo only for ordinary calls without an explicit leaf
+// contract. LLVM intrinsics have their own lowering contracts, while c2go's
+// gc-leaf-function runtime shims are known NOSPLIT callees and must remain
+// leaf. An earlier c2go pass materialises a real routed call when either kind
+// actually needs safepoint treatment.
+static void markExplicitSafepoint(CallBase *CB) {
+  if (CB->getIntrinsicID() != Intrinsic::not_intrinsic ||
+      CB->hasFnAttr("gc-leaf-function"))
+    return;
+  if (const Function *Callee = CB->getCalledFunction())
+    if (Callee->hasFnAttribute("gc-leaf-function"))
+      return;
+  CB->addFnAttr(Attribute::get(CB->getContext(), "gc-safepoint"));
+}
+
 // makeSafepoint ensures CB carries a deopt operand bundle, which RS4GC's
 // NeedsRewrite (AllowStatepointWithNoDeoptInfo==false → hasDeoptState()
 // required) needs to wrap a non-leaf call. If the call already has a deopt
@@ -105,8 +121,10 @@ static void markGCLeaf(CallBase *CB) {
 // empty `[ "deopt"() ]` bundle appended and replace the original. Returns the
 // (possibly new) call.
 static CallBase *makeSafepoint(CallBase *CB) {
-  if (CB->getOperandBundle(LLVMContext::OB_deopt))
+  if (CB->getOperandBundle(LLVMContext::OB_deopt)) {
+    markExplicitSafepoint(CB);
     return CB;
+  }
   // CallBrInst cannot be cloned with addOperandBundle the same way and never
   // appears in c2go output; guard defensively.
   if (isa<CallBrInst>(CB))
@@ -115,6 +133,7 @@ static CallBase *makeSafepoint(CallBase *CB) {
   CallBase *NewCB =
       CallBase::addOperandBundle(CB, LLVMContext::OB_deopt, Deopt, CB->getIterator());
   NewCB->copyMetadata(*CB);
+  markExplicitSafepoint(NewCB);
   CB->replaceAllUsesWith(NewCB);
   CB->eraseFromParent();
   return NewCB;
@@ -242,28 +261,27 @@ PreservedAnalyses C2GoFoldAllocaRelocatesPass::run(Module &M,
     if (F.isDeclaration() || !F.hasGC() || F.getGC() != kStrategy)
       continue;
     SmallVector<GCRelocateInst *, 16> ToFold;
-    // #327: every pointer-bearing alloca in a c2go-gc function (except vararg
-    // packs) is a candidate for entry null-init. RS4GC threads an address-taken
-    // alloca's BASE through phi nodes into the gc-live set of many — often ALL —
-    // statepoints in the function (e.g. SQLite resolveSelectStep's inlined
-    // `Walker w;` flows %w.i -> %.0610 -> ... -> %.8618 across the whole body).
-    // At each such statepoint LowerSTATEPOINT expands the alloca's pointer
-    // FIELDS into the per-PC locals bitmap. That mark is sound ONLY if the slot
-    // reads as either a live heap pointer or null at that PC. On a control path
-    // that reaches a marking statepoint WITHOUT first storing the field (the
-    // field is written on a different path, or only just before its own call),
-    // the slot holds uninitialized stack garbage; a small-int garbage value
-    // (1..4095) makes copystack abort ("bad pointer in frame ... 0x10"). This is
-    // exactly Go's `needzero` obligation for address-taken pointer-containing
-    // stack locals. We therefore null-init at entry regardless of whether the
-    // alloca's relocate was folded below (the Walker's relocate is threaded
-    // through plain phis, so isAllocaRooted never reaches %w.i and the fold —
-    // and the old fold-coupled null-init — both miss it).
+    // #327/#670: every pointer-bearing alloca in a c2go-gc function, including
+    // vararg packs, is a candidate for entry null-init. RS4GC threads an
+    // address-taken alloca's BASE through phi nodes into the gc-live set of
+    // many — often ALL — statepoints in the function (e.g. SQLite
+    // resolveSelectStep's inlined `Walker w;` flows %w.i -> %.0610 -> ... ->
+    // %.8618 across the whole body). At each such statepoint LowerSTATEPOINT
+    // expands the alloca's pointer FIELDS into the per-PC locals bitmap. That
+    // mark is sound ONLY if the slot reads as either a live heap pointer or
+    // null at that PC. On a control path that reaches a marking statepoint
+    // WITHOUT first storing the field (the field is written on a different
+    // path, or only just before its own call), the slot holds uninitialized
+    // stack garbage; a small-int garbage value (1..4095) makes copystack abort
+    // ("bad pointer in frame ... 0x10"). This is exactly Go's `needzero`
+    // obligation for address-taken pointer-containing stack locals. We
+    // therefore null-init at entry regardless of whether the alloca's relocate
+    // was folded below (the Walker's relocate is threaded through plain phis,
+    // so isAllocaRooted never reaches %w.i and the fold — and the old
+    // fold-coupled null-init — both miss it).
     SmallPtrSet<AllocaInst *, 8> PtrAllocas;
     for (Instruction &I : instructions(F)) {
       if (auto *AI = dyn_cast<AllocaInst>(&I)) {
-        if (AI->getMetadata(llvm::c2go::kVaPackMD))
-          continue;
         SmallVector<uint64_t, 8> Offs;
         collectPtrFieldOffsets(AI->getAllocatedType(), 0, F.getDataLayout(),
                                Offs);
@@ -276,24 +294,20 @@ PreservedAnalyses C2GoFoldAllocaRelocatesPass::run(Module &M,
         continue;
       // Fold when the relocated DERIVED pointer is rooted at an alloca. An
       // alloca address is `SP + const`: it never moves within the IR, and after
-      // a copystack the runtime relocates the alloca's stored pointer FIELDS via
-      // the locals bitmap (not this SSA value). So the relocate is the identity
-      // — replacing it with the original derived pointer lets the value
-      // rematerialize as a frame-index at each safepoint → Direct stackmap
-      // location → per-PC aggregate-field expansion in LowerSTATEPOINT.
+      // a copystack the runtime relocates the alloca's stored pointer FIELDS
+      // via the locals bitmap (not this SSA value). So the relocate is the
+      // identity — replacing it with the original derived pointer lets the
+      // value rematerialize as a frame-index at each safepoint → Direct
+      // stackmap location → per-PC aggregate-field expansion in
+      // LowerSTATEPOINT.
       //
-      // EXCEPTION: vararg-pack allocas (`!c2go.va.pack`). RS4GC keeps their
-      // address live across unrelated safepoints, but their pointer content is
-      // valid only right before their own vararg call, so they must NOT be
-      // surfaced as Direct/field-expanded (that marks uninitialized words —
-      // "bad pointer in frame ... 0x1"). Leaving the relocate in place keeps
-      // the array address as an Indirect spill (marked only where actually
-      // spilled = content-valid), and the field expansion never fires.
+      // Vararg-pack allocas are folded too. Their argptrs[] entries are stack
+      // interior pointers (`&c2go.va.slot`), so leaving the pack opaque strands
+      // those entries on the old Go stack when the callee grows the stack.
+      // The entry null-init below plus c2go's pointer-layout-aware stack
+      // coloring makes per-PC field expansion safe even when RS4GC keeps the
+      // pack address live beyond its immediate call.
       Value *Derived = RI->getDerivedPtr();
-      Value *Base = getUnderlyingObject(Derived);
-      if (auto *AI = dyn_cast<AllocaInst>(Base))
-        if (AI->getMetadata(llvm::c2go::kVaPackMD))
-          continue;
       SmallPtrSet<Value *, 16> Visited;
       if (isAllocaRooted(const_cast<Value *>(Derived), Visited))
         ToFold.push_back(RI);

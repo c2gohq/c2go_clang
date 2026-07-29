@@ -1531,6 +1531,9 @@ static AttributeList legalizeCallAttributes(CallBase *Call, bool IsMemIntrinsic,
     if (isStatepointDirectiveAttr(A))
       FnAttrs.removeAttribute(A);
   }
+  // This call-site-only override has served its purpose in
+  // callsGCLeafFunction; it is not a property of the statepoint intrinsic.
+  FnAttrs.removeAttribute("gc-safepoint");
 
   StatepointAL = StatepointAL.addFnAttributes(Ctx, FnAttrs);
 

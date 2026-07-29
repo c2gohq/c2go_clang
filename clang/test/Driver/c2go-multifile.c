@@ -9,8 +9,8 @@
 // RUN:   -fc2go-emit-plan9-asm=%t.s -fc2go-emit-manifest=%t.json -### \
 // RUN:   %s %S/Inputs/c2go-extra.c 2>&1 | FileCheck %s --check-prefix=MULTI
 //
-// MULTI: "-cc1"{{.*}}"-emit-llvm-bc"{{.*}}c2go-multifile.c
-// MULTI: "-cc1"{{.*}}"-emit-llvm-bc"{{.*}}c2go-extra.c
+// MULTI: "-cc1"{{.*}}"-emit-llvm-bc"{{.*}}"-fc2go-lto-prelink"{{.*}}c2go-multifile.c
+// MULTI: "-cc1"{{.*}}"-emit-llvm-bc"{{.*}}"-fc2go-lto-prelink"{{.*}}c2go-extra.c
 // MULTI: c2go-lto"
 // MULTI-SAME: "--c2go-emit-asm={{.*}}.s"
 // MULTI-SAME: "--c2go-emit-manifest={{.*}}.json"
@@ -20,7 +20,7 @@
 // RUN:   -fc2go-emit-plan9-asm=%t.s -fc2go-emit-manifest=%t.json -### -c \
 // RUN:   %s 2>&1 | FileCheck %s --check-prefix=SINGLE
 //
-// SINGLE: "-cc1"{{.*}}"-emit-llvm-bc"{{.*}}c2go-multifile.c
+// SINGLE: "-cc1"{{.*}}"-emit-llvm-bc"{{.*}}"-fc2go-lto-prelink"{{.*}}c2go-multifile.c
 // SINGLE: c2go-lto"
 // SINGLE-SAME: "--c2go-emit-asm={{.*}}.s"
 // SINGLE-SAME: "--c2go-emit-manifest={{.*}}.json"

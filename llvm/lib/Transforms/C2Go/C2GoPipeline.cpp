@@ -8,7 +8,9 @@
 
 #include "llvm/Transforms/C2Go/C2GoPipeline.h"
 
+#include "llvm/Transforms/C2Go/C2GoEscapeCheck.h"
 #include "llvm/Transforms/C2Go/C2GoGCSetup.h"
+#include "llvm/Transforms/C2Go/C2GoLibCallRouting.h"
 #include "llvm/Transforms/C2Go/C2GoLoopPoll.h"
 #include "llvm/Transforms/C2Go/C2GoMemcpyTyping.h"
 #include "llvm/Transforms/C2Go/C2GoSafepoint.h"
@@ -18,17 +20,14 @@
 using namespace llvm;
 
 void llvm::addC2GoLatePollPasses(ModulePassManager &MPM) {
-  // LoopPoll only. Gosched() is a real cooperative safepoint — Layer 1's
-  // RS4GC must wrap it in a gc.statepoint; replaying at Layer 3 (post-
-  // RS4GC) would emit an un-wrapped GoABI0 call. See header.
+  // Gosched() is a real cooperative safepoint. The owning layer must run this
+  // before GCSetup/RS4GC so the new call receives a complete gc-live set.
   MPM.addPass(C2GoLoopPollPass());
 }
 
 void llvm::addC2GoLateLeafPasses(ModulePassManager &MPM) {
   // Both passes are leaf-safe and idempotent. They run AFTER the GC pass
-  // pipeline at Layer 1 (so their own emitted runtime calls do not need
-  // statepoint wrapping — the called shims carry `gc-leaf-function`), and
-  // they replay verbatim at Layer 3 after the cross-TU inliner (#372).
+  // pipeline because their emitted runtime calls carry `gc-leaf-function`.
   //
   // Order rationale:
   //   1. MemcpyTyping first — locks in `!c2go.elem.type` routing so any
@@ -40,8 +39,7 @@ void llvm::addC2GoLateLeafPasses(ModulePassManager &MPM) {
   //      already split, and its slow-path call uses `_c2go_writePtr`
   //      which is declared `gc-leaf-function` (so RS4GC at Layer 1
   //      explicitly does NOT wrap the call, matching its leaf C
-  //      implementation; the Layer 3 re-emission therefore needs no
-  //      follow-up statepoint pass).
+  //      implementation; no follow-up statepoint pass is needed).
   MPM.addPass(C2GoMemcpyTypingPass());
   MPM.addPass(C2GoWriteBarriersPass());
 }
@@ -57,4 +55,15 @@ void llvm::addC2GoLateGCPasses(ModulePassManager &MPM, bool UseStatepoint) {
   } else {
     MPM.addPass(C2GoSafepointPass());
   }
+}
+
+void llvm::addC2GoLatePasses(ModulePassManager &MPM, bool UseStatepoint) {
+  // Single source of truth for clang's non-LTO path and c2go-lto's post-link,
+  // post-inliner path. Calls introduced above GCSetup are included in liveness.
+  MPM.addPass(C2GoMemcpyTypingPass());
+  MPM.addPass(C2GoLibCallRoutingPass());
+  addC2GoLatePollPasses(MPM);
+  addC2GoLateGCPasses(MPM, UseStatepoint);
+  addC2GoLateLeafPasses(MPM);
+  MPM.addPass(C2GoEscapeCheckPass());
 }

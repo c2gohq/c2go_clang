@@ -3291,6 +3291,10 @@ def fc2go : Flag<["-"], "fc2go">, Group<f_Group>,
   Visibility<[ClangOption, CC1Option]>,
   HelpText<"Enable c2go mode (managed-by-default C, GoABI0 codegen).">,
   MarshallingInfoFlag<LangOpts<"C2GoMode">>;
+def fc2go_lto_prelink : Flag<["-"], "fc2go-lto-prelink">, Group<f_Group>,
+  Visibility<[CC1Option]>,
+  HelpText<"Emit c2go pre-link IR and defer safepoint/GC lowering to c2go-lto.">,
+  MarshallingInfoFlag<CodeGenOpts<"C2GoLTOPreLink">>;
 def fc2go_package_EQ : Joined<["-"], "fc2go-package=">, Group<f_Group>,
   Visibility<[ClangOption, CC1Option]>,
   MetaVarName<"<pkgpath>">,

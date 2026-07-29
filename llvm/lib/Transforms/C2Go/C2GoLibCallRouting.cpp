@@ -93,6 +93,17 @@ static bool ensureStringAttr(Function &F, StringRef Key, StringRef Value) {
   return true;
 }
 
+static bool isRoutedDefinition(const Function &F, StringRef CName,
+                               StringRef TargetName) {
+  if (F.isDeclaration())
+    return false;
+  Attribute CNameAttr = F.getFnAttribute("c2go-c-name");
+  Attribute LinkNameAttr = F.getFnAttribute("c2go-linkname");
+  return CNameAttr.isValid() && LinkNameAttr.isValid() &&
+         CNameAttr.getValueAsString() == CName &&
+         LinkNameAttr.getValueAsString() == TargetName;
+}
+
 enum class RoutedIntrinsicKind { Direct, ModF, Frexp, SinCos };
 
 struct RoutedIntrinsic {
@@ -506,10 +517,15 @@ PreservedAnalyses C2GoLibCallRoutingPass::run(Module &M,
     if (!Raw || Raw->use_empty())
       continue;
 
-    // A differently-named definition is real program code, not a synthetic
-    // external libcall. When CName == TargetName, the route only needs to
-    // normalize that definition/declaration's CC and direct call sites.
-    if (CName != TargetName && !Raw->isDeclaration())
+    // A differently-named definition is normally real program code, not a
+    // synthetic external libcall. Whole-package linking adds one important
+    // case: the c2go definition itself can now satisfy the canonical name
+    // synthesized by an earlier per-TU optimization (for example @strlen).
+    // Its frontend attributes prove that it is the exact routed definition.
+    bool IsLinkedRoutedDefinition =
+        CName != TargetName && isRoutedDefinition(*Raw, CName, TargetName);
+    if (CName != TargetName && !Raw->isDeclaration() &&
+        !IsLinkedRoutedDefinition)
       continue;
 
     SmallVector<CallBase *, 8> Calls;
@@ -526,6 +542,23 @@ PreservedAnalyses C2GoLibCallRoutingPass::run(Module &M,
       M.getContext().emitError("cannot route synthesized c2go libcall '" +
                                CName +
                                "': raw declaration has a non-direct-call use");
+      continue;
+    }
+
+    // Normalize optimizer-synthesized calls to the linked c2go definition in
+    // place. The definition already owns the exported Plan 9 symbol, so it
+    // must not be renamed to the metadata route target.
+    if (IsLinkedRoutedDefinition) {
+      if (Raw->getCallingConv() != CallingConv::GoABI0) {
+        Raw->setCallingConv(CallingConv::GoABI0);
+        Changed = true;
+      }
+      for (CallBase *CB : Calls) {
+        if (CB->getCallingConv() != CallingConv::GoABI0) {
+          CB->setCallingConv(CallingConv::GoABI0);
+          Changed = true;
+        }
+      }
       continue;
     }
 

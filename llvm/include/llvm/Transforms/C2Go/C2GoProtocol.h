@@ -79,6 +79,14 @@ inline constexpr StringLiteral kGoabiModuleFlag = "c2go.goabi";
 /// when running its own opt+codegen passes).
 inline constexpr StringLiteral kOptLevelFlag = "c2go.opt-level";
 
+/// Module flag (uint32_t 1) carried only by the clang-driver c2go-lto route.
+/// It says that the per-TU optimizer deliberately deferred LoopPoll, GCSetup,
+/// RS4GC/FoldAllocaRelocates (or the lightweight safepoint pass), and the late
+/// leaf passes. c2go-lto consumes the flag after linking and inlining, runs
+/// that sequence exactly once on the combined module, then changes the value to
+/// 0.
+inline constexpr StringLiteral kLTOPreLinkFlag = "c2go.lto.prelink";
+
 /// Module flag carrying the requested -mcpu= value as a string.
 /// Producer: CodeGenModule. Consumer: c2go-lto.
 inline constexpr StringLiteral kTargetCpuFlag = "c2go.target-cpu";
@@ -222,13 +230,12 @@ inline constexpr StringLiteral kPtrManagedMD = "c2go.ptr.managed";
 
 /// Instruction MD on a vararg-pack alloca (the synthetic argptrs[] array and
 /// each fixed storage slot CGCall emits for `...` calls). Distinct from
-/// `c2go.ptr.managed` because the GC stackmap path treats vararg slots
-/// asymmetrically: per-PC aggregate-field expansion (RS4GC / statepoint
-/// fold) must EXCLUDE them — each slot's pointer content is only valid in
-/// the narrow window before its own vararg call, and StackColoring merges
-/// disjoint-lifetime va slots. See #327.
-/// Producer: CGCall (vararg lowering only). Consumer: C2GoGCSetup
-/// (gclocals scan filter), AArch64AsmPrinter (Plan9 .s emission filter).
+/// `c2go.ptr.managed`: the argptrs[] fan-in is managed as an aggregate while
+/// each value slot retains its real scalar/aggregate type. The late GC pass
+/// entry-zeroes pointer-bearing fields and folds their relocates so per-PC
+/// field expansion can relocate argptrs[]'s stack-interior `&slot` values.
+/// Producer: CGCall (vararg lowering only). Consumers: C2GoGCSetup,
+/// StackColoring, and the target Plan 9 statepoint emitters.
 inline constexpr StringLiteral kVaPackMD = "c2go.va.pack";
 
 /// Instruction MD on an alloca whose containing type has scheme2 union
