@@ -794,8 +794,8 @@ public:
   LLVM_ABI SDValue getBasicBlock(MachineBasicBlock *MBB);
   LLVM_ABI SDValue getExternalSymbol(const char *Sym, EVT VT);
   LLVM_ABI SDValue getExternalSymbol(RTLIB::LibcallImpl LCImpl, EVT VT);
-  /// Return the target's ordinary libcall CC, except that a backend libcall
-  /// carrying a !c2go.libcall.routes entry uses GoABI0.
+  /// Return the target's ordinary libcall CC. In c2go mode this also rejects
+  /// libcalls that should have been materialized before GC lowering.
   LLVM_ABI CallingConv::ID
   getLibcallCallingConv(RTLIB::LibcallImpl LCImpl) const;
   LLVM_ABI SDValue getTargetExternalSymbol(const char *Sym, EVT VT,

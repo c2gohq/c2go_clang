@@ -13,12 +13,14 @@
 
 namespace llvm {
 
-/// Redirect raw external libc calls synthesized by LLVM back to the direct
-/// GoABI0 c2go_linkname targets recorded in !c2go.libcall.routes.
+/// Redirect raw external libc calls and potentially-libcall math intrinsics
+/// synthesized by LLVM back to the direct GoABI0 c2go_linkname targets
+/// recorded in !c2go.libcall.routes.
 ///
 /// This pass intentionally runs after the ordinary optimization pipeline (so
 /// libc idiom recognition remains available) but before RewriteStatepointsForGC
-/// (so each newly-GoABI0 call is classified and wrapped correctly).
+/// (so each newly-GoABI0 call is classified and wrapped correctly). It also
+/// diagnoses remaining declaration-only libc calls that have no route.
 class C2GoLibCallRoutingPass : public PassInfoMixin<C2GoLibCallRoutingPass> {
 public:
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);

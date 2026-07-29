@@ -48,7 +48,6 @@
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
-#include "llvm/Transforms/C2Go/C2GoProtocol.h"
 #include "llvm/Target/TargetOptions.h"
 #include <cassert>
 #include <cstdint>
@@ -2161,24 +2160,6 @@ SelectionDAGLegalize::ExpandLibCall(RTLIB::Libcall LC, SDNode *Node,
     InChain = TCChain;
 
   CallingConv::ID LibCC = DAG.getLibcallCallingConv(LCImpl);
-
-  // c2go: a scalar FP libm libcall expanded here (e.g. an `@llvm.atan`/
-  // `@llvm.rint` intrinsic that has no hardware instruction on the target)
-  // targets a c2go-provided Go-side symbol using the Plan 9 GoABI0 convention,
-  // NOT the default C CC. Mirror the override in TargetLowering::makeLibCall —
-  // the two are the scalar FP libcall emitters and both read
-  // getLibcallImplCallingConv. Without this the callee reads args off the stack
-  // while a default-C-CC call passes them in registers (silent ABI break;
-  // observed as garbage atan2/nearbyint results). Gate on the c2go module flag
-  // and an FP-typed result/operand; non-c2go modules are untouched. This is
-  // what makes the per-libm-body no_builtin attributes unnecessary.
-  if (F.getParent()->getModuleFlag(llvm::c2go::kGoabiModuleFlag)) {
-    bool AnyFP = RetVT.isFloatingPoint();
-    for (const SDValue &Op : Node->op_values())
-      AnyFP |= Op.getValueType().isFloatingPoint();
-    if (AnyFP)
-      LibCC = CallingConv::GoABI0;
-  }
 
   TargetLowering::CallLoweringInfo CLI(DAG);
   bool signExtend = TLI.shouldSignExtendTypeInLibCall(RetTy, IsSigned);

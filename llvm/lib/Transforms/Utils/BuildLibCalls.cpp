@@ -1573,8 +1573,10 @@ bool llvm::isLibFuncEmittable(const Module *M, const TargetLibraryInfo *TLI,
   // A c2go module cannot resolve a standard C spelling merely because the
   // target platform normally provides libc. If no declaration exists, allow
   // LLVM to invent the call only when clang preserved a direct-GoABI0 route.
-  // The four raw memory primitives are the intentional exception: c2go's
-  // memcpy-typing/backend path owns them and c2go-libc provides ABI0 fallbacks.
+  // The four raw memory primitives are the intentional exception so ordinary
+  // IR idiom formation can proceed. The late C2GoMemcpyTypingPass must either
+  // inline or materialize them before GC lowering; the backend rejects any
+  // unsafe survivor.
   if (M->getModuleFlag(c2go::kGoabiModuleFlag)) {
     switch (TheLibFunc) {
     case LibFunc_bzero:

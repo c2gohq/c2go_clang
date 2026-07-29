@@ -443,10 +443,11 @@ collectC2GoModuleGCMaskVars(const llvm::Module *M) {
 // from IR alone.
 //
 // The compact named-metadata table is consumed after the normal optimisation
-// pipeline by C2GoLibCallRoutingPass, and again by SelectionDAG for libcalls
-// first materialised during instruction selection. Recording only
-// C2GO_GOABI0 routes is essential: a linkname without that selector targets a
-// Go ABIInternal symbol and must continue through the existing local wrapper.
+// pipeline by C2GoLibCallRoutingPass. SelectionDAG treats a surviving routed
+// libcall as an error because creating a Go call after RS4GC would bypass GC
+// relocation. Recording only C2GO_GOABI0 routes is essential: a linkname
+// without that selector targets a Go ABIInternal symbol and must continue
+// through the existing local wrapper.
 static void emitC2GoLibCallRoutes(ASTContext &Ctx, llvm::Module &M) {
   std::map<std::string, std::string> Routes;
   for (const Decl *D : Ctx.getTranslationUnitDecl()->decls()) {

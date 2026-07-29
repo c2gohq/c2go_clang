@@ -142,16 +142,16 @@ inline constexpr StringLiteral kSafepointCalleesMDName =
     "c2go.safepoint.callees";
 
 /// Named metadata preserving c2go_linkname routes for calls LLVM may create
-/// late in the middle-end or SelectionDAG (for example a byte-scanning loop ->
-/// `strlen`, or `llvm.sin` -> `sin`). Each operand is:
+/// late in the middle-end or during code generation (for example a
+/// byte-scanning loop -> `strlen`, or `llvm.sin` -> `sin`). Each operand is:
 ///
 ///   !{!"<C name>", !"<Go linkname>"}
 ///
-/// Producer: clang's end-of-TU AST walk. Consumers:
-/// C2GoLibCallRoutingPass (IR calls, before RS4GC) and SelectionDAG (backend
-/// libcalls that have no IR CallInst). Only c2go_linkname functions carrying
-/// C2GO_GOABI0 are recorded; ABIInternal linknames still require their existing
-/// alias-then-wrapper path and must never be redirected directly.
+/// Producer: clang's end-of-TU AST walk. C2GoLibCallRoutingPass consumes routes
+/// before RS4GC; SelectionDAG only enforces that none escaped that boundary.
+/// Only c2go_linkname functions carrying C2GO_GOABI0 are recorded;
+/// ABIInternal linknames still require their existing alias-then-wrapper path
+/// and must never be redirected directly.
 inline constexpr StringLiteral kLibCallRoutesMDName = "c2go.libcall.routes";
 
 //===----------------------------------------------------------------------===//

@@ -15,30 +15,26 @@
 //     !c2go.elem.type !N
 //     !N = !{!"struct.<TypeName>", i64 <element_count>}
 //
-//   Decision table for @llvm.memcpy / @llvm.memmove (and the
-//   c2go-libc.Memcpy/Memmove named stubs):
+//   Decision table for @llvm.memcpy / @llvm.memmove (and raw/named
+//   c2go-libc memcpy/memmove calls):
 //
 //     element_count=1 + typeinfo  → runtime.typedmemmove (write barrier)
 //     element_count>1 + typeinfo  → _c2go_typedMemmoveArray
 //     no typeinfo, small const n  → @llvm.memcpy/memmove intrinsic
 //                                   (backend inlines with ldp/stp)
-//     no typeinfo, large/unknown  → libc.Memmove Go-side call
+//     no typeinfo, large/unknown  → matching libc.Memcpy/Memmove call
 //
-// SCOPE NOTE: This pass deliberately only handles the write-barrier-
-// critical pair (memcpy/memmove). memset/bzero and other libc functions
-// are left alone — clang's TLI substitutions (memset(0)→bzero,
-// memset→memset, etc.) get a chance to run, and c2go-libc is expected
-// to provide the raw libc-name ABI0 symbols (`memset`, `bzero`, …) as
-// the link-time fallback for backend libcalls. Forcing our own
-// rewriting on those functions would short-circuit clang's optimisation
-// passes for shapes it already handles well.
+// Raw memset/bzero calls are handled here as well. Small constant operations
+// remain intrinsics for target inlining; dynamic/large operations become
+// package-qualified libc.Memset calls before GC lowering. No raw memory
+// symbol may survive into SelectionDAG because its platform C ABI does not
+// match the GoABI0 implementation in c2go-libc.
 //
 // The size-threshold path (`canStayInline`) defends against the
-// backend's libcall fallback emitting a reference to the bare libc
-// symbol `memcpy` / `memmove` when the size isn't inline-able. Anything
-// above the threshold gets routed to an explicit c2go-libc Go-side
-// call so the link surface stays self-contained even if c2go-libc
-// hasn't yet exposed a raw `memcpy`/`memmove` ABI0 entry.
+// backend's libcall fallback emitting a reference to a bare memory symbol
+// when the size isn't inline-able. Anything above the threshold gets routed
+// to an explicit c2go-libc Go-side call so the ABI and GC boundary are
+// explicit before instruction selection.
 //
 // The typed paths invoke Go runtime's typed copy primitives (the
 // linkname `_c2go_typedmemmove` resolves to runtime.typedmemmove), which
@@ -96,7 +92,7 @@ constexpr StringRef kTypedMemmoveArrayName = "_c2go_typedMemmoveArray";
 // with ldp/stp pairs.
 constexpr uint64_t kInlineByteThreshold = 64;
 
-enum class StubKind { Memcpy, Memmove };
+enum class StubKind { Memcpy, Memmove, Memset, Bzero };
 
 struct Hit {
   CallInst *Call;
@@ -104,14 +100,14 @@ struct Hit {
 };
 
 // enforceGoABI0AndOptLeaf unifies the CC=GoABI0 + optional gc-leaf-function
-// retrofit applied to all four declare helpers in this pass. Both newly
+// retrofit applied to every helper declaration in this pass. Both newly
 // created and reused (pre-existing) declarations must go through this so
 // IR fixtures / upstream passes that pre-declared a helper with the
 // default C CC don't slip through with a CC mismatch at the call site
 // (the call sites unconditionally set goabi0cc — declaration must match).
 // IsLeaf=true is for the typed-copy helpers (`_c2go_typedmemmove` /
 // `_c2go_typedMemmoveArray`) whose Go-side shims are `//go:nosplit`;
-// IsLeaf=false is for libc.Memmove / libc.Memset which are genuine
+// IsLeaf=false is for libc.Memcpy/Memmove/Memset which are genuine
 // non-leaf libc paths and MUST be statepoint-wrapped by RS4GC.
 //
 // #429 — implementation lifted to C2GoCommon so WriteBarriers,
@@ -230,7 +226,7 @@ static bool canStayInline(Value *NArg) {
 //       cast at the boundary loses no load-bearing info because no GC
 //       relocate happens across the call.
 //
-//   (b) `libc.Memmove` / `libc.Memset` are NOT `gc-leaf-function` — they
+//   (b) `libc.Memcpy/Memmove/Memset` are NOT `gc-leaf-function` — they
 //       are genuinely non-leaf (real libc copy paths) and RS4GC DOES
 //       statepoint-wrap them. The AS1→AS0 cast is still sound because
 //       the #384 c2go-gc carve-out (C2GoGC::isGCManagedPointer / the
@@ -260,7 +256,7 @@ static Value *adaptArgAS(IRBuilder<> &B, Value *V, Type *DeclaredTy) {
 //       post-inliner) entries to MemcpyTyping. This mirrors
 //       C2GoWriteBarriers' fast-path `_c2go_writePtr`.
 //
-//   (2) `libc.Memmove` / `libc.Memset` are NOT `gc-leaf-function`. They
+//   (2) `libc.Memcpy/Memmove/Memset` are NOT `gc-leaf-function`. They
 //       are real non-leaf libc copy paths and RS4GC MUST statepoint-wrap
 //       them so the caller's managed roots survive the call. AS1→AS0
 //       boundary safety is preserved by the #384 c2go-gc carve-out
@@ -275,6 +271,26 @@ static Value *adaptArgAS(IRBuilder<> &B, Value *V, Type *DeclaredTy) {
 // in `gc.statepoint` and (b) _c2go_typedmemmove is NOT wrapped — so an
 // accidental future attribute swap fails the LIT before it ships.
 //
+// getOrDeclareLibcMemcpy returns an external declaration for
+// c2go-libc.Memcpy with GoABI0 calling convention. Direct memcpy calls must
+// retain memcpy semantics here: routing them through libc.Memmove makes
+// musl's memmove -> memcpy fast path recurse back into memmove.
+//   libc.Memcpy signature: ptr(ptr, ptr, i64)
+static Function *getOrDeclareLibcMemcpy(Module &M) {
+  if (auto *F = M.getFunction(kMemcpyName)) {
+    enforceGoABI0AndOptLeaf(F, /*IsLeaf=*/false);
+    return F;
+  }
+  LLVMContext &Ctx = M.getContext();
+  Type *Ptr = PointerType::getUnqual(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+  FunctionType *FT = FunctionType::get(Ptr, {Ptr, Ptr, I64}, false);
+  Function *F =
+      Function::Create(FT, GlobalValue::ExternalLinkage, kMemcpyName, &M);
+  enforceGoABI0AndOptLeaf(F, /*IsLeaf=*/false);
+  return F;
+}
+
 // getOrDeclareLibcMemmove returns an external declaration for
 // c2go-libc.Memmove with GoABI0 calling convention — same as if it
 // had been declared in a c2go-libc header with c2go_linkname. GoABI0
@@ -332,12 +348,24 @@ static Function *getOrDeclareLibcMemset(Module &M) {
   return F;
 }
 
+static CallInst *emitLibcMemsetCall(IRBuilder<> &B, Module &M, Value *Dst,
+                                    Value *Val, Value *N) {
+  Function *F = getOrDeclareLibcMemset(M);
+  FunctionType *FT = F->getFunctionType();
+  Value *DstC = adaptArgAS(B, Dst, FT->getParamType(0));
+  Value *ValI32 = B.CreateZExtOrTrunc(Val, B.getInt32Ty());
+  Value *NCast = B.CreateZExtOrTrunc(N, B.getInt64Ty());
+  CallInst *Call = B.CreateCall(F, {DstC, ValI32, NCast});
+  Call->setCallingConv(llvm::CallingConv::GoABI0);
+  return Call;
+}
+
 // emitTypedOrLibcCopyCall emits a single GoABI0 call to the typed-copy
-// helper (when Typeinfo is non-null) or the libc.Memmove fallback (when
+// helper (when Typeinfo is non-null) or the requested libc fallback (when
 // Typeinfo is null). Three-way dispatch:
 //   Typeinfo + Count<=1  → _c2go_typedmemmove(typ, dst, src)
 //   Typeinfo + Count>1   → _c2go_typedMemmoveArray(typ, dst, src, count)
-//   Typeinfo == nullptr  → libc.Memmove(dst, src, n)
+//   Typeinfo == nullptr  → libc.Memcpy/Memmove(dst, src, n)
 // AS1↔AS0 boundary handled via adaptArgAS for each declared param type.
 // Callers retain control of the "inline intrinsic" path (canStayInline)
 // and of per-call inline/erase/return-value cleanup — this helper only
@@ -345,7 +373,8 @@ static Function *getOrDeclareLibcMemset(Module &M) {
 // and rewriteIntrinsicMemTransfer.
 static void emitTypedOrLibcCopyCall(IRBuilder<> &B, Module &M,
                                     GlobalVariable *Typeinfo, uint64_t Count,
-                                    Value *Dst, Value *Src, Value *N) {
+                                    Value *Dst, Value *Src, Value *N,
+                                    StubKind FallbackKind) {
   if (Typeinfo) {
     Function *F = (Count <= 1) ? getOrDeclareTypedMemmove(M)
                                : getOrDeclareTypedMemmoveArray(M);
@@ -358,7 +387,8 @@ static void emitTypedOrLibcCopyCall(IRBuilder<> &B, Module &M,
     B.CreateCall(F, Args)->setCallingConv(llvm::CallingConv::GoABI0);
     return;
   }
-  Function *F = getOrDeclareLibcMemmove(M);
+  Function *F = FallbackKind == StubKind::Memcpy ? getOrDeclareLibcMemcpy(M)
+                                                 : getOrDeclareLibcMemmove(M);
   FunctionType *FT = F->getFunctionType();
   Value *DstC = adaptArgAS(B, Dst, FT->getParamType(0));
   Value *SrcC = adaptArgAS(B, Src, FT->getParamType(1));
@@ -371,8 +401,8 @@ static void emitTypedOrLibcCopyCall(IRBuilder<> &B, Module &M,
 // Decision tree:
 //   1. has typeinfo → runtime.typedmemmove (single) / Array (multi)
 //   2. else, small constant size → LLVM intrinsic (backend inlines)
-//   3. else (unknown or large size) → libc.Memmove Go-side call so
-//      the link doesn't depend on a bare `memcpy` libc symbol
+//   3. else (unknown or large size) → matching package-qualified
+//      libc.Memcpy/Memmove Go-side call
 static void rewriteMemcpyMemmove(Hit H) {
   CallInst *CI = H.Call;
   IRBuilder<> B(CI);
@@ -394,13 +424,44 @@ static void rewriteMemcpyMemmove(Hit H) {
       B.CreateMemMove(Dst, MaybeAlign(), Src, MaybeAlign(), N, false);
   } else {
     // Typed (single/array) or non-inlinable byte blob → shared helper.
-    // libc.Memmove (not Memcpy) is the safe choice for the untyped
-    // fallback: when sources don't overlap, both give the same result;
-    // when they do, Memmove is required for correctness.
-    emitTypedOrLibcCopyCall(B, *M, Typeinfo, Count, Dst, Src, N);
+    // Preserve the original operation for the untyped fallback. In
+    // particular, musl memmove deliberately calls memcpy on its non-overlap
+    // fast path; redirecting that call back to memmove causes recursion.
+    emitTypedOrLibcCopyCall(B, *M, Typeinfo, Count, Dst, Src, N, H.Kind);
   }
 
   // ISO C: memcpy/memmove return dst.
+  if (!CI->getType()->isVoidTy()) {
+    Value *RV = Dst;
+    if (RV->getType() != CI->getType())
+      RV = B.CreateBitCast(RV, CI->getType());
+    CI->replaceAllUsesWith(RV);
+  }
+  CI->eraseFromParent();
+}
+
+// Rewrite direct calls that escaped builtin folding. Public c2go headers keep
+// memset/bzero plain so LLVM may form intrinsics, but -fno-builtin and libc's
+// own implementations can still leave raw calls. Those raw names cannot use
+// the platform C ABI because their c2go-libc implementations are GoABI0.
+static void rewriteMemsetBzero(Hit H) {
+  CallInst *CI = H.Call;
+  IRBuilder<> B(CI);
+  Module *M = CI->getModule();
+  Value *Dst = CI->getArgOperand(0);
+  Value *Val = H.Kind == StubKind::Bzero ? ConstantInt::get(B.getInt8Ty(), 0)
+                                         : CI->getArgOperand(1);
+  Value *N =
+      H.Kind == StubKind::Bzero ? CI->getArgOperand(1) : CI->getArgOperand(2);
+
+  if (canStayInline(N)) {
+    Value *ValI8 = B.CreateZExtOrTrunc(Val, B.getInt8Ty());
+    B.CreateMemSet(Dst, ValI8, N, MaybeAlign(), false);
+  } else {
+    emitLibcMemsetCall(B, *M, Dst, Val, N);
+  }
+
+  // ISO C memset returns dst; BSD bzero is void.
   if (!CI->getType()->isVoidTy()) {
     Value *RV = Dst;
     if (RV->getType() != CI->getType())
@@ -435,7 +496,10 @@ static bool rewriteIntrinsicMemTransfer(MemTransferInst *MI) {
     return false;
 
   IRBuilder<> B(MI);
-  emitTypedOrLibcCopyCall(B, *M, Typeinfo, Count, Dst, Src, N);
+  // Keep the historical conservative fallback for IR intrinsics. Explicit
+  // source-level memcpy calls are distinguished in rewriteMemcpyMemmove.
+  emitTypedOrLibcCopyCall(B, *M, Typeinfo, Count, Dst, Src, N,
+                          StubKind::Memmove);
   MI->eraseFromParent();
   return true;
 }
@@ -445,18 +509,14 @@ PreservedAnalyses C2GoMemcpyTypingPass::run(Module &M,
   LLVM_DEBUG(dbgs() << "c2go-memcpy-typing: scanning " << M.getName() << "\n");
 
   // Collect both:
-  //   (a) calls to c2go-libc's named Memcpy/Memmove stubs — for the
-  //       path where clang did NOT fold to builtin (e.g. via
-  //       -fno-builtin or an indirect call site).
+  //   (a) direct raw calls and calls to c2go-libc's named memory stubs — for
+  //       the path where clang did NOT fold to an intrinsic (e.g. via
+  //       -fno-builtin or while compiling libc itself).
   //   (b) @llvm.memcpy / @llvm.memmove intrinsic calls — for the common
   //       path where clang folds `memcpy(...)` directly to the
   //       intrinsic. These get the typed-dispatch treatment only when
   //       they carry `!c2go.elem.type` metadata.
   //
-  // memset/bzero/etc. are intentionally NOT collected — we let TLI's
-  // optimisations (memset(0)→bzero substitution, intrinsic folding)
-  // run unimpeded, and c2go-libc provides raw libc-name ABI0 entries
-  // as the link-time fallback.
   SmallVector<Hit, 32> Hits;
   SmallVector<MemTransferInst *, 32> Transfers;
   SmallVector<MemSetInst *, 32> Sets; // #229
@@ -487,10 +547,14 @@ PreservedAnalyses C2GoMemcpyTypingPass::run(Module &M,
       if (!Callee)
         continue;
       StringRef Name = Callee->getName();
-      if (Name == kMemcpyName)
+      if (Name == kMemcpyName || Name == "memcpy")
         Hits.push_back({CI, StubKind::Memcpy});
-      else if (Name == kMemmoveName)
+      else if (Name == kMemmoveName || Name == "memmove")
         Hits.push_back({CI, StubKind::Memmove});
+      else if (Name == kMemsetName || Name == "memset")
+        Hits.push_back({CI, StubKind::Memset});
+      else if (Name == "bzero")
+        Hits.push_back({CI, StubKind::Bzero});
     }
   }
 
@@ -498,8 +562,12 @@ PreservedAnalyses C2GoMemcpyTypingPass::run(Module &M,
   if (!Hits.empty()) {
     LLVM_DEBUG(dbgs() << "c2go-memcpy-typing: rewriting " << Hits.size()
                       << " stub calls\n");
-    for (Hit H : Hits)
-      rewriteMemcpyMemmove(H);
+    for (Hit H : Hits) {
+      if (H.Kind == StubKind::Memcpy || H.Kind == StubKind::Memmove)
+        rewriteMemcpyMemmove(H);
+      else
+        rewriteMemsetBzero(H);
+    }
     Changed = true;
   }
   for (MemTransferInst *MI : Transfers)
@@ -522,17 +590,10 @@ PreservedAnalyses C2GoMemcpyTypingPass::run(Module &M,
     Value *Dst = MS->getRawDest();
     Value *Val = MS->getValue();      // i8
     Value *N   = MS->getLength();
-    Value *ValI32 = B.CreateZExt(Val, B.getInt32Ty());
-    Value *NCast  = B.CreateZExtOrTrunc(N, B.getInt64Ty());
-    Function *F = getOrDeclareLibcMemset(M);
     // Mirror memcpy/memmove: clang may lower `*managed = 0` (or a large
     // managed-pointer-clear) to `llvm.memset.p1.i64` with AS1 Dst, but
-    // libc.Memset declaration is AS0. Cast at the boundary; same
-    // gc-leaf-function + //go:nosplit soundness as the memcpy paths.
-    FunctionType *FT = F->getFunctionType();
-    Value *DstC = adaptArgAS(B, Dst, FT->getParamType(0));
-    CallInst *Call = B.CreateCall(F, {DstC, ValI32, NCast});
-    Call->setCallingConv(llvm::CallingConv::GoABI0);
+    // libc.Memset declaration is AS0. emitLibcMemsetCall performs the cast.
+    emitLibcMemsetCall(B, M, Dst, Val, N);
     MS->eraseFromParent();
     Changed = true;
   }
@@ -547,7 +608,7 @@ PreservedAnalyses C2GoMemcpyTypingPass::run(Module &M,
   // existing CallInst CCs. In release the IR verifier accepts a CC
   // mismatch silently, and the Go-linker-generated ABI0 entry on the
   // callee would then read garbage from the stack at runtime (same
-  // failure mode as #229 / #399). Sweep every use of each of the four
+  // failure mode as #229 / #399). Sweep every use of each helper
   // helpers this pass declares; on mismatch the sweep rewrites the
   // call site CC to match the declaration AND emits a one-line
   // diagnostic so the upstream emitter that produced the wrong CC is
@@ -561,6 +622,7 @@ PreservedAnalyses C2GoMemcpyTypingPass::run(Module &M,
   // PreservedAnalyses::none() rather than misreporting "no change".
   Changed |= llvm::c2go::enforceCallSiteCC(M.getFunction(kTypedMemmoveName));
   Changed |= llvm::c2go::enforceCallSiteCC(M.getFunction(kTypedMemmoveArrayName));
+  Changed |= llvm::c2go::enforceCallSiteCC(M.getFunction(kMemcpyName));
   Changed |= llvm::c2go::enforceCallSiteCC(M.getFunction(kMemmoveName));
   Changed |= llvm::c2go::enforceCallSiteCC(M.getFunction(kMemsetName));
 

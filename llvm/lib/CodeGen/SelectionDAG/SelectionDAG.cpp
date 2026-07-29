@@ -2068,9 +2068,9 @@ SDValue SelectionDAG::getExternalSymbol(const char *Sym, EVT VT) {
 }
 
 // Recover the frontend's direct-GoABI0 c2go_linkname route for a backend
-// libcall. Unlike an IR CallInst, a libcall first created during SelectionDAG
-// lowering never passes through C2GoLibCallRoutingPass, so symbol and CC must
-// be selected together here.
+// libcall. A matching route at this point is an error: changing a SelectionDAG
+// libcall into a real Go call happens after RewriteStatepointsForGC, so live Go
+// pointers would not be spilled and relocated across a possible stack growth.
 static StringRef lookupC2GoLibCallRoute(const SelectionDAG &DAG,
                                         StringRef CName) {
   const Module *M = DAG.getMachineFunction().getFunction().getParent();
@@ -2096,18 +2096,37 @@ static StringRef lookupC2GoLibCallRoute(const SelectionDAG &DAG,
   return Found;
 }
 
+static void validateC2GoBackendLibCall(const SelectionDAG &DAG,
+                                       StringRef CName) {
+  const Module *M = DAG.getMachineFunction().getFunction().getParent();
+  if (!M || !M->getModuleFlag(c2go::kGoabiModuleFlag))
+    return;
+
+  if (!lookupC2GoLibCallRoute(DAG, CName).empty())
+    report_fatal_error("c2go routed libcall '" + CName +
+                       "' reached SelectionDAG after GC lowering; "
+                       "C2GoLibCallRoutingPass must materialize it in IR");
+
+  // Compiler-rt helpers such as __powidf2 are intentionally not LibFuncs and
+  // keep the target's ordinary C ABI. A recognized libc/libm name, however,
+  // cannot be resolved safely without an explicit direct-GoABI0 route.
+  TargetLibraryInfoImpl TLII(Triple(M->getTargetTriple()));
+  LibFunc LF;
+  if (TLII.getLibFunc(CName, LF))
+    report_fatal_error("c2go backend synthesized libc call '" + CName +
+                       "' without a direct-GoABI0 c2go_linkname route");
+}
+
 SDValue SelectionDAG::getExternalSymbol(RTLIB::LibcallImpl Libcall, EVT VT) {
   StringRef SymName = TLI->getLibcallImplName(Libcall);
-  if (StringRef Route = lookupC2GoLibCallRoute(*this, SymName); !Route.empty())
-    SymName = getMachineFunction().createExternalSymbolName(Route);
+  validateC2GoBackendLibCall(*this, SymName);
   return getExternalSymbol(SymName.data(), VT);
 }
 
 CallingConv::ID
 SelectionDAG::getLibcallCallingConv(RTLIB::LibcallImpl Libcall) const {
   StringRef SymName = TLI->getLibcallImplName(Libcall);
-  if (!lookupC2GoLibCallRoute(*this, SymName).empty())
-    return CallingConv::GoABI0;
+  validateC2GoBackendLibCall(*this, SymName);
   return TLI->getLibcallImplCallingConv(Libcall);
 }
 
@@ -2133,8 +2152,7 @@ SDValue SelectionDAG::getTargetExternalSymbol(const char *Sym, EVT VT,
 SDValue SelectionDAG::getTargetExternalSymbol(RTLIB::LibcallImpl Libcall,
                                               EVT VT, unsigned TargetFlags) {
   StringRef SymName = TLI->getLibcallImplName(Libcall);
-  if (StringRef Route = lookupC2GoLibCallRoute(*this, SymName); !Route.empty())
-    SymName = getMachineFunction().createExternalSymbolName(Route);
+  validateC2GoBackendLibCall(*this, SymName);
   return getTargetExternalSymbol(SymName.data(), VT, TargetFlags);
 }
 

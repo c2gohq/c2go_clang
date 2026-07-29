@@ -13,6 +13,8 @@ typedef __SIZE_TYPE__ size_t;
 
 extern size_t strlen(const char *)
     __attribute__((c2go_linkname("example.com/lib.strlen", 1)));
+extern double sin(double)
+    __attribute__((c2go_linkname("example.com/lib.sin", 1)));
 extern int abi_internal_only(int)
     __attribute__((c2go_linkname("example.com/lib.abiInternalOnly")));
 
@@ -23,19 +25,45 @@ size_t loop_strlen(const char *s) {
   return (size_t)(p - s);
 }
 
+double builtin_sin_with_live_pointer(char *p, double x) {
+  double y = __builtin_sin(x);
+  *p = (char)y;
+  return y + *p;
+}
+
+#pragma STDC FENV_ACCESS ON
+double constrained_sin_with_live_pointer(char *p, double x) {
+  double y = __builtin_sin(x);
+  *p = (char)y;
+  return y;
+}
+
 // The declaration is unused at AST lowering time, so no target Function is
 // required in the unoptimized module; the route table itself is the contract.
 // The ABIInternal-only declaration is deliberately absent: it must still use
 // the existing alias-then-wrapper path instead of being called directly.
-// META: !c2go.libcall.routes = !{![[ROUTE_MD:[0-9]+]]}
-// META: ![[ROUTE_MD]] = !{!"strlen", !"example.com/lib.strlen"}
+// META: !c2go.libcall.routes = !{![[SIN_MD:[0-9]+]], ![[STRLEN_MD:[0-9]+]]}
+// META: ![[SIN_MD]] = !{!"sin", !"example.com/lib.sin"}
+// META: ![[STRLEN_MD]] = !{!"strlen", !"example.com/lib.strlen"}
 
 // At -O2 the loop becomes strlen, then C2GoLibCallRouting runs before RS4GC.
 // A non-leaf GoABI0 target is therefore represented by a statepoint naming the
 // package-qualified target, never a package-local raw `strlen`.
 // ROUTE-LABEL: define {{.*}}goabi0cc i64 @loop_strlen(
 // ROUTE: @llvm.experimental.gc.statepoint{{.*}}ptr elementtype(i64 (ptr)) @"example.com/lib.strlen"
+
+// llvm.sin must become a real Go call before RS4GC. The live pointer is then
+// represented in the statepoint instead of crossing an untracked late call.
+// ROUTE-LABEL: define {{.*}}goabi0cc double @builtin_sin_with_live_pointer(
+// ROUTE: @llvm.experimental.gc.statepoint{{.*}}ptr elementtype(double (double)) @"example.com/lib.sin"
+// ROUTE-NOT: @llvm.sin
+// ROUTE-LABEL: define {{.*}}goabi0cc double @constrained_sin_with_live_pointer(
+// ROUTE: @llvm.experimental.gc.statepoint{{.*}}ptr elementtype(double (double)) @"example.com/lib.sin"
+// ROUTE-NOT: @llvm.experimental.constrained.sin
 // ROUTE: declare goabi0cc i64 @"example.com/lib.strlen"(ptr
+// ROUTE: declare goabi0cc double @"example.com/lib.sin"(double
 // ROUTE-NOT: declare {{.*}} @strlen(
-// ROUTE: !c2go.libcall.routes = !{![[ROUTE_MD:[0-9]+]]}
-// ROUTE: ![[ROUTE_MD]] = !{!"strlen", !"example.com/lib.strlen"}
+// ROUTE-NOT: @llvm.sin
+// ROUTE: !c2go.libcall.routes = !{![[SIN_MD:[0-9]+]], ![[STRLEN_MD:[0-9]+]]}
+// ROUTE: ![[SIN_MD]] = !{!"sin", !"example.com/lib.sin"}
+// ROUTE: ![[STRLEN_MD]] = !{!"strlen", !"example.com/lib.strlen"}
