@@ -411,17 +411,17 @@ using llvm::c2go::c2goCapitalizeUnderscore;
 using llvm::c2go::c2goExportGoName;
 using llvm::c2go::c2goInitMainRenamedSymbol;
 
-// c2go §B4 phase 2: collect per-global GC pointer-mask bitmaps emitted
-// by CodeGenModule::emitC2GoGlobalGCMask into a manifest array so
-// c2gobind can stitch them into a synthetic moduledata at runtime
-// init (phase 3 wiring). The IR carries each mask as an internal
+// Collect per-global GC pointer-mask bitmaps emitted by
+// CodeGenModule::emitC2GoGlobalGCMask into a manifest array. c2go-bind uses
+// them to synthesize Go-owned global storage whose native gcdata matches the C
+// layout. The IR carries each mask as an internal
 // `@c2go.global.gcmask.<varname>` global of i8 array type; we just
 // re-serialise the constant bytes here.
 //
 // `M` may be nullptr (e.g. when the manifest is built before IR gen
 // completes for some unusual entry point); in that case we silently
-// emit an empty module_gcmask section. The phase-1 IR emission stays
-// the source of truth — phase 2 only surfaces the metadata.
+// emit an empty module_gcmask section. IR emission remains the source of truth;
+// this helper only surfaces the metadata.
 //
 // #401(b) aux audit cleanup: the body lives in the shared helper
 // `llvm::c2go::collectGCMaskVarsFromModule`
@@ -1269,10 +1269,9 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
   Root["types"] = std::move(Types);
   Root["linknames"] = std::move(Linknames);
 
-  // c2go §B4 phase 2: surface the per-global GC pointer-mask bitmaps
-  // emitted by CodeGenModule::emitC2GoGlobalGCMask. c2gobind reads this
-  // section to build a Go-side data table that phase 3 will register as
-  // a synthetic moduledata entry on `runtime.activeModules()`. Always
+  // Surface the per-global GC pointer-mask bitmaps emitted by
+  // CodeGenModule::emitC2GoGlobalGCMask. c2go-bind reads this section to
+  // synthesize Go-owned globals with matching pointer layouts. Always
   // emit the section (even when empty) so consumers can distinguish
   // "no managed globals in this TU" from "older clang that doesn't
   // know about §B4".
@@ -1344,7 +1343,7 @@ void BackendConsumer::HandleTranslationUnit(ASTContext &C) {
   llvm::json::Object C2GoManifest;
   bool C2GoManifestBuilt = false;
   if (CI.getLangOpts().C2GoMode && !Diags.hasErrorOccurred()) {
-    // §B4 phase 2: pass the LLVM module so buildC2GoManifest can
+    // Pass the LLVM module so buildC2GoManifest can
     // scoop up the `@c2go.global.gcmask.<var>` bitmaps emitted by
     // CodeGenModule::emitC2GoGlobalGCMask into the manifest's
     // `module_gcmask` section.

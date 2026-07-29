@@ -1,0 +1,46 @@
+# module_gcmask is generation metadata for Go-owned global roots. c2go-bind
+# must synthesize a Go variable with the matching pointer/scalar word layout,
+# but must not emit the rejected runtime lookup table or c2go-libc registry
+# hook. The out-of-tree c2go-bind binary is discovered by lit.local.cfg.
+
+# RUN: rm -rf %t && split-file %s %t
+# RUN: %c2gobind -pkg example.com/gcroots -dry-run --sidecar %t/m.json %t/x.s > %t/emit.go
+# RUN: FileCheck %s --input-file=%t/emit.go \
+# RUN:   --implicit-check-not=_c2goGCMask \
+# RUN:   --implicit-check-not=_c2goPkgGCMaskTable \
+# RUN:   --implicit-check-not=_c2goLookupGCMask \
+# RUN:   --implicit-check-not=_c2goRegisterModuleGCMask \
+# RUN:   --implicit-check-not=_c2goDecodeMaskHex \
+# RUN:   --implicit-check-not=_c2goHexNibble \
+# RUN:   --implicit-check-not=RegisterGCMaskLookup \
+# RUN:   --implicit-check-not=gCOwned
+
+# CHECK-DAG: var gAll [3]unsafe.Pointer
+# CHECK-DAG: var gHead unsafe.Pointer
+# CHECK:     var gMixed struct {
+# CHECK-NEXT:  w0 unsafe.Pointer
+# CHECK-NEXT:  w1 uintptr
+# CHECK-NEXT:  w2 unsafe.Pointer
+# CHECK-NEXT: }
+
+#--- m.json
+{
+  "pkgpath": "example.com/gcroots",
+  "min_go_version": "go1.22",
+  "max_go_version": "go1.26",
+  "symbols": [],
+  "types": [],
+  "linknames": [],
+  "module_gcmask": {
+    "vars": [
+      {"name":"gAll","mask_hex":"07","ptr_bits":3,"go_owned":true,"size_bytes":24},
+      {"name":"gHead","mask_hex":"01","ptr_bits":1,"go_owned":true,"size_bytes":8},
+      {"name":"gMixed","mask_hex":"05","ptr_bits":2,"go_owned":true,"size_bytes":24},
+      {"name":"gCOwned","mask_hex":"01","ptr_bits":1,"size_bytes":8}
+    ]
+  }
+}
+
+#--- x.s
+TEXT ·use(SB), $0-0
+	RET

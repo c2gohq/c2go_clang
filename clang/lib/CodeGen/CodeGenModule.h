@@ -1909,14 +1909,13 @@ public:
   /// explicitly annotated `c2go_managed`). The bitmap is emitted as
   /// `@c2go.global.gcmask.<varname>` — an `internal constant [N x i8]`
   /// with one bit per pointer-sized word (LSB-first inside each byte),
-  /// matching the encoding used by Go runtime's `moduledata.gcdatamask` /
-  /// `gcbssmask`. This metadata is consumed by the future phase-2 runtime
-  /// integration that exposes c2go module data through `activeModules()`
-  /// so `bulkBarrierPreWrite` can scan static `.data` / `.bss` globals.
+  /// matching Go's GC bitmap encoding. The manifest carries this metadata to
+  /// c2go-bind, which synthesizes Go-owned storage with the same pointer/scalar
+  /// layout. The Go compiler then emits native gcdata so runtime.markroot scans
+  /// those global pointer slots directly.
   ///
   /// Scalar globals (int, char[], structs of scalars, etc.) get no
-  /// gcmask — the absence is the signal to runtime that the global has
-  /// no managed pointers and need not be scanned.
+  /// gcmask because they need no Go-owned pointer layout.
   ///
   /// Idempotent and side-effect free outside the new gcmask global;
   /// safe to call after the variable's own `llvm::GlobalVariable` has

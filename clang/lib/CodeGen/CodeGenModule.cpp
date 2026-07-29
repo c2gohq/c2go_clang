@@ -8245,8 +8245,7 @@ void CodeGenModule::EmitGlobalVarDefinition(const VarDecl *D,
 
   // c2go §B4: emit `@c2go.global.gcmask.<varname>` for file-scope globals
   // whose type transitively contains a c2go-managed pointer. Scalar globals
-  // (no managed payload) are skipped — phase-2 runtime integration treats
-  // missing gcmask as "no scan needed".
+  // are skipped because c2go-bind needs no Go-owned pointer layout for them.
   if (getLangOpts().C2GoMode) {
     emitC2GoGlobalGCMask(D, GV);
     // c2go WF2 (#319 C3): stamp manifest-grade metadata onto every

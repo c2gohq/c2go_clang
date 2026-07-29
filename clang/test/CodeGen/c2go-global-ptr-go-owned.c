@@ -15,15 +15,13 @@
 // RUN: %clang_cc1 -triple aarch64-unknown-none-goabi -fc2go -std=c2go23 \
 // RUN:   -fc2go-emit-manifest=%t.json -emit-llvm -o %t.ll %s
 //
-// LLVM IR side: check the c2go.go_owned_globals named-metadata is
-// emitted with exactly the single-ptr-word vars (the aggregate is
-// NOT in the list).
+// LLVM IR side: check c2go.go_owned_globals covers every zero-initialized
+// pointer-carrying global, including aggregates.
 //
 // RUN: FileCheck %s --check-prefix=IR --input-file=%t.ll
 //
-// Manifest side: check the module_gcmask section carries the
-// go_owned bit on the single-ptr-word vars and omits it on the
-// aggregate.
+// Manifest side: check module_gcmask carries go_owned and the complete layout
+// metadata for both single-word and aggregate globals.
 //
 // RUN: FileCheck %s --check-prefix=JSON --input-file=%t.json
 

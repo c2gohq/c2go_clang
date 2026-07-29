@@ -516,13 +516,13 @@ void CodeGenModule::attachC2GoElemTypeMetadata(llvm::CallInst *Call,
 // c2go §B4: per-global GC pointer-mask bitmap for file-scope globals
 //===----------------------------------------------------------------------===//
 //
-// Go runtime's `bulkBarrierPreWrite` consults `moduledata.gcdatamask` /
-// `gcbssmask` to decide which words inside a static `.data` / `.bss`
-// global hold managed pointers. c2go-emitted globals are not yet wired
-// into `activeModules()` (that's phase 2), so we lay down the per-global
-// bitmap now under the predictable name `@c2go.global.gcmask.<varname>`.
-// Phase 2 will collect these symbols and stitch them into a synthetic
-// moduledata at link time.
+// Go's GC discovers global roots from compiler-generated moduledata. For a
+// zero-initialized C global containing managed pointers, c2go instead cedes the
+// storage definition to a Go variable with the same pointer/scalar word layout.
+// We emit the per-global bitmap under the predictable name
+// `@c2go.global.gcmask.<varname>` so the manifest can carry that layout to
+// c2go-bind. The bitmap is generation metadata and is never registered with the
+// runtime itself.
 //
 // Bitmap encoding mirrors `runtime.bitvector`: one bit per pointer-sized
 // word, LSB-first inside each byte. We reuse the §A2 PtrBitmap walker
@@ -534,9 +534,8 @@ void CodeGenModule::attachC2GoElemTypeMetadata(llvm::CallInst *Call,
 //     same field-world hierarchy used for struct typeinfo.
 //
 // Scalars (int, char[], non-c2go struct of scalars, ...) produce an
-// empty bitmap — in which case we emit nothing. The absence of a
-// gcmask symbol is the runtime-side signal "this global has no GC
-// pointers".
+// empty bitmap — in which case we emit nothing because no Go-owned pointer
+// layout is needed.
 
 namespace {
 
@@ -694,13 +693,12 @@ void CodeGenModule::emitC2GoGlobalGCMask(const VarDecl *D,
     return;
   if (!D || !GV)
     return;
-  // Only file-scope (non-local) variables get a gcmask. Function-local
-  // statics live in the function frame; the runtime path that consults
-  // gcdatamask is reserved for `.data` / `.bss`.
+  // Only file-scope variables get a gcmask. Function-local statics also have
+  // static storage, but their local naming/ownership bridge is not supported.
   if (!D->hasGlobalStorage() || D->isLocalVarDecl())
     return;
-  // External declarations and TLS variables are out of scope for now —
-  // a phase-2 cross-module manifest can pick them up if needed.
+  // External declarations do not define storage here; TLS ownership is not
+  // supported by the Go-owned global bridge.
   if (D->hasExternalStorage())
     return;
   if (D->getTLSKind() != VarDecl::TLS_None)
@@ -723,10 +721,9 @@ void CodeGenModule::emitC2GoGlobalGCMask(const VarDecl *D,
   llvm::Module &M = getModule();
   llvm::LLVMContext &Ctx = M.getContext();
 
-  // Use the linker-visible name of the variable so phase-2 runtime
-  // integration can match `c2go.global.gcmask.<sym>` to the global by
-  // simple name lookup. GV->getName() reflects mangling / static-name
-  // mapping already applied by EmitGlobalVarDefinition.
+  // Use the linker-visible name so the manifest and c2go-bind can match
+  // `c2go.global.gcmask.<sym>` to the storage symbol. GV->getName() reflects
+  // mangling / static-name mapping already applied by EmitGlobalVarDefinition.
   llvm::StringRef VarName = GV->getName();
   if (VarName.empty())
     return;
@@ -773,23 +770,8 @@ void CodeGenModule::emitC2GoGlobalGCMask(const VarDecl *D,
   // post-link consumer references the symbol.
   addCompilerUsedGlobal(MaskGV);
 
-  // c2go #387 §B4 phase 6 sub-step 1: single-pointer-word file-scope
-  // globals are best handled by ceding storage ownership to the Go
-  // compiler. A bodyless `var X unsafe.Pointer` in the generated Go
-  // package automatically lands in moduledata.gcdata with the correct
-  // pointer bit so `runtime.markroot` scans it as a root — no
-  // out-of-runtime registry, no firstmoduledata patching. The C-side
-  // load/store sites still reference `·X(SB)` and the Go linker
-  // resolves them to the Go-owned storage.
-  //
-  // Eligibility (intentionally narrow):
-  //   * static layout is exactly one pointer word (PtrSize bytes), AND
-  //   * the gcmask is a single byte whose only set bit is bit 0 (the
-  //     pointer lives at offset 0), AND
-  //   * the IR initializer is absent or a null Constant (#394).
-  //
-  // c2go #394: only zero-initialized C globals can cede storage to the
-  // Go side. For `static T *p = &gOther;` AsmPrinter's fallback DATA
+  // Only zero-initialized C globals can cede storage to the Go side (#394).
+  // For `static T *p = &gOther;` AsmPrinter's fallback DATA
   // path (AsmPrinter.cpp:924-936) would emit
   // `DATA ·p+0(SB)/8, $·gOther(SB)` + `GLOBL ·p(SB), NOPTR, $8`
   // alongside the c2gobind-generated `var p unsafe.Pointer`, producing
@@ -797,9 +779,6 @@ void CodeGenModule::emitC2GoGlobalGCMask(const VarDecl *D,
   // `(T *)0`, and folded equivalents all canonicalize to a null
   // Constant before reaching this point — IR predicate is exact.
   // (Direction A per .build_status/issue394_design.md §4.)
-  //
-  // Aggregate / multi-pointer globals stay on the existing out-of-
-  // runtime gcmask registry path; this is a follow-up scope (#388).
   //
   // c2go #423: widen the IR-null predicate beyond Constant::isNullValue()
   // so two cases observed in real-world c2go output also cede storage:
