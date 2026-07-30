@@ -104,8 +104,14 @@ std::string mapC2GoType(QualType QT, const ASTContext &Ctx, bool IsUnmanaged) {
     case BuiltinType::Int: return "int32";
     case BuiltinType::UInt: return "uint32";
     case BuiltinType::Long:
+      // C `long` follows the target data model: it is 64 bits on LP64
+      // targets and 32 bits on Windows LLP64.  The Go declaration must use
+      // the same width as the ABI0 frame emitted from the C type; spelling it
+      // as int64 unconditionally shifts every following slot on Windows.
+      return Ctx.getTypeSize(QT) == 32 ? "int32" : "int64";
     case BuiltinType::LongLong: return "int64";
     case BuiltinType::ULong:
+      return Ctx.getTypeSize(QT) == 32 ? "uint32" : "uint64";
     case BuiltinType::ULongLong: return "uint64";
     case BuiltinType::Float: return "float32";
     case BuiltinType::Double:
