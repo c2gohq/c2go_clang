@@ -1163,9 +1163,11 @@ void Clang::AddPreprocessingOptions(Compilation &C, const JobAction &JA,
   }
 
   // A packaged C2Go SDK installs its annotated libc headers in
-  // <install>/include next to <install>/bin/clang.  Keep this lookup tied to
-  // -fc2go: the same binary remains an ordinary Clang driver when C2Go mode is
-  // not requested, and must not shadow the host C library in that mode.
+  // <install>/include next to <install>/bin/c2go-clang.  Its c2go.h remains a
+  // compiler-owned resource header in <resource-dir>/include.  Keep the libc
+  // lookup tied to -fc2go: the same binary remains an ordinary Clang driver
+  // when C2Go mode is not requested, and must not shadow the host C library in
+  // that mode.
   //
   // Add the resource headers first.  Most host toolchains add them again
   // below (HeaderSearch de-duplicates the path), but the Windows goabi
@@ -1182,8 +1184,8 @@ void Clang::AddPreprocessingOptions(Compilation &C, const JobAction &JA,
     if (!Args.hasArg(options::OPT_nostdlibinc)) {
       SmallString<128> C2GoInclude(D.Dir);
       llvm::sys::path::append(C2GoInclude, "..", "include");
-      SmallString<128> CoreHeader(C2GoInclude);
-      llvm::sys::path::append(CoreHeader, "c2go.h");
+      SmallString<128> CoreHeader(D.ResourceDir);
+      llvm::sys::path::append(CoreHeader, "include", "c2go.h");
       SmallString<128> TypesHeader(C2GoInclude);
       llvm::sys::path::append(TypesHeader, "bits", "alltypes.h");
       if (D.getVFS().exists(CoreHeader) && D.getVFS().exists(TypesHeader)) {
