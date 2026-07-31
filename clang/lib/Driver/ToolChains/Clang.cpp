@@ -1162,6 +1162,38 @@ void Clang::AddPreprocessingOptions(Compilation &C, const JobAction &JA,
     CmdArgs.push_back(Args.MakeArgString(P));
   }
 
+  // A packaged C2Go SDK installs its annotated libc headers in
+  // <install>/include next to <install>/bin/clang.  Keep this lookup tied to
+  // -fc2go: the same binary remains an ordinary Clang driver when C2Go mode is
+  // not requested, and must not shadow the host C library in that mode.
+  //
+  // Add the resource headers first.  Most host toolchains add them again
+  // below (HeaderSearch de-duplicates the path), but the Windows goabi
+  // toolchain otherwise has no implicit resource include.  The order mirrors
+  // the C2Go runtime generator: Clang builtins, C2Go libc, then host headers.
+  if (Args.hasArg(options::OPT_fc2go) && !Args.hasArg(options::OPT_nostdinc)) {
+    if (!Args.hasArg(options::OPT_nobuiltininc)) {
+      SmallString<128> ResourceInclude(D.ResourceDir);
+      llvm::sys::path::append(ResourceInclude, "include");
+      CmdArgs.push_back("-internal-isystem");
+      CmdArgs.push_back(Args.MakeArgString(ResourceInclude));
+    }
+
+    if (!Args.hasArg(options::OPT_nostdlibinc)) {
+      SmallString<128> C2GoInclude(D.Dir);
+      llvm::sys::path::append(C2GoInclude, "..", "include");
+      SmallString<128> CoreHeader(C2GoInclude);
+      llvm::sys::path::append(CoreHeader, "c2go.h");
+      SmallString<128> TypesHeader(C2GoInclude);
+      llvm::sys::path::append(TypesHeader, "bits", "alltypes.h");
+      if (D.getVFS().exists(CoreHeader) && D.getVFS().exists(TypesHeader)) {
+        llvm::sys::path::remove_dots(C2GoInclude, /*remove_dot_dot=*/true);
+        CmdArgs.push_back("-internal-isystem");
+        CmdArgs.push_back(Args.MakeArgString(C2GoInclude));
+      }
+    }
+  }
+
   // Add system include arguments for all targets but IAMCU.
   if (!IsIAMCU)
     forAllAssociatedToolChains(C, JA, getToolChain(),
