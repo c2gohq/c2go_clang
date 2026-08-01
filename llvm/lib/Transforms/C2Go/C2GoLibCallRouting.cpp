@@ -40,6 +40,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/C2GoSymbol.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/C2Go/C2GoProtocol.h"
 
@@ -51,12 +52,22 @@ using namespace llvm;
 
 namespace {
 
-using RouteMap = std::map<std::string, std::string>;
+struct LinknameRoute {
+  std::string Linkname; // Raw Go linker target retained in IR attributes.
+  std::string Symbol;   // LLVM symbol: local suffix for this package, else raw.
+};
+
+using RouteMap = std::map<std::string, LinknameRoute>;
 
 static bool readRoutes(Module &M, RouteMap &Routes) {
   const NamedMDNode *NMD = M.getNamedMetadata(c2go::kLibCallRoutesMDName);
   if (!NMD)
     return true;
+
+  StringRef PackagePath;
+  if (auto *S = dyn_cast_or_null<MDString>(
+          M.getModuleFlag(c2go::kPackagePathModuleFlag)))
+    PackagePath = S->getString();
 
   for (const MDNode *Entry : NMD->operands()) {
     if (!Entry || Entry->getNumOperands() != 2) {
@@ -73,9 +84,15 @@ static bool readRoutes(Module &M, RouteMap &Routes) {
       return false;
     }
 
+    StringRef Linkname = Target->getString();
+    std::optional<StringRef> Local =
+        c2go::getC2GoSamePackageSymbol(Linkname, PackagePath);
+    LinknameRoute Route{Linkname.str(), (Local ? *Local : Linkname).str()};
     auto [It, Inserted] =
-        Routes.emplace(CName->getString().str(), Target->getString().str());
-    if (!Inserted && It->second != Target->getString()) {
+        Routes.emplace(CName->getString().str(), std::move(Route));
+    if (!Inserted &&
+        (StringRef(It->second.Linkname) != Linkname ||
+         StringRef(It->second.Symbol) != (Local ? *Local : Linkname))) {
       M.getContext().emitError(
           "conflicting !c2go.libcall.routes entries for C function '" +
           CName->getString() + "'");
@@ -94,14 +111,38 @@ static bool ensureStringAttr(Function &F, StringRef Key, StringRef Value) {
 }
 
 static bool isRoutedDefinition(const Function &F, StringRef CName,
-                               StringRef TargetName) {
+                               const LinknameRoute &Route) {
   if (F.isDeclaration())
     return false;
   Attribute CNameAttr = F.getFnAttribute("c2go-c-name");
   Attribute LinkNameAttr = F.getFnAttribute("c2go-linkname");
-  return CNameAttr.isValid() && LinkNameAttr.isValid() &&
-         CNameAttr.getValueAsString() == CName &&
-         LinkNameAttr.getValueAsString() == TargetName;
+  if (!CNameAttr.isValid() || CNameAttr.getValueAsString() != CName)
+    return false;
+  if (LinkNameAttr.isValid())
+    return LinkNameAttr.getValueAsString() == Route.Linkname;
+
+  // A definition exported in one TU can be called through a linkname-bearing
+  // declaration in another TU.  The definition then has the boundary/c-name
+  // protocol but no linkname attr of its own.  Accept it only when its physical
+  // symbol is exactly the resolved route target; an unrelated libc-like
+  // definition remains protected.
+  return F.hasFnAttribute("c2go-boundary") &&
+         GlobalValue::dropLLVMManglingEscape(F.getName()) == Route.Symbol;
+}
+
+static bool isResolvedRouteTarget(const Function &F, const RouteMap &Routes) {
+  if (!F.isDeclaration() || !F.hasFnAttribute("c2go-linkname-abi0"))
+    return false;
+
+  Attribute CNameAttr = F.getFnAttribute("c2go-c-name");
+  Attribute LinkNameAttr = F.getFnAttribute("c2go-linkname");
+  if (!CNameAttr.isValid() || !LinkNameAttr.isValid())
+    return false;
+
+  auto It = Routes.find(CNameAttr.getValueAsString().str());
+  StringRef SymbolName = GlobalValue::dropLLVMManglingEscape(F.getName());
+  return It != Routes.end() && It->second.Symbol == SymbolName &&
+         It->second.Linkname == LinkNameAttr.getValueAsString();
 }
 
 enum class RoutedIntrinsicKind { Direct, ModF, Frexp, SinCos };
@@ -275,8 +316,9 @@ classifyRoutedIntrinsic(const IntrinsicInst &II) {
 }
 
 static Function *getOrCreateRouteTarget(Module &M, StringRef CName,
-                                        StringRef TargetName, FunctionType *FT,
-                                        bool &Changed) {
+                                        const LinknameRoute &Route,
+                                        FunctionType *FT, bool &Changed) {
+  StringRef TargetName = Route.Symbol;
   Function *Target = M.getFunction(TargetName);
   if (!Target) {
     if (M.getNamedValue(TargetName)) {
@@ -288,6 +330,12 @@ static Function *getOrCreateRouteTarget(Module &M, StringRef CName,
     }
     Target = Function::Create(FT, GlobalValue::ExternalLinkage, TargetName, &M);
     Changed = true;
+  } else if (!Target->isDeclaration() &&
+             !isRoutedDefinition(*Target, CName, Route)) {
+    M.getContext().emitError(
+        "cannot route synthesized c2go libcall '" + CName + "' to '" +
+        TargetName + "': target definition does not match the route");
+    return nullptr;
   } else if (Target->getFunctionType() != FT) {
     M.getContext().emitError("cannot route synthesized c2go libcall '" + CName +
                              "' to '" + TargetName +
@@ -299,7 +347,11 @@ static Function *getOrCreateRouteTarget(Module &M, StringRef CName,
     Target->setCallingConv(CallingConv::GoABI0);
     Changed = true;
   }
-  Changed |= ensureStringAttr(*Target, "c2go-linkname", TargetName);
+  Changed |= ensureStringAttr(*Target, "c2go-linkname", Route.Linkname);
+  if (!Target->hasFnAttribute("c2go-linkname-abi0")) {
+    Target->addFnAttr("c2go-linkname-abi0");
+    Changed = true;
+  }
   if (!Target->hasFnAttribute("c2go-c-name"))
     Changed |= ensureStringAttr(*Target, "c2go-c-name", CName);
   return Target;
@@ -312,6 +364,7 @@ static AllocaInst *createEntryAlloca(Function &F, Type *Ty, StringRef Name) {
 
 static void copyCallProperties(CallInst &To, const CallInst &From) {
   To.setCallingConv(CallingConv::GoABI0);
+  To.addFnAttr(Attribute::NoBuiltin);
   To.setDebugLoc(From.getDebugLoc());
   if (isa<FPMathOperator>(&To) && isa<FPMathOperator>(&From))
     To.copyFastMathFlags(&From);
@@ -320,7 +373,7 @@ static void copyCallProperties(CallInst &To, const CallInst &From) {
 }
 
 static bool lowerRoutedIntrinsic(CallInst &CI, const RoutedIntrinsic &Desc,
-                                 StringRef TargetName, bool &Changed) {
+                                 const LinknameRoute &Route, bool &Changed) {
   Module &M = *CI.getModule();
   Type *FPTy = CI.getArgOperand(0)->getType();
   if (FPTy->isVectorTy()) {
@@ -358,7 +411,7 @@ static bool lowerRoutedIntrinsic(CallInst &CI, const RoutedIntrinsic &Desc,
     }
     FT = FunctionType::get(CI.getType(), ParamTys, false);
     Function *Target =
-        getOrCreateRouteTarget(M, Desc.CName, TargetName, FT, Changed);
+        getOrCreateRouteTarget(M, Desc.CName, Route, FT, Changed);
     if (!Target)
       return false;
     CallInst *Call = B.CreateCall(Target, Args, Bundles, CI.getName());
@@ -371,7 +424,7 @@ static bool lowerRoutedIntrinsic(CallInst &CI, const RoutedIntrinsic &Desc,
         createEntryAlloca(*CI.getFunction(), FPTy, "c2go.modf.integral");
     FT = FunctionType::get(FPTy, {FPTy, Integral->getType()}, false);
     Function *Target =
-        getOrCreateRouteTarget(M, Desc.CName, TargetName, FT, Changed);
+        getOrCreateRouteTarget(M, Desc.CName, Route, FT, Changed);
     if (!Target)
       return false;
     CallInst *Fraction = B.CreateCall(Target, {CI.getArgOperand(0), Integral},
@@ -398,7 +451,7 @@ static bool lowerRoutedIntrinsic(CallInst &CI, const RoutedIntrinsic &Desc,
         createEntryAlloca(*CI.getFunction(), ExponentTy, "c2go.frexp.exp");
     FT = FunctionType::get(FPTy, {FPTy, Exponent->getType()}, false);
     Function *Target =
-        getOrCreateRouteTarget(M, Desc.CName, TargetName, FT, Changed);
+        getOrCreateRouteTarget(M, Desc.CName, Route, FT, Changed);
     if (!Target)
       return false;
     CallInst *Fraction = B.CreateCall(Target, {CI.getArgOperand(0), Exponent},
@@ -420,7 +473,7 @@ static bool lowerRoutedIntrinsic(CallInst &CI, const RoutedIntrinsic &Desc,
     FT = FunctionType::get(Type::getVoidTy(M.getContext()),
                            {FPTy, Sin->getType(), Cos->getType()}, false);
     Function *Target =
-        getOrCreateRouteTarget(M, Desc.CName, TargetName, FT, Changed);
+        getOrCreateRouteTarget(M, Desc.CName, Route, FT, Changed);
     if (!Target)
       return false;
     CallInst *Call =
@@ -442,7 +495,7 @@ static bool lowerRoutedIntrinsic(CallInst &CI, const RoutedIntrinsic &Desc,
 }
 
 static bool lowerRoutedFRem(BinaryOperator &FRem, StringRef CName,
-                            StringRef TargetName, bool &Changed) {
+                            const LinknameRoute &Route, bool &Changed) {
   Module &M = *FRem.getModule();
   Type *FPTy = FRem.getType();
   if (FPTy->isVectorTy()) {
@@ -451,13 +504,14 @@ static bool lowerRoutedFRem(BinaryOperator &FRem, StringRef CName,
     return false;
   }
   FunctionType *FT = FunctionType::get(FPTy, {FPTy, FPTy}, false);
-  Function *Target = getOrCreateRouteTarget(M, CName, TargetName, FT, Changed);
+  Function *Target = getOrCreateRouteTarget(M, CName, Route, FT, Changed);
   if (!Target)
     return false;
   IRBuilder<> B(&FRem);
   CallInst *Call = B.CreateCall(
       Target, {FRem.getOperand(0), FRem.getOperand(1)}, FRem.getName());
   Call->setCallingConv(CallingConv::GoABI0);
+  Call->addFnAttr(Attribute::NoBuiltin);
   Call->setDebugLoc(FRem.getDebugLoc());
   Call->copyFastMathFlags(&FRem);
   FRem.replaceAllUsesWith(Call);
@@ -512,108 +566,135 @@ PreservedAnalyses C2GoLibCallRoutingPass::run(Module &M,
       lowerRoutedFRem(*FRem, *CName, Route->second, Changed);
   }
 
-  for (const auto &[CName, TargetName] : Routes) {
-    Function *Raw = M.getFunction(CName);
-    if (!Raw || Raw->use_empty())
-      continue;
+  for (const auto &[CName, Route] : Routes) {
+    StringRef TargetName = Route.Symbol;
+    SmallVector<Function *, 2> RawFunctions;
+    for (Function &Candidate : M)
+      if (!Candidate.use_empty() &&
+          GlobalValue::dropLLVMManglingEscape(Candidate.getName()) == CName)
+        RawFunctions.push_back(&Candidate);
 
-    // A differently-named definition is normally real program code, not a
-    // synthetic external libcall. Whole-package linking adds one important
-    // case: the c2go definition itself can now satisfy the canonical name
-    // synthesized by an earlier per-TU optimization (for example @strlen).
-    // Its frontend attributes prove that it is the exact routed definition.
-    bool IsLinkedRoutedDefinition =
-        CName != TargetName && isRoutedDefinition(*Raw, CName, TargetName);
-    if (CName != TargetName && !Raw->isDeclaration() &&
-        !IsLinkedRoutedDefinition)
-      continue;
+    for (Function *Raw : RawFunctions) {
+      // A differently-named definition is normally real program code, not a
+      // synthetic external libcall. Whole-package linking adds one important
+      // case: the c2go definition itself can now satisfy the canonical name
+      // synthesized by an earlier per-TU optimization (for example @strlen).
+      // Its frontend attributes prove that it is the exact routed definition.
+      bool IsLinkedRoutedDefinition = isRoutedDefinition(*Raw, CName, Route);
+      if (!Raw->isDeclaration() && !IsLinkedRoutedDefinition)
+        continue;
 
-    SmallVector<CallBase *, 8> Calls;
-    bool HasNonCallUse = false;
-    for (User *U : Raw->users()) {
-      auto *CB = dyn_cast<CallBase>(U);
-      if (!CB || CB->getCalledFunction() != Raw) {
-        HasNonCallUse = true;
-        break;
+      SmallVector<CallBase *, 8> Calls;
+      bool HasNonCallUse = false;
+      for (User *U : Raw->users()) {
+        auto *CB = dyn_cast<CallBase>(U);
+        if (!CB || CB->getCalledFunction() != Raw) {
+          HasNonCallUse = true;
+          break;
+        }
+        Calls.push_back(CB);
       }
-      Calls.push_back(CB);
-    }
-    if (HasNonCallUse) {
-      M.getContext().emitError("cannot route synthesized c2go libcall '" +
-                               CName +
-                               "': raw declaration has a non-direct-call use");
-      continue;
-    }
+      if (HasNonCallUse) {
+        M.getContext().emitError(
+            "cannot route synthesized c2go libcall '" + CName +
+            "': raw declaration has a non-direct-call use");
+        continue;
+      }
 
-    // Normalize optimizer-synthesized calls to the linked c2go definition in
-    // place. The definition already owns the exported Plan 9 symbol, so it
-    // must not be renamed to the metadata route target.
-    if (IsLinkedRoutedDefinition) {
-      if (Raw->getCallingConv() != CallingConv::GoABI0) {
-        Raw->setCallingConv(CallingConv::GoABI0);
+      // Normalize optimizer-synthesized calls to the linked c2go definition in
+      // place. The definition already owns the exported Plan 9 symbol, so it
+      // must not be renamed to the metadata route target.
+      if (IsLinkedRoutedDefinition) {
+        if (Raw->getCallingConv() != CallingConv::GoABI0) {
+          Raw->setCallingConv(CallingConv::GoABI0);
+          Changed = true;
+        }
+        for (CallBase *CB : Calls) {
+          if (CB->getCallingConv() != CallingConv::GoABI0) {
+            CB->setCallingConv(CallingConv::GoABI0);
+            Changed = true;
+          }
+          if (!CB->isNoBuiltin()) {
+            CB->addFnAttr(Attribute::NoBuiltin);
+            Changed = true;
+          }
+        }
+        if (!Raw->hasFnAttribute("c2go-linkname-abi0")) {
+          Raw->addFnAttr("c2go-linkname-abi0");
+          Changed = true;
+        }
+        continue;
+      }
+
+      Function *Target = M.getFunction(TargetName);
+      if (!Target) {
+        if (GlobalValue *Collision = M.getNamedValue(TargetName)) {
+          (void)Collision;
+          M.getContext().emitError(
+              "cannot route synthesized c2go libcall '" + CName + "' to '" +
+              TargetName + "': target name belongs to a non-function global");
+          continue;
+        }
+        Raw->setName(TargetName);
+        Target = Raw;
+        Changed = true;
+      } else if (Target != Raw) {
+        if (!Target->isDeclaration() &&
+            !isRoutedDefinition(*Target, CName, Route)) {
+          M.getContext().emitError(
+              "cannot route synthesized c2go libcall '" + CName + "' to '" +
+              TargetName + "': target definition does not match the route");
+          continue;
+        }
+        if (Target->getFunctionType() != Raw->getFunctionType()) {
+          M.getContext().emitError("cannot route synthesized c2go libcall '" +
+                                   CName + "' to '" + TargetName +
+                                   "': function types differ");
+          continue;
+        }
+
+        // Preserve attributes inferred for the canonical libc declaration. At
+        // this late point they mostly document semantics for codegen, but
+        // losing nounwind/memory effects would also make the merged declaration
+        // less faithful when emitted as bitcode for WF2.
+        AttrBuilder RawFnAttrs(M.getContext(),
+                               Raw->getAttributes().getFnAttrs());
+        Target->addFnAttrs(RawFnAttrs);
+      }
+
+      if (Target->getCallingConv() != CallingConv::GoABI0) {
+        Target->setCallingConv(CallingConv::GoABI0);
         Changed = true;
       }
+      Changed |= ensureStringAttr(*Target, "c2go-linkname", Route.Linkname);
+      if (!Target->hasFnAttribute("c2go-linkname-abi0")) {
+        Target->addFnAttr("c2go-linkname-abi0");
+        Changed = true;
+      }
+      if (!Target->hasFnAttribute("c2go-c-name"))
+        Changed |= ensureStringAttr(*Target, "c2go-c-name", CName);
+
+      // This mismatch is expected at this normalization boundary, so update it
+      // directly rather than using enforceCallSiteCC: that audit helper records
+      // unexpected producer bugs in c2go.cc.violations and would make every
+      // legitimate optimizer-synthesized libcall fail the WF2 ship gate.
       for (CallBase *CB : Calls) {
+        if (Target != Raw)
+          CB->setCalledFunction(Target);
         if (CB->getCallingConv() != CallingConv::GoABI0) {
           CB->setCallingConv(CallingConv::GoABI0);
           Changed = true;
         }
-      }
-      continue;
-    }
-
-    Function *Target = M.getFunction(TargetName);
-    if (!Target) {
-      if (GlobalValue *Collision = M.getNamedValue(TargetName)) {
-        (void)Collision;
-        M.getContext().emitError(
-            "cannot route synthesized c2go libcall '" + CName + "' to '" +
-            TargetName + "': target name belongs to a non-function global");
-        continue;
-      }
-      Raw->setName(TargetName);
-      Target = Raw;
-      Changed = true;
-    } else if (Target != Raw) {
-      if (Target->getFunctionType() != Raw->getFunctionType()) {
-        M.getContext().emitError("cannot route synthesized c2go libcall '" +
-                                 CName + "' to '" + TargetName +
-                                 "': function types differ");
-        continue;
+        if (!CB->isNoBuiltin()) {
+          CB->addFnAttr(Attribute::NoBuiltin);
+          Changed = true;
+        }
       }
 
-      // Preserve attributes inferred for the canonical libc declaration. At
-      // this late point they mostly document semantics for codegen, but losing
-      // nounwind/memory effects would also make the merged declaration less
-      // faithful when emitted as bitcode for WF2.
-      AttrBuilder RawFnAttrs(M.getContext(), Raw->getAttributes().getFnAttrs());
-      Target->addFnAttrs(RawFnAttrs);
-    }
-
-    if (Target->getCallingConv() != CallingConv::GoABI0) {
-      Target->setCallingConv(CallingConv::GoABI0);
-      Changed = true;
-    }
-    Changed |= ensureStringAttr(*Target, "c2go-linkname", TargetName);
-    if (!Target->hasFnAttribute("c2go-c-name"))
-      Changed |= ensureStringAttr(*Target, "c2go-c-name", CName);
-
-    // This mismatch is expected at this normalization boundary, so update it
-    // directly rather than using enforceCallSiteCC: that audit helper records
-    // unexpected producer bugs in c2go.cc.violations and would make every
-    // legitimate optimizer-synthesized libcall fail the WF2 ship gate.
-    for (CallBase *CB : Calls) {
-      if (Target != Raw)
-        CB->setCalledFunction(Target);
-      if (CB->getCallingConv() != CallingConv::GoABI0) {
-        CB->setCallingConv(CallingConv::GoABI0);
+      if (Target != Raw && Raw->use_empty()) {
+        Raw->eraseFromParent();
         Changed = true;
       }
-    }
-
-    if (Target != Raw && Raw->use_empty()) {
-      Raw->eraseFromParent();
-      Changed = true;
     }
   }
 
@@ -625,10 +706,13 @@ PreservedAnalyses C2GoLibCallRoutingPass::run(Module &M,
   for (Function &F : M) {
     if (!F.isDeclaration() || F.use_empty())
       continue;
-    LibFunc LF;
-    if (!TLII.getLibFunc(F.getName(), LF))
+    if (isResolvedRouteTarget(F, Routes))
       continue;
-    M.getContext().emitError("c2go libc call '" + F.getName() +
+    StringRef CName = GlobalValue::dropLLVMManglingEscape(F.getName());
+    LibFunc LF;
+    if (!TLII.getLibFunc(CName, LF))
+      continue;
+    M.getContext().emitError("c2go libc call '" + CName +
                              "' has no direct-GoABI0 c2go_linkname route");
   }
 

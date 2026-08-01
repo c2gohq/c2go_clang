@@ -14,7 +14,7 @@
 # discovery / the unsupported fallback.
 
 # RUN: rm -rf %t && split-file %s %t
-# RUN: %c2gobind -pkg example.com/demo -dry-run --sidecar %t/m.json %t/x.s > %t/emit.go
+# RUN: %c2gobind -dry-run --sidecar %t/m.json %t/x.s > %t/emit.go
 # RUN: FileCheck %s --input-file=%t/emit.go
 
 # The pulled-in private target keeps the tuple result, and the exposed nosplit

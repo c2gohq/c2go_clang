@@ -8,6 +8,9 @@
 // RUN:   FileCheck %s --check-prefix=META
 // RUN: %clang_cc1 -triple aarch64-unknown-linux-goabi -fc2go -std=c2go23 \
 // RUN:   -O2 -emit-llvm -o - %s | FileCheck %s --check-prefix=ROUTE
+// RUN: %clang_cc1 -triple aarch64-unknown-linux-goabi -fc2go -std=c2go23 \
+// RUN:   -fc2go-package=example.com/lib -O2 -emit-llvm -o - %s | \
+// RUN:   FileCheck %s --check-prefix=LOCAL
 
 typedef __SIZE_TYPE__ size_t;
 
@@ -67,3 +70,20 @@ double constrained_sin_with_live_pointer(char *p, double x) {
 // ROUTE: !c2go.libcall.routes = !{![[SIN_MD:[0-9]+]], ![[STRLEN_MD:[0-9]+]]}
 // ROUTE: ![[SIN_MD]] = !{!"sin", !"example.com/lib.sin"}
 // ROUTE: ![[STRLEN_MD]] = !{!"strlen", !"example.com/lib.strlen"}
+
+// With the linkname package selected as the current package, late synthesized
+// calls resolve to local LLVM symbols while retaining the raw linkname attr.
+// LOCAL-LABEL: define {{.*}}goabi0cc i64 @loop_strlen(
+// LOCAL: @llvm.experimental.gc.statepoint{{.*}}ptr elementtype(i64 (ptr)) @strlen
+// LOCAL-LABEL: define {{.*}}goabi0cc double @builtin_sin_with_live_pointer(
+// LOCAL: @llvm.experimental.gc.statepoint{{.*}}ptr elementtype(double (double)) @sin
+// LOCAL: declare goabi0cc i64 @strlen(ptr{{.*}}){{.*}}#[[LOCAL_STR:[0-9]+]]
+// LOCAL: declare goabi0cc double @sin(double) #[[LOCAL_SIN:[0-9]+]]
+// LOCAL: attributes #[[LOCAL_STR]] = {
+// LOCAL-SAME: "c2go-c-name"="strlen"
+// LOCAL-SAME: "c2go-linkname"="example.com/lib.strlen"
+// LOCAL-SAME: "c2go-linkname-abi0"
+// LOCAL: attributes #[[LOCAL_SIN]] = {
+// LOCAL-SAME: "c2go-c-name"="sin"
+// LOCAL-SAME: "c2go-linkname"="example.com/lib.sin"
+// LOCAL-SAME: "c2go-linkname-abi0"

@@ -63,10 +63,28 @@ build/bin/clang \
   -O2 \
   -fc2go-emit-plan9-asm=out.s \
   -fc2go-emit-manifest=out.json \
-  -c -o out.o input.c
+  input.c
 ```
 
-`.s` 和 JSON manifest 才是交给 `c2go-bind` 的 c2go 产物；`.o` 在该流程中只是附带输出。完整的消费者构建还需要兼容版本的 `c2go-bind`、`c2go-libc` 和 Go 工具链。
+driver 会在内部调用 `c2go-lto`，生成交给 `c2go-bind` 的 `.s` 和 JSON manifest；这条直接输出工作流不会保留中间 `.o`。
+
+需要保留 object/archive 依赖图时，分别编译每个 translation unit，并让 `c2go-lto` 充当 archiver：
+
+```sh
+build/bin/clang \
+  --target=x86_64-unknown-linux-goabi \
+  -fc2go \
+  -fc2go-package=example.com/acme/mypkg \
+  -O2 -c input.c -o input.o
+
+build/bin/c2go-lto rcs libmypkg.a input.o
+```
+
+这里的 `input.o` 是 pre-link LLVM bitcode，不是 native object；`libmypkg.a` 内含生成的 Plan 9 汇编和 manifest。完整的消费者构建还需要兼容版本的 `c2go-bind`、`c2go-libc` 和 Go 工具链。
+
+`-fc2go-package` 是最终 Go import path 的唯一来源。Clang 用它将同包
+`c2go_linkname` 目标解析为本地符号，并将其写入 manifest；`c2go-bind`
+从 manifest 读取，不再接收第二个 package path 参数。
 
 ## 测试
 

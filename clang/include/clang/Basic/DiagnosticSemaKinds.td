@@ -2280,7 +2280,7 @@ def err_c2go_unmanaged_struct_field_aligned : Error<
 // elsewhere in this file (e.g. ImplicitConvFloatingToBoolean).
 def warn_c2go_struct_packed : Warning<
   "c2go_struct %0 uses 'packed' layout; c2gobind must emit matching "
-  "byte-padded Go fields (verify with --pkg=...)">,
+  "byte-padded Go fields (verify the generated Go layout)">,
   InGroup<DiagGroup<"c2go-layout-packed">>;
 def warn_c2go_struct_aligned : Warning<
   "c2go_struct %0 uses custom alignment; c2gobind must emit matching "

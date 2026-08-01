@@ -27,6 +27,7 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/C2GoSymbol.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -178,7 +179,7 @@ rebuildManifestFromIR(Module &Composite, bool Build,
         return S->getString().str();
     return "";
   };
-  std::string PkgPath = getStringFlag("c2go.pkgpath");
+  std::string PkgPath = getStringFlag(c2go::kPackagePathModuleFlag);
   if (PkgPath.empty())
     PkgPath = "main";
   Root["pkgpath"] = PkgPath;
@@ -444,44 +445,33 @@ rebuildManifestFromIR(Module &Composite, bool Build,
   Root["symbols"] = std::move(Symbols);
 
   // c2go WF2 (#319 C2 follow-up): rebuild the top-level `linknames[]`
-  // bridge table from per-function "c2go-linkname" attrs. Mirrors
-  // CodeGenAction::buildC2GoManifest's logic: only emit path-b entries
-  // (targets carrying chars Plan 9 asm can't pass through `·name(SB)`,
-  // e.g. hyphens), since path-a is burned directly into the .s and needs
-  // no bridge. Path (a) targets like "runtime.Gosched" are skipped here.
+  // bridge table from per-function attrs. Mirrors
+  // CodeGenAction::buildC2GoManifest: same-package targets use their local
+  // suffix, while a cross-package ABIInternal target or a Plan-9-illegal
+  // spelling needs c2go-bind's bridge.
   {
     json::Array Linknames;
-    auto plan9Direct = [](StringRef T) {
-      for (char C : T)
-        if (!((C >= 'A' && C <= 'Z') || (C >= 'a' && C <= 'z') ||
-              (C >= '0' && C <= '9') || C == '_' || C == '/' || C == '.'))
-          return false;
-      return true;
-    };
-    auto sanitiseToIdent = [](std::string S) {
-      for (char &C : S) {
-        if ((C >= 'A' && C <= 'Z') || (C >= 'a' && C <= 'z') ||
-            (C >= '0' && C <= '9') || C == '_')
-          continue;
-        C = '_';
-      }
-      return S;
-    };
     for (Function &F : Composite) {
       if (!F.hasFnAttribute("c2go-linkname"))
         continue;
-      StringRef Target =
-          F.getFnAttribute("c2go-linkname").getValueAsString();
-      if (Target.empty() || plan9Direct(Target))
-        continue; // path-a — burned into .s, no bridge needed
+      StringRef Target = F.getFnAttribute("c2go-linkname").getValueAsString();
+      std::optional<StringRef> Local =
+          c2go::getC2GoSamePackageSymbol(Target, PkgPath);
+      StringRef EmittedName = Local ? *Local : Target;
+      bool Plan9Direct = Local ? c2go::isC2GoPlan9LocalSymbol(EmittedName)
+                               : c2go::isC2GoPlan9PathSymbol(EmittedName);
+      bool Direct = Plan9Direct && (Local.has_value() ||
+                                    F.hasFnAttribute("c2go-linkname-abi0"));
+      if (Target.empty() || Direct)
+        continue;
       json::Object Bridge;
-      Bridge["name"] =
-          F.getFnAttribute("c2go-c-name").getValueAsString().str();
+      Bridge["name"] = F.getFnAttribute("c2go-c-name").getValueAsString().str();
       Bridge["kind"] = "func";
       Bridge["go_sig"] =
           F.getFnAttribute("c2go-go-sig").getValueAsString().str();
       Bridge["linkname"] = Target.str();
-      Bridge["asm_symbol"] = "\xc2\xb7" + sanitiseToIdent(Target.str());
+      Bridge["asm_symbol"] =
+          "\xc2\xb7" + c2go::sanitiseC2GoSymbolToIdent(Target);
       Linknames.push_back(std::move(Bridge));
     }
     std::sort(Linknames.begin(), Linknames.end(),

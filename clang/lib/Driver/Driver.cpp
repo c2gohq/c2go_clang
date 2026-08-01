@@ -4381,18 +4381,25 @@ void Driver::BuildActions(Compilation &C, DerivedArgList &Args,
   ActionList MergerInputs;
   ActionList C2GoLtoInputs;
 
-  // c2go: a `-fc2go` compile that requests the Plan 9 .s / manifest outputs is
-  // routed internally through c2go-lto (the WF2 bitcode linker) — the SINGLE
-  // internal code path. Each TU is compiled to bitcode (carrying its embedded
-  // manifest) and c2go-lto links them, emitting the .s + manifest (one set, even
-  // for several inputs). This holds for a single TU too: the emitted .s/manifest
-  // are byte-identical to the old cc1-direct emit (same bitcode, same codegen),
-  // so single-file just joins the same path rather than keeping a parallel one.
-  // A `-fc2go` compile WITHOUT the emit flags keeps the ordinary object pipeline.
-  const bool C2GoLtoMode =
+  // c2go has two public workflows over the same pre-link bitcode boundary:
+  //
+  //  * `-fc2go -c`: emit an LLVM bitcode file with the conventional `.o`
+  //    suffix. A build system later passes one or more such files to c2go-lto
+  //    (normally through its ar-compatible CLI).
+  //  * `-fc2go-emit-plan9-asm=` / `-fc2go-emit-manifest=`: route the per-TU
+  //    bitcode to c2go-lto immediately and emit the requested sidecars.
+  //
+  // The latter is the driver-internal route. Keep its action separate from the
+  // default compile-only route: a plain `-c` must stop at bitcode rather than
+  // invoking c2go-lto itself.
+  const bool C2GoImmediateLtoMode =
       Args.hasArg(options::OPT_fc2go) &&
       (Args.hasArg(options::OPT_fc2go_emit_plan9_asm_EQ) ||
        Args.hasArg(options::OPT_fc2go_emit_manifest_EQ));
+  const bool C2GoBitcodeObjectMode = Args.hasArg(options::OPT_fc2go) &&
+                                     !C2GoImmediateLtoMode &&
+                                     !Args.hasArg(options::OPT_emit_llvm) &&
+                                     getFinalPhase(Args) == phases::Assemble;
 
   for (auto &I : Inputs) {
     types::ID InputType = I.first;
@@ -4456,7 +4463,7 @@ void Driver::BuildActions(Compilation &C, DerivedArgList &Args,
       // job defers c2go's late safepoint/GC pipeline; c2go-lto links and
       // inlines first, then runs that pipeline once on the combined module.
       // This mirrors -flto bitcode emit, but the "linker" is c2go-lto.
-      if (C2GoLtoMode && Phase == phases::Backend) {
+      if (C2GoImmediateLtoMode && Phase == phases::Backend) {
         Current = C.MakeAction<BackendJobAction>(Current, types::TY_LLVM_BC);
         C2GoLtoInputs.push_back(Current);
         Current = nullptr;
@@ -4472,8 +4479,14 @@ void Driver::BuildActions(Compilation &C, DerivedArgList &Args,
       // FIXME: Should we include any prior module file outputs as inputs of
       // later actions in the same command line?
 
-      // Otherwise construct the appropriate action.
-      Action *NewCurrent = ConstructPhaseAction(C, Args, Phase, Current);
+      // Otherwise construct the appropriate action. A compile-only c2go job
+      // stops at LLVM bitcode while retaining the ordinary object suffix. The
+      // following Assemble phase is skipped by ConstructPhaseAction because
+      // TY_LTO_BC is already an LLVM IR type.
+      Action *NewCurrent =
+          C2GoBitcodeObjectMode && Phase == phases::Backend
+              ? C.MakeAction<BackendJobAction>(Current, types::TY_LTO_BC)
+              : ConstructPhaseAction(C, Args, Phase, Current);
 
       // We didn't create a new action, so we will just move to the next phase.
       if (NewCurrent == Current)

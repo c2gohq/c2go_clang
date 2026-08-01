@@ -25,10 +25,11 @@
 // deterministic and we never operate on an existing archive, so `rcs` /
 // `rc` / `cr` / `crs` / `rcsD` all collapse to the same behaviour.
 //
-// Inputs are still expected to be LLVM bitcode (.bc) — a build system
-// driving c2go-lto as AR pairs it with `c2go-clang -c -emit-llvm` upstream
-// (i.e. .o files are really LLVM bitcode). This is the same contract the
-// existing --c2go-emit-archive flag has; the shim is pure CLI surface.
+// Inputs are still expected to be LLVM bitcode. In the default WF2 workflow,
+// `c2go-clang -fc2go -c` writes that bitcode with a conventional .o suffix, so
+// a build system can pair `CC=c2go-clang` with `AR=c2go-lto`. This is the same
+// contract the existing --c2go-emit-archive flag has; the shim is pure CLI
+// surface.
 //
 //===----------------------------------------------------------------------===//
 

@@ -65,6 +65,7 @@
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/MC/MCSectionMachO.h"
+#include "llvm/Support/C2GoSymbol.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
@@ -6329,19 +6330,23 @@ static void handleC2GoLinknameAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
       return;
     }
   }
-  // Does the Go target contain a char the Plan 9 assembler cannot carry raw
-  // in a `·name(SB)` symbol — `-` (hyphenated import paths) or a method
-  // symbol's `(`/`*`/`)`? Mirrors goSymToPlan9 / the manifest path-b check.
-  auto isPlan9Ident = [](char C) {
-    return (C >= 'A' && C <= 'Z') || (C >= 'a' && C <= 'z') ||
-           (C >= '0' && C <= '9') || C == '_';
-  };
-  bool HasIllegal = false;
-  for (char C : Name)
-    if (!(isPlan9Ident(C) || C == '/' || C == '.')) {
-      HasIllegal = true;
-      break;
-    }
+  // Resolve ownership before validating the Plan 9 spelling.  A linkname in
+  // the package selected by -fc2go-package= uses its local suffix: this makes
+  // a header declaration such as
+  //
+  //   strlen __attribute__((c2go_linkname("example/lib.strlen", 1)))
+  //
+  // name the same LLVM/Plan 9 symbol as this package's `strlen` definition.
+  // It also means a hyphen in the CURRENT package path is harmless because it
+  // never reaches the `·strlen(SB)` spelling.  Cross-package targets retain
+  // their full linker name.  A local suffix must be a plain identifier: dots
+  // and slashes are package separators in Plan 9 syntax, not local-name bytes.
+  std::optional<StringRef> LocalName = llvm::c2go::getC2GoSamePackageSymbol(
+      Name, S.getLangOpts().C2GoPackagePath);
+  StringRef EmittedName = LocalName ? *LocalName : Name;
+  bool Plan9Direct = LocalName ? llvm::c2go::isC2GoPlan9LocalSymbol(EmittedName)
+                               : llvm::c2go::isC2GoPlan9PathSymbol(EmittedName);
+  bool HasIllegal = !Plan9Direct;
   // C2GO_GOABI0 asks for a direct reference; impossible for a name the
   // assembler can't carry.
   if (HasAbi0 && HasIllegal) {
@@ -6391,12 +6396,14 @@ static void handleC2GoLinknameAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   //     (c2gobind emits an alias-then-wrap stub — a Go 1.25 bodyless
   //     //go:linkname no longer satisfies a .s-referenced symbol), or a '-'
   //     variable (pointer-indirected at its use sites; see CGExpr).
-  bool Direct = isa<VarDecl>(D) ? !HasIllegal : ((int)HasAbi0 != 0 && !HasIllegal);
-  std::string Label = Name.str();
-  if (!Direct)
-    for (char &C : Label)
-      if (!isPlan9Ident(C))
-        C = '_';
+  // A same-package ABIInternal Go function is also direct at the symbol level:
+  // the local Plan 9 reference is ABI0 and Go's symabis/compiler pipeline emits
+  // the transparent ABI0 -> ABIInternal wrapper.  Only a CROSS-package
+  // ABIInternal function needs c2go-bind's alias-then-wrap bridge.
+  bool Direct =
+      Plan9Direct && (LocalName.has_value() || isa<VarDecl>(D) || HasAbi0 != 0);
+  std::string Label =
+      Direct ? EmittedName.str() : llvm::c2go::sanitiseC2GoSymbolToIdent(Name);
   // c2go: when c2go_extern is ALSO present, the export attribute owns the
   // emitted symbol (the header's c2go_linkname documents the Go target + the
   // ABI0 CC applied above, but does not rename the symbol). Skip the asm-label

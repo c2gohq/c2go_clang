@@ -24,7 +24,7 @@
 # Drive c2go-bind in -dry-run mode (writes generated Go to stdout, no
 # files needed). The Go output must carry //go:nosplit immediately
 # above each of the three helper definitions.
-# RUN: %c2gobind -pkg example.com/stub -dry-run %t/stub.c2go-export.json | FileCheck %s
+# RUN: %c2gobind -dry-run %t/stub.c2go-export.json | FileCheck %s
 
 # For each helper, anchor on a unique line that precedes its definition
 # (the //go:linkname or the leading comment), then assert the next lines

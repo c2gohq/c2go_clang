@@ -6801,24 +6801,24 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
   // cc1 and claim them to suppress "argument unused" warnings.
   Args.AddLastArg(CmdArgs, options::OPT_fc2go);
   Args.AddLastArg(CmdArgs, options::OPT_fc2go_package_EQ);
-  // When this cc1 emits bitcode for the c2go-lto routing (a -fc2go compile that
-  // requested the .s/manifest outputs), it must NOT also write those files: the
-  // driver's c2go-lto job produces them from the linked bitcode. The manifest
-  // still rides in the bitcode (CodeGenAction embeds it whenever -fc2go is on),
-  // so only the file-writing emit flags are withheld here; they are claimed so
-  // no "unused argument" warning fires. A standalone `clang -cc1 -emit-llvm-bc
-  // -fc2go-emit-manifest=` (e.g. a LIT reference) bypasses this driver path and
-  // still writes its file.
-  const bool C2GoLtoRoutedBC =
-      JA.getType() == types::TY_LLVM_BC && Args.hasArg(options::OPT_fc2go) &&
-      (Args.hasArg(options::OPT_fc2go_emit_manifest_EQ) ||
-       Args.hasArg(options::OPT_fc2go_emit_plan9_asm_EQ));
-  if (C2GoLtoRoutedBC) {
-    // Keep the per-TU IR in pre-RS4GC form. c2go-lto links and inlines first,
-    // then runs the complete c2go late pipeline once on the combined module.
-    // Without this phase boundary, an inlined callee can introduce a new
-    // safepoint call after liveness was already computed for the caller.
+  // Every c2go bitcode object consumed by c2go-lto must remain in pre-link IR:
+  // cross-TU inlining has to finish before the late safepoint/GC pipeline fixes
+  // liveness. This applies both to the default `.o` (= TY_LTO_BC) workflow and
+  // to explicit LLVM bitcode output.
+  const bool C2GoPreLinkBC =
+      (JA.getType() == types::TY_LLVM_BC || JA.getType() == types::TY_LTO_BC) &&
+      Args.hasArg(options::OPT_fc2go);
+  if (C2GoPreLinkBC)
     CmdArgs.push_back("-fc2go-lto-prelink");
+
+  // When the driver immediately routes that bitcode through c2go-lto, cc1 must
+  // not also write the requested .s/manifest files. The full manifest still
+  // rides in the bitcode; claim only the file-writing flags here so no unused
+  // argument warning fires. A standalone cc1 invocation bypasses this route.
+  const bool C2GoLtoRoutedBC =
+      C2GoPreLinkBC && (Args.hasArg(options::OPT_fc2go_emit_manifest_EQ) ||
+                        Args.hasArg(options::OPT_fc2go_emit_plan9_asm_EQ));
+  if (C2GoLtoRoutedBC) {
     Args.ClaimAllArgs(options::OPT_fc2go_emit_manifest_EQ);
     Args.ClaimAllArgs(options::OPT_fc2go_emit_plan9_asm_EQ);
   } else {

@@ -48,6 +48,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/MatrixBuilder.h"
+#include "llvm/Support/C2GoSymbol.h"
 #include "llvm/Support/ConvertUTF.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/MathExtras.h"
@@ -3367,14 +3368,12 @@ static LValue EmitGlobalVarDeclLValue(CodeGenFunction &CGF,
   // direct reference below.
   if (const auto *LN = VD->getAttr<C2GoLinknameAttr>()) {
     StringRef GoTarget = LN->getName();
-    bool HasIllegal = false;
-    for (char C : GoTarget)
-      if (!((C >= 'A' && C <= 'Z') || (C >= 'a' && C <= 'z') ||
-            (C >= '0' && C <= '9') || C == '_' || C == '/' || C == '.')) {
-        HasIllegal = true;
-        break;
-      }
-    if (HasIllegal) {
+    std::optional<StringRef> Local = llvm::c2go::getC2GoSamePackageSymbol(
+        GoTarget, CGF.getLangOpts().C2GoPackagePath);
+    StringRef EmittedTarget = Local ? *Local : GoTarget;
+    bool Plan9Direct = Local ? llvm::c2go::isC2GoPlan9LocalSymbol(EmittedTarget)
+                             : llvm::c2go::isC2GoPlan9PathSymbol(EmittedTarget);
+    if (!Plan9Direct) {
       std::string PtrSym = "_c2go_ptr_";
       for (char C : GoTarget)
         PtrSym += ((C >= 'A' && C <= 'Z') || (C >= 'a' && C <= 'z') ||

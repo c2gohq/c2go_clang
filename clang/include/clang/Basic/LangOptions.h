@@ -499,7 +499,8 @@ public:
   /// The module currently being compiled as specified by -fmodule-name.
   std::string ModuleName;
 
-  /// c2go: Go package path for symbol mangling (set by -fc2go-package=).
+  /// c2go: final Go import path used for same-package linkname resolution and
+  /// recorded in IR/the export manifest (set by -fc2go-package=).
   /// Default "main" when -fc2go-package= is not given.
   std::string C2GoPackagePath;
 

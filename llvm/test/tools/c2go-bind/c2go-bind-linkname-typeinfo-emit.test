@@ -29,13 +29,13 @@
 # Run 1: the .s references four descriptors (a C-owner struct, two
 # Go-owner aliases, and an anonymous ref with no Go type). Expect the
 # full emission matrix incl. the reflect pin table.
-# RUN: %c2gobind -pkg example.com/demo -dry-run --sidecar %t/m.json %t/withrefs.s > %t/emit.go
+# RUN: %c2gobind -dry-run --sidecar %t/m.json %t/withrefs.s > %t/emit.go
 # RUN: FileCheck %s --check-prefix=EMIT --input-file=%t/emit.go
 
 # Run 2: same manifest, a .s that references no descriptor. The aliases
 # and linkname bridges must still be emitted, but the reflect pin table
 # and the `reflect` import must be fully gated out.
-# RUN: %c2gobind -pkg example.com/demo -dry-run --sidecar %t/m.json %t/norefs.s > %t/gated.go
+# RUN: %c2gobind -dry-run --sidecar %t/m.json %t/norefs.s > %t/gated.go
 # RUN: FileCheck %s --check-prefix=GATED --input-file=%t/gated.go
 # RUN: FileCheck %s --check-prefix=NOREFLECT --input-file=%t/gated.go
 

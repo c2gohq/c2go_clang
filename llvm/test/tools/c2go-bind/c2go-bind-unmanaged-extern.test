@@ -15,8 +15,8 @@
 # c2go-bind lives outside llvm-project; see lit.local.cfg for path discovery.
 
 # RUN: rm -rf %t && split-file %s %t
-# RUN: %c2gobind -pkg demo -dry-run %t/m.json | FileCheck %s --check-prefix=EXT
-# RUN: %c2gobind -pkg demo -dry-run %t/m.json | FileCheck %s --check-prefix=NOEXT
+# RUN: %c2gobind -dry-run %t/m.json | FileCheck %s --check-prefix=EXT
+# RUN: %c2gobind -dry-run %t/m.json | FileCheck %s --check-prefix=NOEXT
 
 # Dispatch is through the c2go-libc/dl package.
 # EXT:      "github.com/c2gohq/c2go_libc/dl"
@@ -64,4 +64,3 @@
 
 #--- m.json
 {"linknames":[],"max_go_version":"go1.26","min_go_version":"go1.22","module_gcmask":{"vars":[]},"pkgpath":"demo","symbols":[{"abi":"abi0","argsize":24,"asm_symbol":"\u00b7ext_dscale","cabi":{"params":[{"pass":"direct","words":[{"f":true,"off":0,"sz":8}]},{"pass":"direct","words":[{"f":false,"off":0,"sz":4}]}],"ret":{"pass":"direct","words":[{"f":true,"off":0,"sz":8}]}},"go_name":"ExtDscale","go_sig":"func ext_dscale(v float64, n int32) float64","has_float":true,"kind":"unmanaged_extern","managed":true,"name":"ext_dscale","needs_linkname":true},{"abi":"abi0","argsize":16,"asm_symbol":"\u00b7ext_mkpt","cabi":{"params":[{"pass":"direct","words":[{"f":false,"off":0,"sz":4}]},{"pass":"direct","words":[{"f":false,"off":0,"sz":4}]}],"ret":{"pass":"direct","words":[{"f":false,"off":0,"sz":8}]}},"go_name":"ExtMkpt","go_sig":"func ext_mkpt(x int32, y int32) Pt","has_aggregate":true,"kind":"unmanaged_extern","managed":true,"name":"ext_mkpt","needs_linkname":true},{"abi":"abi0","argsize":16,"asm_symbol":"\u00b7ext_printf","cabi":{"params":[{"pass":"direct","words":[{"f":false,"off":0,"sz":8}]},{"pass":"direct","words":[{"f":false,"off":0,"sz":8}]}],"ret":{"pass":"direct","words":[{"f":false,"off":0,"sz":4}]}},"go_name":"ExtPrintf","go_sig":"func ext_printf(fmt *byte) int32","is_variadic":true,"kind":"unmanaged_extern","managed":true,"name":"ext_printf","needs_linkname":true},{"abi":"abi0","argsize":32,"asm_symbol":"\u00b7ext_read","cabi":{"params":[{"pass":"direct","words":[{"f":false,"off":0,"sz":4}]},{"pass":"direct","words":[{"f":false,"off":0,"sz":8}]},{"pass":"direct","words":[{"f":false,"off":0,"sz":8}]}],"ret":{"pass":"direct","words":[{"f":false,"off":0,"sz":4}]}},"go_name":"ExtRead","go_sig":"func ext_read(fd int32, buf unsafe.Pointer, n uint64) int32","kind":"unmanaged_extern","managed":true,"name":"ext_read","needs_linkname":true},{"abi":"abi0","argsize":16,"asm_symbol":"\u00b7ext_store","cabi":{"params":[{"pass":"direct","words":[{"f":false,"off":0,"sz":8}]},{"pass":"direct","words":[{"f":false,"off":0,"sz":4}]}],"ret":{"pass":"void"}},"go_name":"ExtStore","go_sig":"func ext_store(p *int32, v int32)","kind":"unmanaged_extern","managed":true,"name":"ext_store","needs_linkname":true}],"types":[{"go_def":"struct {\n\tx int32\n\ty int32\n}","linkage_owner":"c","managed_record":true,"name":"Pt"}]}
-

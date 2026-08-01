@@ -1611,18 +1611,17 @@ void CodeGenModule::Release() {
     // range so c2go-lto can rebuild the manifest pkgpath / min_go_version /
     // max_go_version fields without consulting the AST.
     //
-    // The package NAME is deliberately NOT recorded: nothing in the .s /
-    // codegen path uses it. Same-package symbol refs use the `·name` short
-    // form (the package is supplied at Go-build time by `go tool asm -p
-    // <importpath>`), and typeinfo refs use the current-package `·_typeinfo_
-    // <X>` indirection var (#218). The `Plan9PackageName` typeinfo mechanism
-    // that once consumed the package name was removed in #239. The package
-    // name is purely c2go-bind's `package <name>` codegen concern (its
-    // -pkgname flag), not an artifact fact — so it does not belong here.
+    // The package NAME is deliberately NOT recorded. The IMPORT PATH is the
+    // linker identity: Sema uses it to fold same-package c2go_linkname targets
+    // to `·name`, and Go supplies it again while assembling via `go tool asm
+    // -p <importpath>`. Typeinfo refs likewise use the current-package
+    // `·_typeinfo_<X>` indirection var (#218). The source-level package name
+    // remains purely c2go-bind's `package <name>` concern (its -pkgname flag).
     StringRef PkgPath = LangOpts.C2GoPackagePath;
     if (PkgPath.empty())
       PkgPath = "main";
-    getModule().addModuleFlag(llvm::Module::Error, "c2go.pkgpath",
+    getModule().addModuleFlag(llvm::Module::Error,
+                              llvm::c2go::kPackagePathModuleFlag,
                               llvm::MDString::get(VMContext, PkgPath));
     StringRef VerRange = LangOpts.C2GoTargetGoVersion;
     if (VerRange.empty()) VerRange = "1.22-1.25";
@@ -3107,6 +3106,12 @@ void CodeGenModule::SetLLVMFunctionAttributes(GlobalDecl GD,
         F->addFnAttr("c2go-unmanaged-world");
       if (const auto *LN = FD->getAttr<C2GoLinknameAttr>()) {
         F->addFnAttr("c2go-linkname", LN->getName());
+        // Preserve the optional target-ABI selector for c2go-lto's fallback
+        // manifest rebuilder. CallingConv::GoABI0 alone cannot distinguish a
+        // direct C2GO_GOABI0 target from an ABIInternal target reached through
+        // an ABI0 wrapper because c2go_linkname applies GoABI0 to both.
+        if (LN->getHasAbi0() != 0)
+          F->addFnAttr("c2go-linkname-abi0");
         // #304: teach native LLVM DSE/GVN that c2go_libc.GCMalloc returns
         // zero-initialized memory, so redundant `memset(p, 0, n)` / `*p = 0`
         // sequences after `gc_malloc(typeinfo, n)` are dropped without a

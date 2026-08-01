@@ -4,7 +4,7 @@
 # hook. The out-of-tree c2go-bind binary is discovered by lit.local.cfg.
 
 # RUN: rm -rf %t && split-file %s %t
-# RUN: %c2gobind -pkg example.com/gcroots -dry-run --sidecar %t/m.json %t/x.s > %t/emit.go
+# RUN: %c2gobind -dry-run --sidecar %t/m.json %t/x.s > %t/emit.go
 # RUN: FileCheck %s --input-file=%t/emit.go \
 # RUN:   --implicit-check-not=_c2goGCMask \
 # RUN:   --implicit-check-not=_c2goPkgGCMaskTable \

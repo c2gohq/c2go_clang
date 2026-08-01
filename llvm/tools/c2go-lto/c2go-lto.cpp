@@ -41,56 +41,55 @@
 //     indirect call : same, over address-taken functions of compatible arity
 //
 //   escape test, per `store ptr q, ptr p`:
-//     pts(q) contains a Stack cell  AND  pts(p) contains Heap / Global / Unknown
+//     pts(q) contains a Stack cell  AND  pts(p) contains Heap / Global /
+//     Unknown
 //
 //   asymmetric soundness (key): the value side (q) stays precise (only a real
 //   alloca counts as Stack, to avoid drowning in false positives); the
-//   destination side (p) is over-approximated — a function that is address-taken
-//   or externally linked may be an external entry, so its pointer-typed params
-//   are seeded with HeapUnknown (treated as may-point-to-heap). The HeapUnknown
-//   cell points to itself, so loading through an unknown-heap pointer keeps
-//   yielding heap. This catches prep1 (external), prep3 (address-taken), and
-//   prep2 (`db = outer->self`, a load from a heap field).
+//   destination side (p) is over-approximated — a function that is
+//   address-taken or externally linked may be an external entry, so its
+//   pointer-typed params are seeded with HeapUnknown (treated as
+//   may-point-to-heap). The HeapUnknown cell points to itself, so loading
+//   through an unknown-heap pointer keeps yielding heap. This catches prep1
+//   (external), prep3 (address-taken), and prep2 (`db = outer->self`, a load
+//   from a heap field).
 //
 //===----------------------------------------------------------------------===//
 
+#include "C2GoArCli.h"
+#include "C2GoEscapeAudit.h"
+#include "C2GoManifestRebuilder.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassInstrumentation.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Linker/Linker.h"
 #include "llvm/MC/MCPlan9AsmStreamer.h"
 #include "llvm/MC/MCTargetOptions.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Object/ArchiveWriter.h"
-#include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Passes/PassBuilder.h"
-#include "llvm/Transforms/C2Go/C2GoGCMaskUtils.h"
-#include "llvm/Transforms/C2Go/C2GoPipeline.h"
-#include "llvm/Transforms/C2Go/C2GoProtocol.h"
-#include "llvm/Transforms/IPO/Inliner.h"
-#include "llvm/IR/PassInstrumentation.h"
-#include "C2GoArCli.h"
-#include "C2GoEscapeAudit.h"
-#include "C2GoManifestRebuilder.h"
-#include "llvm/Support/ErrorHandling.h"
-#include "llvm/Support/MemoryBuffer.h"
-#include "llvm/Support/Path.h"
-#include "llvm/Support/CodeGen.h"
 #include "llvm/Support/C2GoEmergencyFlag.h"
+#include "llvm/Support/CodeGen.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
@@ -98,6 +97,10 @@
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/C2Go/C2GoGCMaskUtils.h"
+#include "llvm/Transforms/C2Go/C2GoPipeline.h"
+#include "llvm/Transforms/C2Go/C2GoProtocol.h"
+#include "llvm/Transforms/IPO/Inliner.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #include <optional>
@@ -291,7 +294,7 @@ bool RunPlan9Codegen(Module &M, raw_pwrite_stream &Out) {
   Options.NoTrapAfterNoreturn = false;
 
   // c2go #433: read CPU + features + optlevel from the bc's c2go.* module
-  // flags (clang/CodeGenModule.cpp stamps them at `-fc2go -emit-llvm` time)
+  // flags (clang/CodeGenModule.cpp stamps them when emitting c2go bitcode)
   // instead of the previous hard-coded ("generic", "+neon", Aggressive) tuple.
   // Falls back to the legacy hard-code only when a flag is absent (older bc
   // produced before #433 — keeps `c2go-lto` regression-tolerant against
@@ -978,6 +981,13 @@ int main(int argc, char **argv) {
   SmallString<0> AsmText;
   bool BuildAsm = !EmitAsm.empty() || !EmitArchive.empty();
   if (BuildAsm) {
+    // The Plan 9 streamer emits Go assembly rather than an ELF/Mach-O object
+    // and has no DWARF section model. Keep locations through linking, escape
+    // diagnostics, manifest rebuilding, and optional --output-bc emission,
+    // then strip them immediately before codegen so ordinary build-system
+    // CFLAGS containing -g cannot drive the object streamer into DWARF paths.
+    StripDebugInfo(*Composite);
+
     // c2go #439: stamp the gcmask-collect watermark immediately before
     // codegen. RunPlan9Codegen asserts the watermark is present; a future
     // refactor that reorders codegen earlier than the collect step (or

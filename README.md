@@ -63,10 +63,29 @@ build/bin/clang \
   -O2 \
   -fc2go-emit-plan9-asm=out.s \
   -fc2go-emit-manifest=out.json \
-  -c -o out.o input.c
+  input.c
 ```
 
-The `.s` and JSON manifest are the c2go outputs consumed by `c2go-bind`; the `.o` file is incidental to this flow. A full consumer build also needs compatible `c2go-bind`, `c2go-libc`, and Go toolchain versions.
+The driver invokes `c2go-lto` internally and writes the `.s` and JSON manifest consumed by `c2go-bind`; this direct-output workflow does not keep an intermediate `.o`.
+
+For an object/archive build, compile each translation unit separately and use `c2go-lto` as the archiver:
+
+```sh
+build/bin/clang \
+  --target=x86_64-unknown-linux-goabi \
+  -fc2go \
+  -fc2go-package=example.com/acme/mypkg \
+  -O2 -c input.c -o input.o
+
+build/bin/c2go-lto rcs libmypkg.a input.o
+```
+
+Here `input.o` is pre-link LLVM bitcode, not a native object; `libmypkg.a` contains the generated Plan 9 assembly and manifest. A full consumer build also needs compatible `c2go-bind`, `c2go-libc`, and Go toolchain versions.
+
+`-fc2go-package` is the single source of truth for the final Go import path.
+Clang uses it to resolve same-package `c2go_linkname` targets to local symbols
+and records it in the manifest; `c2go-bind` reads it from there and does not take
+a second package-path argument.
 
 ## Testing
 

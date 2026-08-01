@@ -75,15 +75,15 @@ attributes #0 = { nounwind memory(argmem: read) }
 ; CHECK: declare goabi0cc i32 @"example.com/lib.puts"(ptr) #[[PUTS:[0-9]+]]
 
 ; CHECK-LABEL: define i64 @use_strlen(
-; CHECK: tail call goabi0cc i64 @"example.com/lib.strlen"(ptr %s)
+; CHECK: tail call goabi0cc i64 @"example.com/lib.strlen"(ptr %s) #[[NOBUILTIN:[0-9]+]]
 ; CHECK-LABEL: define i32 @use_puts(
-; CHECK: call goabi0cc i32 @"example.com/lib.puts"(ptr %s)
+; CHECK: call goabi0cc i32 @"example.com/lib.puts"(ptr %s) #[[NOBUILTIN]]
 
 ; A real definition with a standard-library name remains local program code.
 ; CHECK: define i32 @strcmp(
 
 ; CHECK-LABEL: define double @use_sin(
-; CHECK: call goabi0cc double @"example.com/lib.sin"(double %x)
+; CHECK: call goabi0cc double @"example.com/lib.sin"(double %x) #[[NOBUILTIN]]
 ; CHECK-NOT: @llvm.sin
 ; CHECK-LABEL: define double @use_constrained_sin(
 ; CHECK: call goabi0cc double @"example.com/lib.sin"(double %x) #[[STRICT:[0-9]+]]
@@ -106,13 +106,15 @@ attributes #0 = { nounwind memory(argmem: read) }
 ; CHECK: declare goabi0cc double @"example.com/lib.frexp"(double, ptr)
 ; CHECK: declare goabi0cc void @"example.com/lib.sincos"(double, ptr, ptr)
 
-; CHECK: attributes #[[STR]] = { "c2go-c-name"="strlen" "c2go-linkname"="example.com/lib.strlen" }
+; CHECK: attributes #[[STR]] = { "c2go-c-name"="strlen" "c2go-linkname"="example.com/lib.strlen" "c2go-linkname-abi0" }
 ; CHECK: attributes #[[PUTS]] = {
 ; CHECK-SAME: nounwind
 ; CHECK-SAME: memory(argmem: read)
 ; CHECK-SAME: "c2go-c-name"="puts"
 ; CHECK-SAME: "c2go-linkname"="example.com/lib.puts"
-; CHECK: attributes #[[STRICT]] = { strictfp }
+; CHECK-SAME: "c2go-linkname-abi0"
+; CHECK: attributes #[[NOBUILTIN]] = { nobuiltin }
+; CHECK: attributes #[[STRICT]] = { nobuiltin strictfp }
 ; CHECK-NOT: !"c2go.cc.violations"
 
 !llvm.module.flags = !{!0}

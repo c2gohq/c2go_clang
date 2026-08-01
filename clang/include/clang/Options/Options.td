@@ -3298,7 +3298,7 @@ def fc2go_lto_prelink : Flag<["-"], "fc2go-lto-prelink">, Group<f_Group>,
 def fc2go_package_EQ : Joined<["-"], "fc2go-package=">, Group<f_Group>,
   Visibility<[ClangOption, CC1Option]>,
   MetaVarName<"<pkgpath>">,
-  HelpText<"Set the Go package path used for symbol mangling under c2go mode (default: main).">,
+  HelpText<"Set the final Go import path for same-package symbol resolution and c2go artifacts (default: main).">,
   MarshallingInfoString<LangOpts<"C2GoPackagePath">, [{"main"}]>;
 def fc2go_emit_manifest_EQ : Joined<["-"], "fc2go-emit-manifest=">, Group<f_Group>,
   Visibility<[ClangOption, CC1Option]>,

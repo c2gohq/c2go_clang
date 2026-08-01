@@ -95,6 +95,11 @@ inline constexpr StringLiteral kTargetCpuFlag = "c2go.target-cpu";
 /// Producer: CodeGenModule. Consumer: c2go-lto.
 inline constexpr StringLiteral kTargetFeaturesFlag = "c2go.target-features";
 
+/// Module flag carrying the final Go import path. Besides manifest identity,
+/// this resolves c2go_linkname targets in the same package to their local LLVM
+/// and Plan 9 symbol suffix.
+inline constexpr StringLiteral kPackagePathModuleFlag = "c2go.pkgpath";
+
 /// Module flag carrying the running count of CC (calling-convention)
 /// violations detected by C2GoCommon::enforceCallSiteCC. Merged with
 /// Module::Max across TUs at link time.
@@ -157,9 +162,9 @@ inline constexpr StringLiteral kSafepointCalleesMDName =
 ///
 /// Producer: clang's end-of-TU AST walk. C2GoLibCallRoutingPass consumes routes
 /// before RS4GC; SelectionDAG only enforces that none escaped that boundary.
-/// Only c2go_linkname functions carrying C2GO_GOABI0 are recorded;
-/// ABIInternal linknames still require their existing alias-then-wrapper path
-/// and must never be redirected directly.
+/// Only c2go_linkname functions carrying C2GO_GOABI0 are recorded. The consumer
+/// resolves a target in kPackagePathModuleFlag to its current-package suffix;
+/// cross-package targets retain their full linker path.
 inline constexpr StringLiteral kLibCallRoutesMDName = "c2go.libcall.routes";
 
 //===----------------------------------------------------------------------===//

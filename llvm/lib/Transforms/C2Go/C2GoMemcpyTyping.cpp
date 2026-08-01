@@ -57,6 +57,7 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/C2GoSymbol.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/C2Go/C2GoCommon.h"
@@ -76,6 +77,44 @@ namespace {
 constexpr StringRef kMemcpyName  = "github.com/c2gohq/c2go_libc.memcpy";
 constexpr StringRef kMemmoveName = "github.com/c2gohq/c2go_libc.memmove";
 constexpr StringRef kMemsetName  = "github.com/c2gohq/c2go_libc.memset";
+
+static StringRef getResolvedMemorySymbol(const Module &M, StringRef Linkname) {
+  StringRef PackagePath;
+  if (auto *S = dyn_cast_or_null<MDString>(
+          M.getModuleFlag(c2go::kPackagePathModuleFlag)))
+    PackagePath = S->getString();
+  std::optional<StringRef> Local =
+      c2go::getC2GoSamePackageSymbol(Linkname, PackagePath);
+  return Local ? *Local : Linkname;
+}
+
+static bool ensureLibCallRoute(Module &M, StringRef CName, StringRef Linkname) {
+  NamedMDNode *Routes = M.getOrInsertNamedMetadata(c2go::kLibCallRoutesMDName);
+  for (const MDNode *Entry : Routes->operands()) {
+    if (!Entry || Entry->getNumOperands() != 2)
+      continue;
+    const auto *Name = dyn_cast_or_null<MDString>(Entry->getOperand(0));
+    const auto *Target = dyn_cast_or_null<MDString>(Entry->getOperand(1));
+    if (!Name || Name->getString() != CName)
+      continue;
+    if (!Target || Target->getString() != Linkname)
+      M.getContext().emitError("conflicting c2go libcall route for '" + CName +
+                               "'");
+    return false;
+  }
+
+  LLVMContext &Ctx = M.getContext();
+  Routes->addOperand(MDNode::get(
+      Ctx, {MDString::get(Ctx, CName), MDString::get(Ctx, Linkname)}));
+  return true;
+}
+
+static void stampMemoryLinkname(Function &F, StringRef CName,
+                                StringRef Linkname) {
+  F.addFnAttr("c2go-c-name", CName);
+  F.addFnAttr("c2go-linkname", Linkname);
+  F.addFnAttr("c2go-linkname-abi0");
+}
 
 // Runtime typed-copy helpers — provided by c2gobind's runtimeHelpers.
 //   _c2go_typedmemmove(typ *_type, dst, src unsafe.Pointer)
@@ -277,17 +316,20 @@ static Value *adaptArgAS(IRBuilder<> &B, Value *V, Type *DeclaredTy) {
 // musl's memmove -> memcpy fast path recurse back into memmove.
 //   libc.Memcpy signature: ptr(ptr, ptr, i64)
 static Function *getOrDeclareLibcMemcpy(Module &M) {
-  if (auto *F = M.getFunction(kMemcpyName)) {
+  ensureLibCallRoute(M, "memcpy", kMemcpyName);
+  StringRef Symbol = getResolvedMemorySymbol(M, kMemcpyName);
+  if (auto *F = M.getFunction(Symbol)) {
     enforceGoABI0AndOptLeaf(F, /*IsLeaf=*/false);
+    stampMemoryLinkname(*F, "memcpy", kMemcpyName);
     return F;
   }
   LLVMContext &Ctx = M.getContext();
   Type *Ptr = PointerType::getUnqual(Ctx);
   Type *I64 = Type::getInt64Ty(Ctx);
   FunctionType *FT = FunctionType::get(Ptr, {Ptr, Ptr, I64}, false);
-  Function *F =
-      Function::Create(FT, GlobalValue::ExternalLinkage, kMemcpyName, &M);
+  Function *F = Function::Create(FT, GlobalValue::ExternalLinkage, Symbol, &M);
   enforceGoABI0AndOptLeaf(F, /*IsLeaf=*/false);
+  stampMemoryLinkname(*F, "memcpy", kMemcpyName);
   return F;
 }
 
@@ -300,7 +342,9 @@ static Function *getOrDeclareLibcMemcpy(Module &M) {
 // garbage from stack, crashing on first dereference.
 //   libc.Memmove signature: ptr(ptr, ptr, i64)
 static Function *getOrDeclareLibcMemmove(Module &M) {
-  if (auto *F = M.getFunction(kMemmoveName)) {
+  ensureLibCallRoute(M, "memmove", kMemmoveName);
+  StringRef Symbol = getResolvedMemorySymbol(M, kMemmoveName);
+  if (auto *F = M.getFunction(Symbol)) {
     // #399 aux audit #4: symmetric reuse-path CC retrofit. Pre-existing
     // declarations (from earlier passes or hand-written IR fixtures)
     // could still hold the default C CC; without this enforce, the call
@@ -310,15 +354,16 @@ static Function *getOrDeclareLibcMemmove(Module &M) {
     // IsLeaf=false: libc.Memmove is a real non-leaf libc copy path and
     // RS4GC MUST statepoint-wrap it (see c2go-libc-memmove-statepoint.ll).
     enforceGoABI0AndOptLeaf(F, /*IsLeaf=*/false);
+    stampMemoryLinkname(*F, "memmove", kMemmoveName);
     return F;
   }
   LLVMContext &Ctx = M.getContext();
   Type *Ptr = PointerType::getUnqual(Ctx);
   Type *I64 = Type::getInt64Ty(Ctx);
   FunctionType *FT = FunctionType::get(Ptr, {Ptr, Ptr, I64}, false);
-  Function *F = Function::Create(FT, GlobalValue::ExternalLinkage,
-                                 kMemmoveName, &M);
+  Function *F = Function::Create(FT, GlobalValue::ExternalLinkage, Symbol, &M);
   enforceGoABI0AndOptLeaf(F, /*IsLeaf=*/false);
+  stampMemoryLinkname(*F, "memmove", kMemmoveName);
   return F;
 }
 
@@ -330,11 +375,14 @@ static Function *getOrDeclareLibcMemmove(Module &M) {
 // `sqlitepkg.bzero` shim's auto-generated ABI0 entry → SIGBUS.
 //   libc.Memset signature: ptr(ptr, i32, i64)
 static Function *getOrDeclareLibcMemset(Module &M) {
-  if (auto *F = M.getFunction(kMemsetName)) {
+  ensureLibCallRoute(M, "memset", kMemsetName);
+  StringRef Symbol = getResolvedMemorySymbol(M, kMemsetName);
+  if (auto *F = M.getFunction(Symbol)) {
     // #399 aux audit #4: symmetric reuse-path CC retrofit. Same rationale
     // as getOrDeclareLibcMemmove above — pre-declared default-CC must be
     // upgraded so the goabi0cc CallInst we emit matches.
     enforceGoABI0AndOptLeaf(F, /*IsLeaf=*/false);
+    stampMemoryLinkname(*F, "memset", kMemsetName);
     return F;
   }
   LLVMContext &Ctx = M.getContext();
@@ -342,9 +390,9 @@ static Function *getOrDeclareLibcMemset(Module &M) {
   Type *I32 = Type::getInt32Ty(Ctx);
   Type *I64 = Type::getInt64Ty(Ctx);
   FunctionType *FT = FunctionType::get(Ptr, {Ptr, I32, I64}, false);
-  Function *F = Function::Create(FT, GlobalValue::ExternalLinkage,
-                                 kMemsetName, &M);
+  Function *F = Function::Create(FT, GlobalValue::ExternalLinkage, Symbol, &M);
   enforceGoABI0AndOptLeaf(F, /*IsLeaf=*/false);
+  stampMemoryLinkname(*F, "memset", kMemsetName);
   return F;
 }
 
@@ -357,6 +405,7 @@ static CallInst *emitLibcMemsetCall(IRBuilder<> &B, Module &M, Value *Dst,
   Value *NCast = B.CreateZExtOrTrunc(N, B.getInt64Ty());
   CallInst *Call = B.CreateCall(F, {DstC, ValI32, NCast});
   Call->setCallingConv(llvm::CallingConv::GoABI0);
+  Call->addFnAttr(Attribute::NoBuiltin);
   return Call;
 }
 
@@ -393,8 +442,9 @@ static void emitTypedOrLibcCopyCall(IRBuilder<> &B, Module &M,
   Value *DstC = adaptArgAS(B, Dst, FT->getParamType(0));
   Value *SrcC = adaptArgAS(B, Src, FT->getParamType(1));
   Value *NCast = B.CreateZExtOrTrunc(N, B.getInt64Ty());
-  B.CreateCall(F, {DstC, SrcC, NCast})
-      ->setCallingConv(llvm::CallingConv::GoABI0);
+  CallInst *Call = B.CreateCall(F, {DstC, SrcC, NCast});
+  Call->setCallingConv(llvm::CallingConv::GoABI0);
+  Call->addFnAttr(Attribute::NoBuiltin);
 }
 
 // rewriteMemcpyMemmove handles c2go-libc.Memcpy and c2go-libc.Memmove.
@@ -622,9 +672,12 @@ PreservedAnalyses C2GoMemcpyTypingPass::run(Module &M,
   // PreservedAnalyses::none() rather than misreporting "no change".
   Changed |= llvm::c2go::enforceCallSiteCC(M.getFunction(kTypedMemmoveName));
   Changed |= llvm::c2go::enforceCallSiteCC(M.getFunction(kTypedMemmoveArrayName));
-  Changed |= llvm::c2go::enforceCallSiteCC(M.getFunction(kMemcpyName));
-  Changed |= llvm::c2go::enforceCallSiteCC(M.getFunction(kMemmoveName));
-  Changed |= llvm::c2go::enforceCallSiteCC(M.getFunction(kMemsetName));
+  Changed |= llvm::c2go::enforceCallSiteCC(
+      M.getFunction(getResolvedMemorySymbol(M, kMemcpyName)));
+  Changed |= llvm::c2go::enforceCallSiteCC(
+      M.getFunction(getResolvedMemorySymbol(M, kMemmoveName)));
+  Changed |= llvm::c2go::enforceCallSiteCC(
+      M.getFunction(getResolvedMemorySymbol(M, kMemsetName)));
 
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
