@@ -2273,6 +2273,51 @@ void PragmaPackHandler::HandlePragma(Preprocessor &PP,
                       /*IsReinject=*/false);
 }
 
+static bool parseC2GoManagedMaskExpr(Preprocessor &PP, Token &Tok,
+                                     uint64_t &Value);
+
+static bool parseC2GoManagedMaskPrimary(Preprocessor &PP, Token &Tok,
+                                        uint64_t &Value) {
+  if (Tok.is(tok::numeric_constant)) {
+    if (PP.parseSimpleIntegerLiteral(Tok, Value))
+      return true;
+    PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_integer)
+        << 0 << 7 << "c2go";
+    return false;
+  }
+
+  if (Tok.is(tok::l_paren)) {
+    PP.Lex(Tok);
+    if (!parseC2GoManagedMaskExpr(PP, Tok, Value))
+      return false;
+    if (Tok.isNot(tok::r_paren)) {
+      PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_rparen) << "c2go";
+      return false;
+    }
+    PP.Lex(Tok);
+    return true;
+  }
+
+  PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_integer)
+      << 0 << 7 << "c2go";
+  return false;
+}
+
+static bool parseC2GoManagedMaskExpr(Preprocessor &PP, Token &Tok,
+                                     uint64_t &Value) {
+  if (!parseC2GoManagedMaskPrimary(PP, Tok, Value))
+    return false;
+
+  while (Tok.is(tok::pipe)) {
+    PP.Lex(Tok);
+    uint64_t RHS = 0;
+    if (!parseC2GoManagedMaskPrimary(PP, Tok, RHS))
+      return false;
+    Value |= RHS;
+  }
+  return true;
+}
+
 // #pragma c2go managed push / pop      -- managed-default region
 // #pragma c2go unmanaged push / pop    -- unmanaged-default region
 // (Legacy: `#pragma c2go push / pop` -- equivalent to managed push/pop.)
@@ -2303,27 +2348,26 @@ void PragmaC2GoHandler::HandlePragma(Preprocessor &PP,
     ConsumedWorld = true;
     PP.LexUnexpandedToken(Tok);
   } else if (First->isStr("managed")) {
-    // Require `(N)`.
+    // Require a parenthesized mask expression. PP.Lex expands c2go.h's flag
+    // macros, while the deliberately small grammar accepts only integer
+    // tokens, parentheses, and bitwise OR.
     PP.LexUnexpandedToken(Tok);
     if (Tok.isNot(tok::l_paren)) {
       PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_lparen) << "c2go";
       return;
     }
-    PP.LexUnexpandedToken(Tok);
-    if (Tok.isNot(tok::numeric_constant)) {
-      PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_integer)
-          << 0 << 7 << "c2go";
+
+    PP.Lex(Tok);
+    SourceLocation MaskLoc = Tok.getLocation();
+    uint64_t Mask = 0;
+    if (!parseC2GoManagedMaskExpr(PP, Tok, Mask))
+      return;
+    if (Mask > 7) {
+      PP.Diag(MaskLoc, diag::warn_pragma_expected_integer) << 0 << 7 << "c2go";
       return;
     }
-    SmallString<16> IntBuf;
-    bool Invalid = false;
-    StringRef Spelling = PP.getSpelling(Tok, IntBuf, &Invalid);
-    if (Invalid || Spelling.getAsInteger(0, Flags)) {
-      PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_integer)
-          << 0 << 7 << "c2go";
-      return;
-    }
-    PP.LexUnexpandedToken(Tok);
+    Flags = static_cast<unsigned>(Mask);
+
     if (Tok.isNot(tok::r_paren)) {
       PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_rparen) << "c2go";
       return;

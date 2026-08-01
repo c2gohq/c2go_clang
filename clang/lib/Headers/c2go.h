@@ -82,11 +82,10 @@
 #define C2GO_GOABI0     1   /* target provides an ABI0 entry -> direct reference */
 /* (omit the 2nd arg) -> external Go symbol (ABIInternal) -> alias-then-wrap stub */
 
-/* `#pragma c2go managed(N) push` world-bit flags. N is an OR of these. The
- * pragma parser reads a single un-expanded numeric token, so it does NOT accept
- * these names or an OR expression — combine the bits into the integer literal
- * yourself; the names document the values:
- *   #pragma c2go managed(7) push   // = C2GO_FUNC | C2GO_PTR | C2GO_RECORD
+/* `#pragma c2go managed(N) push` world-bit flags. N accepts integer literals
+ * and macros combined with bitwise OR and parentheses. The final mask must be
+ * in the range 0..7:
+ *   #pragma c2go managed(C2GO_FUNC | C2GO_PTR | C2GO_RECORD) push
  *   #pragma c2go pop
  */
 #define C2GO_FUNC       1   /* declared-only funcs in scope -> internal (not import) */
