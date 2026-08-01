@@ -391,10 +391,10 @@ void Sema::Initialize() {
   if (!TUScope)
     return;
 
-  // v15: there is NO auto-managed TU-wide default. The default world is
-  // fully unmanaged (`managed(0)`); managed regions are opt-in per-region
-  // via `#pragma c2go managed(N) push/pop`. The old `-fc2go-auto-managed`
-  // flag was removed (see docs/c2go_design.md "v15 转折点" P2).
+  // There is NO auto-managed TU-wide default. The default world is fully
+  // unmanaged; managed regions are opt-in via `#pragma c2go managed push/pop`
+  // (all bits) or `managed(N)` (selected bits). The old
+  // `-fc2go-auto-managed` flag was removed.
 
   // Initialize predefined 128-bit integer types, if needed.
   if (Context.getTargetInfo().hasInt128Type() ||

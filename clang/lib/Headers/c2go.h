@@ -82,11 +82,15 @@
 #define C2GO_GOABI0     1   /* target provides an ABI0 entry -> direct reference */
 /* (omit the 2nd arg) -> external Go symbol (ABIInternal) -> alias-then-wrap stub */
 
-/* `#pragma c2go managed(N) push` world-bit flags. N accepts integer literals
- * and macros combined with bitwise OR and parentheses. The final mask must be
- * in the range 0..7:
- *   #pragma c2go managed(C2GO_FUNC | C2GO_PTR | C2GO_RECORD) push
+/* `#pragma c2go managed push` enables all managed defaults (function, pointer,
+ * and record) and is the recommended form for ordinary managed regions:
+ *   #pragma c2go managed push
  *   #pragma c2go pop
+ *
+ * Use `managed(N)` only to select individual world bits. N accepts integer
+ * literals and macros combined with bitwise OR and parentheses; the final mask
+ * must be in the range 0..7:
+ *   #pragma c2go managed(C2GO_PTR | C2GO_RECORD) push
  */
 #define C2GO_FUNC       1   /* declared-only funcs in scope -> internal (not import) */
 #define C2GO_PTR        2   /* pointers in scope -> managed (GC-scanned) */

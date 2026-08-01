@@ -10,6 +10,13 @@
 #define C2GO_DATA (C2GO_PTR | C2GO_RECORD)
 #define C2GO_NESTED ((C2GO_PTR) | (C2GO_RECORD))
 
+#pragma c2go managed push
+struct DefaultMask {
+  int *next;
+};
+int default_package_function(int);
+#pragma c2go pop
+
 #pragma c2go managed(C2GO_DATA) push
 struct MacroMask {
   int *next;
@@ -26,6 +33,13 @@ struct NestedMask {
 int current_package_function(int);
 #pragma c2go pop
 int outside_package_function(int);
+
+// CHECK-LABEL: RecordDecl {{.*}} struct DefaultMask definition
+// CHECK: C2GoStructAttr {{.*}} Implicit
+// CHECK: FieldDecl {{.*}} next 'int *'
+// CHECK-NEXT: C2GoManagedAttr {{.*}} Implicit
+// CHECK-LABEL: FunctionDecl {{.*}} default_package_function 'int (int)'
+// CHECK-NOT: C2GoUnmanagedAttr
 
 // CHECK-LABEL: RecordDecl {{.*}} struct MacroMask definition
 // CHECK: C2GoStructAttr {{.*}} Implicit

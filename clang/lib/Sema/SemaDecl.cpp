@@ -6819,9 +6819,10 @@ NamedDecl *Sema::HandleDeclarator(Scope *S, Declarator &D,
   if (OpenMP().isInOpenMPDeclareTargetContext())
     OpenMP().checkDeclIsAllowedInOpenMPTarget(nullptr, New);
 
-  // c2go v15: inside a `#pragma c2go managed(N) push` region, stamp the
-  // region's default pointer world (Ptr bit → managed, else unmanaged) onto
-  // unannotated pointer-shaped *parameter* and *variable* declarations.
+  // Inside a bare `#pragma c2go managed push` or explicit `managed(N) push`
+  // region, stamp the region's default pointer world (Ptr bit → managed,
+  // otherwise unmanaged) onto unannotated pointer-shaped *parameter* and
+  // *variable* declarations.
   // Explicit per-decl annotation still wins.
   if (getLangOpts().C2GoMode && !C2GoStack.empty()) {
     const auto &Top = C2GoStack.back();
@@ -6846,9 +6847,10 @@ NamedDecl *Sema::HandleDeclarator(Scope *S, Declarator &D,
   // c2go (model B, docs/c2go_design.md "v15 转折点"): the DEFAULT world for a
   // function is UNMANAGED. A function DECLARATION with no explicit c2go world
   // attr (and not c2go_extern / c2go_linkname) is an `unmanaged extern` import
-  // by default; the `#pragma c2go managed(N)` func bit (1) opts declared-only
-  // functions in scope INTO the internal c2go world. We stamp an *implicit*
-  // C2GoUnmanagedAttr so the existing import machinery
+  // by default; the func bit (1), enabled by bare `managed` and selectable with
+  // `managed(N)`, opts declared-only functions in scope INTO the internal c2go
+  // world. We stamp an *implicit* C2GoUnmanagedAttr so the existing import
+  // machinery
   // (isC2GoUnmanagedExternImport, manifest, the .s dispatch wrapper, boundary
   // CC) picks it up. A DEFINITION is always internal — isC2GoUnmanagedExternImport
   // checks isDefined(), so a forward decl that is later defined safely becomes
@@ -19112,13 +19114,12 @@ static bool recordContainsScannablePointer(const RecordDecl *RD) {
   return false;
 }
 
-// `#pragma c2go managed(N) push` / `#pragma c2go pop` implementation (v15).
+// Bare `#pragma c2go managed push`, explicit `managed(N) push`, and
+// `#pragma c2go pop` implementation.
 //
-// The flag bitmask N (Ptr=2, Record=4) controls which worlds default to
-// managed inside the region: Record runs struct/union inference, Ptr makes
-// unannotated pointers managed. The func bit (1) is deprecated/inert (#268):
-// the function world is decided by #290 (default CC + c2go_extern/c2go_managed
-// attributes), so `managed(1)` parses but is a no-op region.
+// Omitting N enables all managed defaults. With an explicit bitmask, Func=1
+// makes declared-only functions internal, Ptr=2 makes unannotated pointers
+// managed, and Record=4 runs conservative struct/union inference.
 // Nesting is supported; pop only unwinds one level. A bare `#pragma c2go pop`
 // outside of any push is a recoverable warning.
 void Sema::ActOnPragmaC2GoPush(SourceLocation PragmaLoc, unsigned Flags) {

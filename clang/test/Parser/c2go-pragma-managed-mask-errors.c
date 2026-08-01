@@ -14,5 +14,6 @@
 #pragma c2go managed() push // expected-warning {{expected integer between 0 and 7 inclusive in '#pragma c2go' - ignored}}
 #pragma c2go managed(C2GO_PTR |) push // expected-warning {{expected integer between 0 and 7 inclusive in '#pragma c2go' - ignored}}
 #pragma c2go managed(C2GO_PTR + C2GO_RECORD) push // expected-warning {{missing ')' after '#pragma c2go' - ignoring}}
+#pragma c2go push // expected-warning {{missing '(' after '#pragma c2go' - ignoring}}
 
 int value;

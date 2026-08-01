@@ -2087,9 +2087,10 @@ public:
   /// VisContext - Manages the stack for \#pragma GCC visibility.
   void *VisContext; // Really a "PragmaVisStack*"
 
-  /// C2GoPragmaEntry — one frame on the c2go pragma stack (v15). Tracks the
-  /// `#pragma c2go managed(N) push` location plus the flag bitmask N that
-  /// controls which worlds default to managed inside the region.
+  /// C2GoPragmaEntry — one frame on the c2go pragma stack. Tracks a bare
+  /// `#pragma c2go managed push` or explicit `managed(N) push` location plus
+  /// the flag bitmask controlling which worlds default to managed. The bare
+  /// form enables all three bits.
   struct C2GoPragmaEntry {
     SourceLocation Loc;
     unsigned Flags; // bitmask: Func=1, Ptr=2, Record=4
@@ -2109,11 +2110,11 @@ public:
     bool recordAnalyze() const { return Flags & Record; }
   };
 
-  /// C2GoStack - currently active `#pragma c2go managed(N) push` regions
-  /// (v15). The top frame's Flags drive: record analysis (Record bit) and
-  /// the default pointer world for unannotated pointers/fields (Ptr bit).
-  /// The func bit (1) is deprecated/inert (#268). An empty stack means
-  /// fully unmanaged (`managed(0)`).
+  /// C2GoStack - active bare `#pragma c2go managed push` or explicit
+  /// `#pragma c2go managed(N) push` regions. The top frame's Flags drive the
+  /// default function world (Func bit), pointer world for unannotated
+  /// pointers/fields (Ptr bit), and record inference (Record bit). An empty
+  /// stack means fully unmanaged.
   SmallVector<C2GoPragmaEntry, 4> C2GoStack;
 
   /// This an attribute introduced by \#pragma clang attribute.
@@ -4422,9 +4423,9 @@ public:
   /// a diagnostic about an unmarked hybrid that touches a c2go record.
   bool analyzeC2GoStruct(RecordDecl *RD);
 
-  /// `#pragma c2go managed(N) push` / `pop` (v15) -- a region between push
-  /// and pop applies the flag bitmask N (Ptr=2, Record=4; the func bit 1 is
-  /// deprecated/inert, #268) as the default managed worlds inside it. Nested
+  /// `#pragma c2go managed push` or `managed(N) push` / `pop` -- a region
+  /// between push and pop applies all managed defaults in the bare form, or
+  /// selected flag bits (Func=1, Ptr=2, Record=4) when N is present. Nested
   /// push works like a stack; pop only unwinds one level. Mis-paired pop emits
   /// a diagnostic.
   void ActOnPragmaC2GoPush(SourceLocation PragmaLoc, unsigned Flags);

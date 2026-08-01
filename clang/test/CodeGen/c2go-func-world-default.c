@@ -1,8 +1,8 @@
 // c2go function-world default (docs/c2go_design.md "v15 转折点"): the DEFAULT
 // world for a function is UNMANAGED — a plain declared-only function is an
-// `unmanaged extern` IMPORT. The `#pragma c2go managed(N)` func bit (1) opts
-// declared-only functions in scope INTO the internal c2go world. A DEFINED
-// function is always internal regardless of the func bit.
+// `unmanaged extern` IMPORT. Bare `#pragma c2go managed push` enables every
+// managed bit, including the func bit (1), and opts declared-only functions in
+// scope INTO the internal c2go world. A DEFINED function is always internal.
 //
 // REQUIRES: aarch64-registered-target
 //
@@ -13,9 +13,9 @@
 // Plain declared-only function, no attr, no pragma -> implicit-default IMPORT.
 int imp_default(int x);
 
-// Declared-only function inside a func-bit region (managed(7) = Func|Ptr|Record)
-// -> internal reference, NOT an import.
-#pragma c2go managed(7) push
+// Declared-only function inside the default all-managed region -> internal
+// reference, NOT an import.
+#pragma c2go managed push
 int internal_ref(int x);
 #pragma c2go pop
 

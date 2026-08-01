@@ -2273,6 +2273,8 @@ void PragmaPackHandler::HandlePragma(Preprocessor &PP,
                       /*IsReinject=*/false);
 }
 
+static constexpr unsigned C2GoManagedAllMask = 7;
+
 static bool parseC2GoManagedMaskExpr(Preprocessor &PP, Token &Tok,
                                      uint64_t &Value);
 
@@ -2282,7 +2284,7 @@ static bool parseC2GoManagedMaskPrimary(Preprocessor &PP, Token &Tok,
     if (PP.parseSimpleIntegerLiteral(Tok, Value))
       return true;
     PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_integer)
-        << 0 << 7 << "c2go";
+        << 0 << C2GoManagedAllMask << "c2go";
     return false;
   }
 
@@ -2299,7 +2301,7 @@ static bool parseC2GoManagedMaskPrimary(Preprocessor &PP, Token &Tok,
   }
 
   PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_integer)
-      << 0 << 7 << "c2go";
+      << 0 << C2GoManagedAllMask << "c2go";
   return false;
 }
 
@@ -2318,9 +2320,9 @@ static bool parseC2GoManagedMaskExpr(Preprocessor &PP, Token &Tok,
   return true;
 }
 
-// #pragma c2go managed push / pop      -- managed-default region
-// #pragma c2go unmanaged push / pop    -- unmanaged-default region
-// (Legacy: `#pragma c2go push / pop` -- equivalent to managed push/pop.)
+// #pragma c2go managed push / pop       -- all managed defaults enabled
+// #pragma c2go managed(N) push / pop    -- selected managed defaults enabled
+// #pragma c2go unmanaged push / pop     -- unmanaged-default region
 //
 // Push/pop is stack-balanced. An unbalanced push at end of file warns.
 //
@@ -2337,10 +2339,10 @@ void PragmaC2GoHandler::HandlePragma(Preprocessor &PP,
     return;
   }
 
-  // v15 form: `c2go managed(N) push` / `c2go unmanaged push` / `c2go pop`.
-  // N is a flag bitmask (Func=1, Ptr=2, Record=4, OR-able). `unmanaged` is
-  // sugar for `managed(0)`. A bare `managed push` (no mask) is an error;
-  // so is a bare `push`. See docs/c2go_design.md "v15 转折点" P2.
+  // `c2go managed push` enables every managed default. The optional explicit
+  // mask in `c2go managed(N) push` selects individual defaults (Func=1, Ptr=2,
+  // Record=4, OR-able). `unmanaged` is sugar for a zero mask. A bare `push`
+  // still has no world and is rejected.
   unsigned Flags = 0;
   bool ConsumedWorld = false;
   if (First->isStr("unmanaged")) {
@@ -2348,32 +2350,30 @@ void PragmaC2GoHandler::HandlePragma(Preprocessor &PP,
     ConsumedWorld = true;
     PP.LexUnexpandedToken(Tok);
   } else if (First->isStr("managed")) {
-    // Require a parenthesized mask expression. PP.Lex expands c2go.h's flag
-    // macros, while the deliberately small grammar accepts only integer
-    // tokens, parentheses, and bitwise OR.
-    PP.LexUnexpandedToken(Tok);
-    if (Tok.isNot(tok::l_paren)) {
-      PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_lparen) << "c2go";
-      return;
-    }
-
-    PP.Lex(Tok);
-    SourceLocation MaskLoc = Tok.getLocation();
-    uint64_t Mask = 0;
-    if (!parseC2GoManagedMaskExpr(PP, Tok, Mask))
-      return;
-    if (Mask > 7) {
-      PP.Diag(MaskLoc, diag::warn_pragma_expected_integer) << 0 << 7 << "c2go";
-      return;
-    }
-    Flags = static_cast<unsigned>(Mask);
-
-    if (Tok.isNot(tok::r_paren)) {
-      PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_rparen) << "c2go";
-      return;
-    }
+    Flags = C2GoManagedAllMask;
     ConsumedWorld = true;
     PP.LexUnexpandedToken(Tok);
+    if (Tok.is(tok::l_paren)) {
+      // PP.Lex expands c2go.h's flag macros, while the deliberately small mask
+      // grammar accepts only integer tokens, parentheses, and bitwise OR.
+      PP.Lex(Tok);
+      SourceLocation MaskLoc = Tok.getLocation();
+      uint64_t Mask = 0;
+      if (!parseC2GoManagedMaskExpr(PP, Tok, Mask))
+        return;
+      if (Mask > C2GoManagedAllMask) {
+        PP.Diag(MaskLoc, diag::warn_pragma_expected_integer)
+            << 0 << C2GoManagedAllMask << "c2go";
+        return;
+      }
+      Flags = static_cast<unsigned>(Mask);
+
+      if (Tok.isNot(tok::r_paren)) {
+        PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_rparen) << "c2go";
+        return;
+      }
+      PP.LexUnexpandedToken(Tok);
+    }
   }
 
   const IdentifierInfo *Action = Tok.getIdentifierInfo();
@@ -2382,7 +2382,7 @@ void PragmaC2GoHandler::HandlePragma(Preprocessor &PP,
     return;
   }
   bool IsPush = Action->isStr("push");
-  // v15: a push must specify a world — `managed(N)` or `unmanaged`.
+  // A push must specify a world — `managed`, `managed(N)`, or `unmanaged`.
   if (IsPush && !ConsumedWorld) {
     PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_lparen) << "c2go";
     return;
