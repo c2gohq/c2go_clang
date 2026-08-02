@@ -575,11 +575,18 @@ AArch64RegisterInfo::getReservedRegs(const MachineFunction &MF) const {
       markSuperRegs(Reserved, AArch64::GPR32commonRegClass.getRegister(i));
   }
 
-  if (MF.getSubtarget<AArch64Subtarget>().isLRReservedForRA()) {
+  const Function &F = MF.getFunction();
+  const bool IsC2GoMode =
+      F.getCallingConv() == CallingConv::GoABI0 ||
+      F.getParent()->getModuleFlag(llvm::c2go::kGoabiModuleFlag) != nullptr;
+  if (MF.getSubtarget<AArch64Subtarget>().isLRReservedForRA() || IsC2GoMode) {
     // In order to prevent the register allocator from using LR, we need to
     // mark it as reserved. However we don't want to keep it reserved throughout
     // the pipeline since it prevents other infrastructure from reasoning about
-    // it's liveness. We use the NoVRegs property instead of IsSSA because
+    // its liveness. c2go additionally relies on this because the Go assembler
+    // only saves LR for functions containing calls; an LLVM leaf that used LR
+    // as scratch would otherwise return to scratch data. We use the NoVRegs
+    // property instead of IsSSA because
     // IsSSA is removed before VirtRegRewriter runs.
     if (!MF.getProperties().hasNoVRegs())
       // Reserve LR (X30) by marking from its subregister W30 because otherwise
