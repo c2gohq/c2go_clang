@@ -600,6 +600,27 @@ int main(int argc, char **argv) {
     return ExitToolError;
   }
 
+  // Embedded manifests are per-TU metadata. IRMover appends operands from
+  // modules that have the named metadata, but it cannot record that another
+  // input had no metadata at all. Without this pre-link presence check, mixing
+  // legacy and schema-v2 bitcode would silently rebuild the archive manifest
+  // from only the newer TUs. All-legacy input remains supported by the
+  // reconstruction fallback; mixed generations fail closed.
+  const bool InputsHaveEmbeddedManifest =
+      Composite->getNamedMetadata("c2go.manifest.json") != nullptr;
+  auto requiresEmbeddedManifest = [](const Module &M) {
+    Metadata *MD = M.getModuleFlag(c2go::kManifestSchemaModuleFlag);
+    auto *CAM = dyn_cast_or_null<ConstantAsMetadata>(MD);
+    auto *CI = CAM ? dyn_cast<ConstantInt>(CAM->getValue()) : nullptr;
+    return CI && CI->getZExtValue() >= c2go::kManifestSchemaVersion;
+  };
+  if (requiresEmbeddedManifest(*Composite) && !InputsHaveEmbeddedManifest) {
+    errs() << argv[0] << ": error: schema-v" << c2go::kManifestSchemaVersion
+           << " c2go bitcode '" << InputFiles[0]
+           << "' is missing embedded c2go.manifest.json metadata\n";
+    return ExitToolError;
+  }
+
   // Preserve the producer's optimization level. It gates the cross-TU inliner
   // and selects statepoint GC at -O2+ versus the lightweight safepoint path at
   // -O0/-O1; it does not make c2go-lto impose an extra generic opt pipeline.
@@ -644,6 +665,22 @@ int main(int argc, char **argv) {
     std::unique_ptr<Module> Mod = parseIRFile(InputFiles[i], Err, Context);
     if (!Mod) {
       Err.print(argv[0], errs());
+      return ExitToolError;
+    }
+    const bool ThisInputHasEmbeddedManifest =
+        Mod->getNamedMetadata("c2go.manifest.json") != nullptr;
+    if (requiresEmbeddedManifest(*Mod) && !ThisInputHasEmbeddedManifest) {
+      errs() << argv[0] << ": error: schema-v" << c2go::kManifestSchemaVersion
+             << " c2go bitcode '" << InputFiles[i]
+             << "' is missing embedded c2go.manifest.json metadata\n";
+      return ExitToolError;
+    }
+    if (ThisInputHasEmbeddedManifest != InputsHaveEmbeddedManifest) {
+      errs() << argv[0]
+             << ": error: cannot mix c2go bitcode with and without embedded "
+                "manifests ('"
+             << InputFiles[0] << "' vs '" << InputFiles[i]
+             << "'); regenerate all objects with one c2go-clang contract\n";
       return ExitToolError;
     }
     recordBoundaries(*Mod, InputFiles[i]);

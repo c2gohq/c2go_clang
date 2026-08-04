@@ -100,6 +100,13 @@ inline constexpr StringLiteral kTargetFeaturesFlag = "c2go.target-features";
 /// and Plan 9 symbol suffix.
 inline constexpr StringLiteral kPackagePathModuleFlag = "c2go.pkgpath";
 
+/// Schema generation expected in the per-TU c2go.manifest.json metadata.
+/// Schema v2 and later must never fall back to the lossy legacy IR
+/// reconstruction path when that metadata is missing.
+inline constexpr StringLiteral kManifestSchemaModuleFlag =
+    "c2go.manifest.schema";
+inline constexpr unsigned kManifestSchemaVersion = 2;
+
 /// Module flag carrying the running count of CC (calling-convention)
 /// violations detected by C2GoCommon::enforceCallSiteCC. Merged with
 /// Module::Max across TUs at link time.

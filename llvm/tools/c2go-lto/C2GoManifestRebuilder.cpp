@@ -57,34 +57,167 @@ namespace c2go {
 // construction — the only WF2-specific work is this cross-TU merge (the LTO step:
 // one operand per linked TU after llvm-link appends them).
 static std::optional<json::Object>
-extractEmbeddedC2GoManifest(Module &Composite) {
+extractEmbeddedC2GoManifest(Module &Composite, StringRef ProgName,
+                            bool &HadError) {
+  HadError = false;
   NamedMDNode *NMD = Composite.getNamedMetadata("c2go.manifest.json");
   if (!NMD)
     return std::nullopt;
   SmallVector<json::Object, 4> Ms;
+  unsigned OperandIndex = 0;
   for (const MDNode *Op : NMD->operands()) {
-    if (Op->getNumOperands() != 1)
-      continue;
+    if (Op->getNumOperands() != 1) {
+      errs() << ProgName << ": malformed c2go.manifest.json operand "
+             << OperandIndex << " (expected one JSON string)\n";
+      HadError = true;
+      return std::nullopt;
+    }
     auto *S = dyn_cast<MDString>(Op->getOperand(0));
-    if (!S)
-      continue;
+    if (!S) {
+      errs() << ProgName << ": malformed c2go.manifest.json operand "
+             << OperandIndex << " (expected a JSON string)\n";
+      HadError = true;
+      return std::nullopt;
+    }
     Expected<json::Value> V = json::parse(S->getString());
     if (!V) {
       consumeError(V.takeError());
-      continue;
+      errs() << ProgName << ": malformed c2go.manifest.json operand "
+             << OperandIndex << " (invalid JSON)\n";
+      HadError = true;
+      return std::nullopt;
     }
-    if (json::Object *O = V->getAsObject())
-      Ms.push_back(std::move(*O));
+    json::Object *O = V->getAsObject();
+    if (!O) {
+      errs() << ProgName << ": malformed c2go.manifest.json operand "
+             << OperandIndex << " (top level must be an object)\n";
+      HadError = true;
+      return std::nullopt;
+    }
+    Ms.push_back(std::move(*O));
+    ++OperandIndex;
   }
-  if (Ms.empty())
+  if (Ms.empty()) {
+    errs() << ProgName
+           << ": c2go.manifest.json metadata has no manifest operands\n";
+    HadError = true;
     return std::nullopt;
+  }
   if (Ms.size() == 1)
     return std::move(Ms.front());
 
-  // Multiple linked TUs: keep the module-scalar fields (pkgpath, versions,
-  // goos/goarch) from the first TU; union each per-entity array — concatenate
-  // across TUs, de-duplicate by "name", then re-sort by "name" to match the
-  // per-section ordering WF1 emits.
+  // Multiple linked TUs may contribute entity arrays, but every module-level
+  // field must be identical. In particular, silently taking schema/contract
+  // epochs from the first TU would allow objects produced by incompatible
+  // c2go-clang versions to be packaged as one library. Compare every field
+  // except the explicitly mergeable sections so future scalar contract fields
+  // also fail closed until this merger understands them.
+  const json::Object &First = Ms.front();
+  bool ProviderEpoch =
+      First.getInteger("schema_version").value_or(0) == 2 &&
+      First.getString("compatibility_model").value_or("") == "provider_epoch";
+  auto isMergeableField = [&](StringRef Key) {
+    if (Key == "symbols" || Key == "linknames" || Key == "callbacks" ||
+        Key == "types" || Key == "module_gcmask")
+      return true;
+    // These fields are validation provenance, not compatibility identifiers.
+    // Their conservative intersection is computed after all true scalar fields
+    // (including schema and both epochs) have matched.
+    return ProviderEpoch && (Key == "min_go_version" ||
+                             Key == "validation_snapshot_max_exclusive");
+  };
+  auto renderValue = [](const json::Value &V) {
+    std::string Text;
+    raw_string_ostream OS(Text);
+    OS << formatv("{0}", V);
+    return Text;
+  };
+  auto reportMismatch = [&](StringRef Key, unsigned ManifestIndex) {
+    errs() << ProgName << ": embedded c2go manifest scalar field '" << Key
+           << "' differs between inputs 0 and " << ManifestIndex << "\n";
+    HadError = true;
+  };
+  for (unsigned I = 1; I < Ms.size(); ++I) {
+    const json::Object &Current = Ms[I];
+    for (const auto &KV : First) {
+      StringRef Key = KV.first;
+      if (isMergeableField(Key))
+        continue;
+      auto It = Current.find(Key);
+      if (It == Current.end() ||
+          renderValue(KV.second) != renderValue(It->second)) {
+        reportMismatch(Key, I);
+        return std::nullopt;
+      }
+    }
+    for (const auto &KV : Current) {
+      StringRef Key = KV.first;
+      if (!isMergeableField(Key) && First.find(Key) == First.end()) {
+        reportMismatch(Key, I);
+        return std::nullopt;
+      }
+    }
+  }
+
+  std::string MergedMinGoVersion;
+  std::string MergedValidationMax;
+  if (ProviderEpoch) {
+    unsigned MergedMinMinor = 0;
+    unsigned MergedMaxMinor = 0;
+    auto readGoLanguageVersion = [&](const json::Object &M, StringRef Key,
+                                     unsigned ManifestIndex, unsigned &Minor,
+                                     std::string &Spelling) -> bool {
+      std::optional<StringRef> Value = M.getString(Key);
+      StringRef Rest = Value.value_or("");
+      if (!Rest.consume_front("go1.") || Rest.empty() ||
+          Rest.getAsInteger(10, Minor)) {
+        errs() << ProgName << ": embedded c2go manifest " << ManifestIndex
+               << " has invalid " << Key
+               << " (expected a Go language version such as go1.25)\n";
+        HadError = true;
+        return false;
+      }
+      Spelling = Value->str();
+      return true;
+    };
+
+    for (unsigned I = 0; I < Ms.size(); ++I) {
+      unsigned MinMinor = 0, MaxMinor = 0;
+      std::string MinSpelling, MaxSpelling;
+      if (!readGoLanguageVersion(Ms[I], "min_go_version", I, MinMinor,
+                                 MinSpelling) ||
+          !readGoLanguageVersion(Ms[I], "validation_snapshot_max_exclusive", I,
+                                 MaxMinor, MaxSpelling))
+        return std::nullopt;
+      if (MinMinor >= MaxMinor) {
+        errs() << ProgName << ": embedded c2go manifest " << I
+               << " has empty validation snapshot [" << MinSpelling << ", "
+               << MaxSpelling << ")\n";
+        HadError = true;
+        return std::nullopt;
+      }
+      if (I == 0 || MinMinor > MergedMinMinor) {
+        MergedMinMinor = MinMinor;
+        MergedMinGoVersion = std::move(MinSpelling);
+      }
+      if (I == 0 || MaxMinor < MergedMaxMinor) {
+        MergedMaxMinor = MaxMinor;
+        MergedValidationMax = std::move(MaxSpelling);
+      }
+    }
+    if (MergedMinMinor >= MergedMaxMinor) {
+      errs() << ProgName
+             << ": embedded schema-v2 validation snapshots do not overlap: "
+                "merged range ["
+             << MergedMinGoVersion << ", " << MergedValidationMax << ")\n";
+      HadError = true;
+      return std::nullopt;
+    }
+  }
+
+  // Union each per-entity array: concatenate across TUs, de-duplicate by
+  // "name", then re-sort by "name" to match the per-section ordering WF1
+  // emits.
   auto nameOf = [](const json::Value &V) -> StringRef {
     if (const json::Object *O = V.getAsObject())
       if (std::optional<StringRef> N = O->getString("name"))
@@ -127,6 +260,10 @@ extractEmbeddedC2GoManifest(Module &Composite) {
   json::Array MS = mergeArray("symbols"), ML = mergeArray("linknames"),
               MC = mergeArray("callbacks"), MT = mergeArray("types");
   json::Object Out(std::move(Ms.front())); // scalar fields from the first TU
+  if (ProviderEpoch) {
+    Out["min_go_version"] = std::move(MergedMinGoVersion);
+    Out["validation_snapshot_max_exclusive"] = std::move(MergedValidationMax);
+  }
   // Match WF1's section presence exactly (CodeGenAction::buildC2GoManifest):
   // symbols / linknames / types are emitted unconditionally (empty [] included);
   // callbacks only when non-empty.
@@ -155,7 +292,11 @@ rebuildManifestFromIR(Module &Composite, bool Build,
   // reconstruction (which silently drifted from WF1: cabi/callbacks/var-linknames/
   // imported were all lost). Falls through to reconstruction only for pre-embed
   // bitcode (Embedded == nullopt).
-  std::optional<json::Object> Embedded = extractEmbeddedC2GoManifest(Composite);
+  bool EmbeddedManifestError = false;
+  std::optional<json::Object> Embedded =
+      extractEmbeddedC2GoManifest(Composite, ProgName, EmbeddedManifestError);
+  if (EmbeddedManifestError)
+    return ManifestRebuildStatus::ToolError;
 
   // c2go WF2 (#319, M4 minimal): optional manifest rebuild from combined
   // bitcode. Reads c2go.pkgpath / c2go.target_go_version module flags and the

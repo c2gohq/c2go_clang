@@ -502,24 +502,44 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
                        ? "main"
                        : LangOpts.C2GoPackagePath;
 
-  // c2go version anchoring (docs/c2go/versioning.md): stamp the toolchain's
-  // epoch constants into every manifest (carried verbatim into WF2 bitcode).
-  // c2go-bind asserts the consumer's c2go_abi_epoch lies in the linked
-  // c2go-libc's accepted [C2GoABIEpochMin, C2GoABIEpochMax] range; go_contract_
-  // epoch records the Go-internal contract generation this artifact was emitted
-  // for. Bump c2go_abi_epoch ONLY on an intentional c2go ABI break; keep both
-  // in sync with c2go-libc's version consts and c2go-bind's defaults.
+  // c2go version anchoring (docs/c2go/versioning.md): schema v2 removes the
+  // per-artifact future-Go hard gate. The generated package records both
+  // independent contract axes; c2go-bind emits compile-time assertions against
+  // the c2goabi provider shipped by c2go-libc. Unknown future Go versions are
+  // rejected once, by that provider, rather than by every frozen artifact.
+  Root["schema_version"] = llvm::c2go::kManifestSchemaVersion;
+  Root["compatibility_model"] = "provider_epoch";
   Root["c2go_abi_epoch"] = 1;
-  Root["go_contract_epoch"] = 1;
+  Root["go_toolchain_contract_epoch"] = 1;
 
-  // Parse "<lo>-<hi>" from -fc2go-target-go-version (default "1.22-1.25").
+  // Parse "<lo>-<hi>" from -fc2go-target-go-version. `lo` remains the actual
+  // minimum build version. `hi` is provenance only: the exclusive end of the
+  // validation snapshot for this producer, never a generated build constraint.
   StringRef VerRange = LangOpts.C2GoTargetGoVersion;
-  if (VerRange.empty()) VerRange = "1.22-1.25";
+  if (VerRange.empty())
+    VerRange = "1.25-1.27";
   auto Dash = VerRange.find('-');
   StringRef Lo = Dash == StringRef::npos ? VerRange : VerRange.substr(0, Dash);
   StringRef Hi = Dash == StringRef::npos ? VerRange : VerRange.substr(Dash + 1);
+  auto parseGoLanguageVersion = [](StringRef Version, unsigned &Minor) {
+    return Version.consume_front("1.") && !Version.empty() &&
+           !Version.getAsInteger(10, Minor);
+  };
+  unsigned LoMinor = 0, HiMinor = 0;
+  if (Dash == StringRef::npos || !parseGoLanguageVersion(Lo, LoMinor) ||
+      !parseGoLanguageVersion(Hi, HiMinor) || LoMinor >= HiMinor) {
+    unsigned DiagID = Diags.getCustomDiagID(
+        DiagnosticsEngine::Error,
+        "invalid value '%0' for -fc2go-target-go-version; expected "
+        "<1.min>-<1.max> with min < max (for example 1.25-1.27)");
+    Diags.Report(DiagID) << VerRange;
+    // Keep the in-memory manifest well-formed while normal compilation failure
+    // propagates the diagnostic to the driver.
+    Lo = "1.25";
+    Hi = "1.27";
+  }
   Root["min_go_version"] = ("go" + Lo).str();
-  Root["max_go_version"] = ("go" + Hi).str();
+  Root["validation_snapshot_max_exclusive"] = ("go" + Hi).str();
 
   // Record the target as Go's GOOS/GOARCH so c2go-bind derives the per-OS
   // extern dispatch (unix cgocall vs windows syscall.SyscallN) and the

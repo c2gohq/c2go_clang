@@ -1,0 +1,125 @@
+# Embedded per-TU manifests may merge entity arrays, but their module-level
+# schema and contract fields must agree. Taking those fields from the first TU
+# would hide a mixed c2go-clang toolchain and could stamp the resulting archive
+# with the wrong ABI contract.
+
+# RUN: rm -rf %t && split-file %s %t
+# RUN: not c2go-lto %t/epoch1.ll %t/epoch2.ll \
+# RUN:   --c2go-emit-manifest=%t/epoch.json 2>&1 | FileCheck %s --check-prefix=EPOCH
+# RUN: not c2go-lto %t/epoch1.ll %t/schema1.ll \
+# RUN:   --c2go-emit-manifest=%t/schema.json 2>&1 | FileCheck %s --check-prefix=SCHEMA
+# RUN: c2go-lto %t/epoch1.ll %t/wider-snapshot.ll \
+# RUN:   --c2go-emit-manifest=%t/intersection.json
+# RUN: grep -q '"min_go_version": "go1.25"' %t/intersection.json
+# RUN: grep -q '"validation_snapshot_max_exclusive": "go1.26"' %t/intersection.json
+# RUN: not c2go-lto %t/epoch1.ll %t/disjoint-snapshot.ll \
+# RUN:   --c2go-emit-manifest=%t/disjoint.json 2>&1 | FileCheck %s --check-prefix=DISJOINT
+# RUN: not c2go-lto %t/malformed.ll --c2go-emit-manifest=%t/malformed.json \
+# RUN:   2>&1 | FileCheck %s --check-prefix=MALFORMED
+# RUN: not c2go-lto %t/epoch1.ll %t/legacy-no-manifest.ll \
+# RUN:   --c2go-emit-manifest=%t/mixed-presence.json 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=MIXED-PRESENCE
+
+# EPOCH: embedded c2go manifest scalar field 'go_toolchain_contract_epoch' differs between inputs 0 and 1
+# SCHEMA: embedded c2go manifest scalar field
+# SCHEMA-SAME: differs between inputs 0 and 1
+# DISJOINT: embedded schema-v2 validation snapshots do not overlap
+# MALFORMED: malformed c2go.manifest.json operand 0 (invalid JSON)
+# MIXED-PRESENCE: cannot mix c2go bitcode with and without embedded manifests
+# MIXED-PRESENCE-SAME: regenerate all objects with one c2go-clang contract
+
+#--- epoch1.ll
+target triple = "aarch64-unknown-unknown-elf"
+
+define i32 @epoch1() {
+  ret i32 1
+}
+
+!llvm.module.flags = !{!0, !1, !2}
+!0 = !{i32 1, !"c2go.goabi", i32 1}
+!1 = !{i32 1, !"c2go.pkgpath", !"example.com/mixed"}
+!2 = !{i32 1, !"c2go.manifest.schema", i32 2}
+!c2go.manifest.json = !{!3}
+!3 = !{!"{\22schema_version\22:2,\22compatibility_model\22:\22provider_epoch\22,\22pkgpath\22:\22example.com/mixed\22,\22min_go_version\22:\22go1.25\22,\22validation_snapshot_max_exclusive\22:\22go1.26\22,\22c2go_abi_epoch\22:1,\22go_toolchain_contract_epoch\22:1,\22symbols\22:[],\22linknames\22:[],\22types\22:[],\22module_gcmask\22:{\22vars\22:[]}}"}
+
+#--- epoch2.ll
+target triple = "aarch64-unknown-unknown-elf"
+
+define i32 @epoch2() {
+  ret i32 2
+}
+
+!llvm.module.flags = !{!0, !1, !2}
+!0 = !{i32 1, !"c2go.goabi", i32 1}
+!1 = !{i32 1, !"c2go.pkgpath", !"example.com/mixed"}
+!2 = !{i32 1, !"c2go.manifest.schema", i32 2}
+!c2go.manifest.json = !{!3}
+!3 = !{!"{\22schema_version\22:2,\22compatibility_model\22:\22provider_epoch\22,\22pkgpath\22:\22example.com/mixed\22,\22min_go_version\22:\22go1.25\22,\22validation_snapshot_max_exclusive\22:\22go1.26\22,\22c2go_abi_epoch\22:1,\22go_toolchain_contract_epoch\22:2,\22symbols\22:[],\22linknames\22:[],\22types\22:[],\22module_gcmask\22:{\22vars\22:[]}}"}
+
+#--- schema1.ll
+target triple = "aarch64-unknown-unknown-elf"
+
+define i32 @schema1() {
+  ret i32 3
+}
+
+!llvm.module.flags = !{!0, !1, !2}
+!0 = !{i32 1, !"c2go.goabi", i32 1}
+!1 = !{i32 1, !"c2go.target_go_version", !"1.25-1.26"}
+!2 = !{i32 1, !"c2go.pkgpath", !"example.com/mixed"}
+!c2go.manifest.json = !{!3}
+!3 = !{!"{\22pkgpath\22:\22example.com/mixed\22,\22min_go_version\22:\22go1.22\22,\22max_go_version\22:\22go1.26\22,\22c2go_abi_epoch\22:1,\22go_contract_epoch\22:1,\22symbols\22:[],\22linknames\22:[],\22types\22:[],\22module_gcmask\22:{\22vars\22:[]}}"}
+
+#--- wider-snapshot.ll
+target triple = "aarch64-unknown-unknown-elf"
+
+define i32 @wider_snapshot() {
+  ret i32 4
+}
+
+!llvm.module.flags = !{!0, !1, !2}
+!0 = !{i32 1, !"c2go.goabi", i32 1}
+!1 = !{i32 1, !"c2go.pkgpath", !"example.com/mixed"}
+!2 = !{i32 1, !"c2go.manifest.schema", i32 2}
+!c2go.manifest.json = !{!3}
+!3 = !{!"{\22schema_version\22:2,\22compatibility_model\22:\22provider_epoch\22,\22pkgpath\22:\22example.com/mixed\22,\22min_go_version\22:\22go1.24\22,\22validation_snapshot_max_exclusive\22:\22go1.28\22,\22c2go_abi_epoch\22:1,\22go_toolchain_contract_epoch\22:1,\22symbols\22:[],\22linknames\22:[],\22types\22:[],\22module_gcmask\22:{\22vars\22:[]}}"}
+
+#--- disjoint-snapshot.ll
+target triple = "aarch64-unknown-unknown-elf"
+
+define i32 @disjoint_snapshot() {
+  ret i32 5
+}
+
+!llvm.module.flags = !{!0, !1, !2}
+!0 = !{i32 1, !"c2go.goabi", i32 1}
+!1 = !{i32 1, !"c2go.pkgpath", !"example.com/mixed"}
+!2 = !{i32 1, !"c2go.manifest.schema", i32 2}
+!c2go.manifest.json = !{!3}
+!3 = !{!"{\22schema_version\22:2,\22compatibility_model\22:\22provider_epoch\22,\22pkgpath\22:\22example.com/mixed\22,\22min_go_version\22:\22go1.26\22,\22validation_snapshot_max_exclusive\22:\22go1.27\22,\22c2go_abi_epoch\22:1,\22go_toolchain_contract_epoch\22:1,\22symbols\22:[],\22linknames\22:[],\22types\22:[],\22module_gcmask\22:{\22vars\22:[]}}"}
+
+#--- malformed.ll
+target triple = "aarch64-unknown-unknown-elf"
+
+define i32 @malformed() {
+  ret i32 6
+}
+
+!llvm.module.flags = !{!0, !1, !2}
+!0 = !{i32 1, !"c2go.goabi", i32 1}
+!1 = !{i32 1, !"c2go.pkgpath", !"example.com/mixed"}
+!2 = !{i32 1, !"c2go.manifest.schema", i32 2}
+!c2go.manifest.json = !{!3}
+!3 = !{!"not-json"}
+
+#--- legacy-no-manifest.ll
+target triple = "aarch64-unknown-unknown-elf"
+
+define i32 @legacy_no_manifest() {
+  ret i32 7
+}
+
+!llvm.module.flags = !{!0, !1, !2}
+!0 = !{i32 1, !"c2go.goabi", i32 1}
+!1 = !{i32 1, !"c2go.target_go_version", !"1.25-1.26"}
+!2 = !{i32 1, !"c2go.pkgpath", !"example.com/mixed"}

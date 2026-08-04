@@ -72,7 +72,22 @@
 // RUN: llvm-ar t %t.a | FileCheck %s --check-prefix=ARCHIVE
 //
 // PRELINK-IR: !{i32 1, !"c2go.lto.prelink", i32 1}
+// PRELINK-IR: !{i32 1, !"c2go.manifest.schema", i32 2}
+// PRELINK-IR-NOT: !"c2go.target_go_version"
 // ARCHIVE: {{.*}}.s
 // ARCHIVE: {{.*}}.c2go-export.json
+
+// Schema-v2 validation snapshots are provenance rather than identity. Objects
+// with the same contract epochs may carry different snapshots; c2go-lto takes
+// their conservative intersection instead of forcing regeneration.
+// RUN: %clang --target=aarch64-unknown-none-goabi -fc2go -fc2go-package=t \
+// RUN:   -fc2go-target-go-version=1.25-1.27 -O2 -c %s -o %t.snapshot-a.o
+// RUN: %clang --target=aarch64-unknown-none-goabi -fc2go -fc2go-package=t \
+// RUN:   -fc2go-target-go-version=1.26-1.28 -O2 -c \
+// RUN:   %S/Inputs/c2go-extra.c -o %t.snapshot-b.o
+// RUN: c2go-lto %t.snapshot-a.o %t.snapshot-b.o \
+// RUN:   --c2go-emit-manifest=%t.snapshot.json
+// RUN: grep -q '"min_go_version": "go1.26"' %t.snapshot.json
+// RUN: grep -q '"validation_snapshot_max_exclusive": "go1.27"' %t.snapshot.json
 
 void f(void) {}

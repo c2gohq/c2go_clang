@@ -3310,11 +3310,15 @@ def fc2go_emit_plan9_asm_EQ : Joined<["-"], "fc2go-emit-plan9-asm=">, Group<f_Gr
   MetaVarName<"<path>">,
   HelpText<"Emit a Plan 9 syntax assembly file (consumed by the Go assembler) to <path> alongside the object file. Replaces the external c2go-plan9asm post-process step. v0+1 byte-packaged form; opcodes are upgraded to symbolic Plan 9 mnemonics as the InstPrinter table grows.">,
   MarshallingInfoString<LangOpts<"C2GoEmitPlan9AsmPath">>;
-def fc2go_target_go_version_EQ : Joined<["-"], "fc2go-target-go-version=">, Group<f_Group>,
-  Visibility<[ClangOption, CC1Option]>,
-  MetaVarName<"<lo>-<hi>">,
-  HelpText<"Pin the supported Go runtime range for c2go output (default: 1.22-1.26; max is exclusive).">,
-  MarshallingInfoString<LangOpts<"C2GoTargetGoVersion">, [{"1.22-1.26"}]>;
+def fc2go_target_go_version_EQ
+    : Joined<["-"], "fc2go-target-go-version=">,
+      Group<f_Group>,
+      Visibility<[ClangOption, CC1Option]>,
+      MetaVarName<"<lo>-<hi>">,
+      HelpText<"Set the minimum Go version and validation-snapshot upper bound "
+               "for c2go output (default: 1.25-1.27; upper bound is exclusive "
+               "provenance, not a schema-v2 build gate).">,
+      MarshallingInfoString<LangOpts<"C2GoTargetGoVersion">, [{"1.25-1.27"}]>;
 def frandomize_layout_seed_EQ : Joined<["-"], "frandomize-layout-seed=">,
   MetaVarName<"<seed>">, Group<f_clang_Group>,
   Visibility<[ClangOption, CC1Option]>,

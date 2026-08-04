@@ -1607,9 +1607,13 @@ void CodeGenModule::Release() {
     getModule().addModuleFlag(llvm::Module::Error,
                               llvm::c2go::kTargetFeaturesFlag,
                               llvm::MDString::get(VMContext, FeaturesJoined));
-    // c2go WF2 (#319, C1): publish the full Go package PATH and the version
-    // range so c2go-lto can rebuild the manifest pkgpath / min_go_version /
-    // max_go_version fields without consulting the AST.
+    // c2go WF2 (#319, C1): publish the full Go package PATH. Normal WF2 carries
+    // the complete schema-v2 version/contract metadata verbatim in
+    // c2go.manifest.json; do not duplicate its validation range in an Error-
+    // merged string flag, because different validation snapshots with the same
+    // epochs are allowed to merge conservatively. The schema marker makes a
+    // stripped/missing embedded manifest a hard error instead of silently
+    // entering the lossy legacy fallback.
     //
     // The package NAME is deliberately NOT recorded. The IMPORT PATH is the
     // linker identity: Sema uses it to fold same-package c2go_linkname targets
@@ -1623,10 +1627,9 @@ void CodeGenModule::Release() {
     getModule().addModuleFlag(llvm::Module::Error,
                               llvm::c2go::kPackagePathModuleFlag,
                               llvm::MDString::get(VMContext, PkgPath));
-    StringRef VerRange = LangOpts.C2GoTargetGoVersion;
-    if (VerRange.empty()) VerRange = "1.22-1.25";
-    getModule().addModuleFlag(llvm::Module::Error, "c2go.target_go_version",
-                              llvm::MDString::get(VMContext, VerRange));
+    getModule().addModuleFlag(llvm::Module::Error,
+                              llvm::c2go::kManifestSchemaModuleFlag,
+                              llvm::c2go::kManifestSchemaVersion);
     // c2go #420 invariant IR-enforce: stamp the legacy managed-alloca
     // seed/default list as a named metadata so the .bc is self-describing
     // and downstream tools

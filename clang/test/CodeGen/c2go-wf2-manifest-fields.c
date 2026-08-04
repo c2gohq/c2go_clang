@@ -26,6 +26,19 @@
 // JSON must also match (other sections - pkgpath / linknames / types - are
 // already covered by sibling tests; this guard catches any drift).
 // RUN: diff -u %t.ref.json %t.lto.json
+// RUN: not grep -E '"(max_go_version|go_contract_epoch)"[[:space:]]*:' %t.lto.json
+// RUN: grep -q '"schema_version": 2' %t.lto.json
+// RUN: grep -q '"compatibility_model": "provider_epoch"' %t.lto.json
+// RUN: grep -q '"min_go_version": "go1.25"' %t.lto.json
+// RUN: grep -q '"validation_snapshot_max_exclusive": "go1.27"' %t.lto.json
+// RUN: grep -q '"c2go_abi_epoch": 1' %t.lto.json
+// RUN: grep -q '"go_toolchain_contract_epoch": 1' %t.lto.json
+// RUN: not %clang_cc1 -triple aarch64-unknown-none-goabi -fc2go -std=c2go23 \
+// RUN:   -fc2go-target-go-version=1.25.1-1.27 -emit-llvm-bc -o %t.bad.bc %s \
+// RUN:   2>&1 | FileCheck %s --check-prefix=BAD-VERSION
+// RUN: not %clang_cc1 -triple aarch64-unknown-none-goabi -fc2go -std=c2go23 \
+// RUN:   -fc2go-target-go-version=1.27-1.26 -emit-llvm-bc -o %t.backwards.bc %s \
+// RUN:   2>&1 | FileCheck %s --check-prefix=BAD-VERSION
 //
 // FileCheck the round-trip output as an extra readability/regression net:
 // every boundary's manifest entry carries the expected fields.
@@ -64,6 +77,9 @@ int main(int argc, char **argv) { return argc; }
 // Symbols are sorted by name; the JSON pretty-printer also sorts keys
 // alphabetically inside each entry. Order is: chain8 / compute / log_msg / main.
 //
+// Schema v2 records an informational validation snapshot, while actual future
+// Go admission is delegated to the c2goabi provider.
+// BAD-VERSION: error: invalid value '{{.*}}' for -fc2go-target-go-version
 // CHECK: "symbols": [
 //
 // chain8: 8 i64 args -> argsize = 8*8 + 8 (ret) = 72. Pure scalar shape.
