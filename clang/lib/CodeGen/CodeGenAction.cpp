@@ -725,6 +725,22 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
         if (HasAggregate)
           Sym["has_aggregate"] = true;
       }
+      // Every boundary that passes a C record by value needs the record's Go
+      // declaration in types[].  The Go signature already names that record;
+      // without its layout c2go-bind can only synthesize an opaque struct{},
+      // which has size zero and corrupts the ABI0 argument frame.  This is not
+      // specific to unmanaged imports: ordinary c2go_extern definitions (for
+      // example hsearch(ENTRY, ...)) have the same requirement.
+      auto SeedByValueRecord = [&](QualType QT) {
+        QT = QT.getCanonicalType();
+        if (const auto *RT = QT->getAs<RecordType>())
+          if (const RecordDecl *Def = RT->getDecl()->getDefinition())
+            RecordWorklist.push_back(Def);
+      };
+      for (const auto *PVD : FD->parameters())
+        SeedByValueRecord(PVD->getType());
+      SeedByValueRecord(FD->getReturnType());
+
       // c2go §E full ABI: for unmanaged_extern targets, attach the per-target
       // parameter-passing description from clang's C-ABI lowering so c2gobind
       // generates a real (float / struct-aware) dispatch wrapper instead of a
@@ -733,20 +749,6 @@ static llvm::json::Object buildC2GoManifest(ASTContext &Ctx,
       if (CGM && IsImport) {
         if (auto Abi = c2goBuildAbiDesc(*CGM, FD))
           Sym["cabi"] = std::move(*Abi);
-        // By-value struct params/returns of an unmanaged_extern need their Go
-        // type emitted so the wrapper signature is correctly sized. Plain C
-        // structs carry no C2GoStructAttr, so seed the record worklist
-        // directly (its field-walking path builds the layout); the Emitted set
-        // dedups against managed records.
-        auto SeedRecord = [&](QualType QT) {
-          QT = QT.getCanonicalType();
-          if (const auto *RT = QT->getAs<RecordType>())
-            if (const RecordDecl *Def = RT->getDecl()->getDefinition())
-              RecordWorklist.push_back(Def);
-        };
-        for (const auto *PVD : FD->parameters())
-          SeedRecord(PVD->getType());
-        SeedRecord(FD->getReturnType());
         // c2go §E (.s-wrapper model): if clang synthesized the GoABI0 dispatch
         // wrapper for this symbol (EmitC2GoUnmanagedExternWrappers tagged the
         // IR function with `c2go-wrapper-in-asm`), tell c2gobind to emit only

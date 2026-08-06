@@ -105,3 +105,15 @@ int main(int argc, char **argv) { return argc; }
 // CHECK:        "c_entry": true
 // CHECK-NEXT:   "entry_sig": "argc_argv"
 // CHECK:        "name": "main"
+//
+// A normal c2go_extern boundary that takes a plain C record by value must also
+// carry the record layout.  Otherwise c2go-bind falls back to `struct{}` and
+// emits a zero-byte argument even though the ABI0 frame reserves sizeof(Point).
+// CHECK:      "types": [
+// CHECK-NEXT:   {
+// CHECK-NEXT:     "go_def": "struct {\n\tx int32\n\ty int32\n}"
+// CHECK-NEXT:     "linkage_owner": "c"
+// CHECK-NEXT:     "managed_record": true
+// CHECK-NEXT:     "name": "Point"
+// CHECK-NEXT:   }
+// CHECK-NEXT: ]
