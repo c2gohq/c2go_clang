@@ -1427,8 +1427,15 @@ AArch64TargetInfo::checkCallingConvention(CallingConv CC) const {
 
 bool AArch64TargetInfo::isCLZForZeroUndef() const { return false; }
 
+void AArch64TargetInfo::adjust(DiagnosticsEngine &Diags, LangOptions &Opts,
+                               const TargetInfo *Aux) {
+  TargetInfo::adjust(Diags, Opts, Aux);
+  C2GoVoidPtrVaList = Opts.C2GoMode;
+}
+
 TargetInfo::BuiltinVaListKind AArch64TargetInfo::getBuiltinVaListKind() const {
-  return TargetInfo::AArch64ABIBuiltinVaList;
+  return C2GoVoidPtrVaList ? TargetInfo::VoidPtrBuiltinVaList
+                           : TargetInfo::AArch64ABIBuiltinVaList;
 }
 
 const char *const AArch64TargetInfo::GCCRegNames[] = {
@@ -1729,7 +1736,8 @@ WindowsARM64TargetInfo::WindowsARM64TargetInfo(const llvm::Triple &Triple,
 
 TargetInfo::BuiltinVaListKind
 WindowsARM64TargetInfo::getBuiltinVaListKind() const {
-  return TargetInfo::CharPtrBuiltinVaList;
+  return C2GoVoidPtrVaList ? TargetInfo::VoidPtrBuiltinVaList
+                           : TargetInfo::CharPtrBuiltinVaList;
 }
 
 TargetInfo::CallingConvCheckResult
@@ -1872,7 +1880,9 @@ void DarwinAArch64TargetInfo::adjust(DiagnosticsEngine &Diags,
   // cursor over the caller-packed `void* argptrs[]` array. va_start/va_arg/
   // va_end are lowered specially (no AAPCS register-save-area walk, no
   // llvm.va_start), so the callee prologue has no reg-save and the call site
-  // has no per-callsite SUB/ADD sp. Set from LangOpts.
+  // has no per-callsite SUB/ADD sp. The base AArch64 adjustment applies the
+  // same representation on every OS; retain this assignment defensively for
+  // the Darwin wrapper's qualified adjustment path.
   C2GoVoidPtrVaList = Opts.C2GoMode;
 }
 

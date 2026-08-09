@@ -1,0 +1,67 @@
+# A scheduled instruction may split an ELF GOT ADRP from its companion LDR.
+# The Plan 9 printer has already lowered the ADRP to the symbol's complete
+# address, so the delayed GOT LDR must preserve that address with a register
+# copy. Treating it as `MOVD sym(SB)` loads the global's value too early and
+# makes the following real-width load dereference zero/garbage.
+#
+# RUN: llc %s -mtriple=arm64-unknown-none-goabi -start-after=branch-relaxation \
+# RUN:   --output-asm-variant=2 -o - \
+# RUN:   | FileCheck %s --implicit-check-not=PLAN9-ERROR \
+# RUN:       --implicit-check-not="MOVD runtime·writeBarrier(SB)"
+
+--- |
+  target triple = "arm64-unknown-none-goabi"
+
+  @runtime.writeBarrier = external global i32
+
+  define i32 @split_got_load(ptr %p) {
+    ret i32 0
+  }
+
+  define i32 @cross_block_got_load() {
+    ret i32 0
+  }
+...
+---
+name:            split_got_load
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x0
+    $x10 = ADRP target-flags(aarch64-page, aarch64-got) @runtime.writeBarrier
+    $x8 = ORRXrs $xzr, $x0, 0
+    $x10 = LDRXui $x10, target-flags(aarch64-pageoff, aarch64-got, aarch64-nc) @runtime.writeBarrier
+    $w0 = LDRWui $x10, 0
+    RET undef $lr, implicit $w0
+...
+
+# CHECK-LABEL: TEXT ·split_got_load(SB)
+# CHECK:       MOVD $runtime·writeBarrier(SB), R10
+# CHECK:       MOVD R0, R8
+# CHECK-NEXT:  MOVD R10, R10
+# CHECK-NEXT:  MOVWU 0(R10), R0
+# CHECK-NEXT:  RET
+
+---
+name:            cross_block_got_load
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    successors: %bb.1
+    $x10 = ADRP target-flags(aarch64-page, aarch64-got) @runtime.writeBarrier
+    B %bb.1
+
+  bb.1:
+    liveins: $x10
+    $x10 = LDRXui $x10, target-flags(aarch64-pageoff, aarch64-got, aarch64-nc) @runtime.writeBarrier
+    $w0 = LDRWui $x10, 0
+    RET undef $lr, implicit $w0
+...
+
+# CHECK-LABEL: TEXT ·cross_block_got_load(SB)
+# CHECK:       MOVD $runtime·writeBarrier(SB), R10
+# CHECK:       JMP [[JOIN:_LBB[0-9]+_1]]
+# CHECK:       [[JOIN]]:
+# CHECK-NEXT:  MOVD R10, R10
+# CHECK-NEXT:  MOVWU 0(R10), R0
+# CHECK-NEXT:  RET

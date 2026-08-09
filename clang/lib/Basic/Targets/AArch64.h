@@ -145,9 +145,17 @@ class LLVM_LIBRARY_VISIBILITY AArch64TargetInfo : public TargetInfo {
 
 protected:
   std::string ABI;
+  // c2go's variadic ABI uses one void** cursor on every AArch64 OS. Keeping
+  // the native AAPCS five-field va_list type in C2Go mode makes its unused
+  // pointer fields enter Go stack maps even though only word zero is
+  // initialized as the cursor.
+  bool C2GoVoidPtrVaList = false;
 
 public:
   AArch64TargetInfo(const llvm::Triple &Triple, const TargetOptions &Opts);
+
+  void adjust(DiagnosticsEngine &Diags, LangOptions &Opts,
+              const TargetInfo *Aux) override;
 
   StringRef getABI() const override;
   bool setABI(const std::string &Name) override;
@@ -355,13 +363,6 @@ protected:
 
 class LLVM_LIBRARY_VISIBILITY DarwinAArch64TargetInfo
     : public DarwinTargetInfo<AArch64leTargetInfo> {
-  // c2go (§2.3 void** vararg): in c2go mode use a void* va_list whose value is
-  // a void** cursor over the caller-packed `void* argptrs[]` array, instead of
-  // Darwin's char* / the AAPCS register-save-area va_list. va_start/va_arg/
-  // va_end are lowered specially (no AAPCS walk, no reg-save-area prologue).
-  // Set in adjust() from LangOpts.
-  bool C2GoVoidPtrVaList = false;
-
 public:
   DarwinAArch64TargetInfo(const llvm::Triple &Triple, const TargetOptions &Opts);
 

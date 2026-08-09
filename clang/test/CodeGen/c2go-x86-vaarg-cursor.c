@@ -9,7 +9,7 @@
 // load-bearing.) The SysV walk is locked out via --implicit-check-not, and the
 // AArch64 lowering must produce the same shape for parity.
 //
-// REQUIRES: x86-registered-target
+// REQUIRES: x86-registered-target, aarch64-registered-target
 //
 // RUN: %clang_cc1 -triple x86_64-unknown-none-goabi -fc2go -std=c2go23 \
 // RUN:   -emit-llvm -o - %s | FileCheck %s \
@@ -21,9 +21,20 @@
 //
 // Parity: the AArch64 lowering must produce the same cursor shape.
 // RUN: %clang_cc1 -triple aarch64-unknown-none-goabi -fc2go -std=c2go23 \
-// RUN:   -emit-llvm -o - %s | FileCheck %s \
+// RUN:   -emit-llvm -o - %s | FileCheck %s --check-prefixes=CHECK,AARCH64 \
 // RUN:   --implicit-check-not=llvm.va_start \
-// RUN:   --implicit-check-not=llvm.va_end
+// RUN:   --implicit-check-not=llvm.va_end \
+// RUN:   --implicit-check-not=%%struct.__va_list
+// RUN: %clang_cc1 -triple aarch64-unknown-linux-goabi -fc2go -std=c2go23 \
+// RUN:   -emit-llvm -o - %s | FileCheck %s --check-prefixes=CHECK,AARCH64 \
+// RUN:   --implicit-check-not=llvm.va_start \
+// RUN:   --implicit-check-not=llvm.va_end \
+// RUN:   --implicit-check-not=%%struct.__va_list
+// RUN: %clang_cc1 -triple aarch64-pc-windows-goabi -fc2go -std=c2go23 \
+// RUN:   -emit-llvm -o - %s | FileCheck %s --check-prefix=WIN-AARCH64 \
+// RUN:   --implicit-check-not=llvm.va_start \
+// RUN:   --implicit-check-not=llvm.va_end \
+// RUN:   --implicit-check-not=%%struct.__va_list
 
 #include <stdarg.h>
 
@@ -54,6 +65,9 @@ static long g;
 // (read an optional trailing arg, ignore it when a runtime flag says it's absent)
 // safe. The sentinel stays nil, so the caller-side #588 GC contract is unchanged.
 // CHECK-LABEL: define{{.*}} goabi0cc void @my_config(i32 noundef %op, ptr noundef %__c2go_va)
+// AARCH64: %ap = alloca ptr, align 8
+// WIN-AARCH64-LABEL: define{{.*}} goabi0cc void @my_config(i32 noundef %op, ptr noundef %__c2go_va)
+// WIN-AARCH64: %ap = alloca ptr, align 8
 // CHECK: %c2go.va.base = load ptr, ptr %__c2go_va.addr
 // CHECK: store ptr %c2go.va.base,
 //

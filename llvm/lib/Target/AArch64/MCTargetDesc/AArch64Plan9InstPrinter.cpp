@@ -925,6 +925,22 @@ bool AArch64Plan9InstPrinter::tryPrintLDRSTRViaTrackedADRP(const MCInst *MI,
   StringRef Sym = getReferencedSymbolName(MI->getOperand(2).getExpr());
   if (Sym.empty()) return false;
   int64_t Off = getReferencedSymbolOffset(MI->getOperand(2).getExpr());
+  // A scheduled instruction or a basic-block boundary may separate an ELF
+  // GOT ADRP from its companion LDR. flushPendingADRP has already
+  // materialized the symbol's full address in Rn. The native LDRXui would
+  // load that same address from the GOT slot; Go assembly has no GOT, so it
+  // becomes a register copy, not a value load from sym(SB). The GOT modifier
+  // itself proves this is address materialization, so this remains valid even
+  // after a label has conservatively cleared RegHoldsPage.
+  if (Op == AArch64::LDRXui &&
+      referencesGOT(MI->getOperand(2).getExpr())) {
+    O << "\tMOVD ";
+    printPlan9GPR(O, MI->getOperand(1).getReg());
+    O << ", ";
+    printPlan9GPR(O, MI->getOperand(0).getReg());
+    O << "\n";
+    return true;
+  }
   // c2go §D2 phase 2: an LDR/STR with an MCExpr-imm operand can be one
   // of two patterns:
   //   (a) Tracked-ADRP — the base register Rn was loaded with an ADRP
